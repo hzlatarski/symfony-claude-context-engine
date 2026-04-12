@@ -1,0 +1,340 @@
+# Claude Context Engine — Symfony Edition
+
+**Your AI conversations, project docs, and codebase compile themselves into a searchable, self-healing knowledge base — with semantic retrieval, memory-type filtering, and drift detection baked in.**
+
+A long-term memory system for Claude Code, purpose-built for Symfony projects. Session transcripts, design specs, and live codebase structure flow into a single knowledge store that Claude queries on demand through dedicated MCP tools. Unlike vector-only systems that store everything and hope for the best, this engine **compiles** raw conversations into structured, source-cited articles — and defends that structure against the drift failure modes typical LLM wikis suffer.
+
+**Target stack:** Symfony 7.x, PHP 8.2+, Twig, Stimulus.js, AssetMapper.
+
+**Lineage:** Forked from [coleam00/claude-memory-compiler](https://github.com/coleam00/claude-memory-compiler), itself inspired by [Andrej Karpathy's LLM Knowledge Base](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f). Substantially extended with a Symfony code-intelligence layer, anti-drift hardening, and a semantic retrieval surface inspired by [MemPalace](https://github.com/MemPalace/mempalace).
+
+---
+
+## Why This Exists
+
+Every Claude Code session starts blank. You re-explain the same things — naming conventions, deployment rules, last week's architectural decisions — over and over. Generic "memory" plugins store raw transcripts and hope vector search surfaces the right chunks. That works, until it doesn't: no type filtering, no confidence, no way to tell a firm decision from a passing remark, no way to know when the system has started hallucinating.
+
+This engine takes a different bet. It **compiles** your sessions into structured, human-readable articles with explicit provenance — then layers **semantic retrieval, confidence decay, and drift canaries** on top of that curated foundation. You get the recall benefits of a vector store *and* the reliability of a hand-curated wiki, without hand-curating anything.
+
+---
+
+## What Makes It Valuable
+
+### 1. Two-Layer Knowledge Store
+
+- **Curated articles** (`knowledge/concepts/`) — LLM-compiled Truth + Timeline format, one file per concept, with `[[wikilinks]]` forming a full knowledge graph.
+- **Verbatim drawer** (`knowledge/daily/`) — raw session logs, never summarized, semantically indexed so you can always retrieve the exact words that led to a compiled claim.
+
+### 2. Symfony Code Intelligence (Dedicated MCP Server)
+
+Five pure-Python parsers expose your live codebase as structured data via the `symfony-code-intel` MCP server's six tools:
+
+| Tool | What it returns |
+|---|---|
+| `get_codebase_overview` | File counts by type, routes, templates, Stimulus orphans, top churn hotspots |
+| `get_file_deps(path)` | Imports, reverse deps, routes/templates touched, co-change partners |
+| `get_route_map(prefix)` | Route → controller → action → template → injected services table |
+| `get_template_graph(t)` | Twig inheritance, includes, Stimulus bindings |
+| `get_stimulus_map(c)` | Bidirectional JS ↔ Twig map with orphan detection |
+| `get_hotspots(top_n)` | Churn-ranked files with ownership and bus-factor scoring |
+
+Runs live, mtime-cached, under one second. Git intelligence caches to `knowledge/git-intel.json` and invalidates on HEAD change.
+
+### 3. Knowledge MCP Server (Semantic Retrieval)
+
+A **second** MCP server (`knowledge-compiler`) — separate from the code-intel one on purpose — exposes the knowledge store:
+
+| Tool | What it returns |
+|---|---|
+| `search_knowledge(query, ...)` | Semantic search over curated articles with filters for memory `type`, `min_confidence`, `zone`, quarantine state |
+| `search_raw_daily(query, date_from, date_to)` | Semantic search over verbatim drawer chunks (daily logs, never summarized) |
+| `get_article(slug)` | Full markdown + parsed frontmatter for one article |
+| `list_contradictions()` | Current contradiction-quarantine list |
+
+Backed by **ChromaDB** with the bundled `all-MiniLM-L6-v2` ONNX embedder — fully local, zero API cost, ~90 MB one-time model download on first use.
+
+### 4. Anti-Drift Hardening (Six Defenses)
+
+Typical LLM wikis decay: compilers hallucinate, facts contradict earlier facts, old claims rot without anyone noticing. This engine ships six concrete mitigations out of the box:
+
+| Defense | What it does |
+|---|---|
+| **Source anchors** | Every Truth bullet carries a `[src:path]` anchor. `lint.py` verifies targets exist; broken anchors become errors. |
+| **Confidence decay** | 90-day exponential half-life on the `confidence:` frontmatter field. Unvalidated old claims sink in priority until re-corroborated. |
+| **Contradiction quarantine** | `lint.py` writes contradictions to `knowledge/contradictions.json`. Quarantined articles are excluded from `compiled-truth.md` **and** from `search_knowledge` results until `lint --resolve` clears them. |
+| **Canary questions** | `canary.py` runs known-answer questions via Haiku and fails loudly if expected substrings stop appearing — early warning for compiler drift. |
+| **Skeptical compile prompt** | `compile.py` compares new info against existing Truth on every update, flags contradictions with a `CONTRADICTION:` marker, and appends `### Conflict` subsections instead of silently overwriting. |
+| **Observed / Synthesized zones** | `## Truth` splits into `### Observed` (direct extractions, low hallucination risk) and `### Synthesized` (compiler inferences, higher risk, opt-in via `compile_truth.py --synth`). |
+
+### 5. Memory Type Taxonomy
+
+Every article carries a `type:` — one of `fact`, `event`, `discovery`, `preference`, `advice`, `decision`. Used as a first-class filter in `search_knowledge` so you can ask the agent to surface "only preferences about testing" or "only decisions from the last sprint." Unknown values fail `lint.check_memory_types`.
+
+### 6. O(1) Prompt Cost
+
+The upstream compiler dumps every article into every prompt — cost scales linearly with knowledge base size. This fork uses a three-level retrieval pattern:
+
+- **Level 0 (always injected):** `index.md` (map) + `compiled-truth.md` (priority-scored excerpt, default 40KB)
+- **Level 1 (on-demand MCP):** `search_knowledge`, `search_raw_daily`, `get_article` — targeted fetches
+- **Level 2 (fallback):** Direct `Read` / `Grep` via the agent's built-in tools
+
+Cost stays constant from 50 articles to 5,000.
+
+---
+
+## How It Works
+
+```
+                   SESSION LIFECYCLE
+                   =================
+
+  ┌─────────────┐  SessionStart hook   ┌──────────────────┐
+  │ Claude Code │◄── compiled-truth ───│ session-start.py │
+  │   session   │    + index + wip     └──────────────────┘
+  └──────┬──────┘
+         │ SessionEnd / PreCompact hook
+         ▼
+  ┌──────────────┐  background spawn   ┌─────────────┐
+  │session-end.py│────────────────────►│  flush.py   │
+  └──────────────┘  (detached proc)    └──────┬──────┘
+                                              │
+                               ┌──────────────┼──────────────┐
+                               ▼              ▼              ▼
+                        daily log       wip.md        ChromaDB
+                       (markdown)    (resume-here)   (verbatim chunks)
+                               │
+                               │ after 6 PM
+                               ▼
+                        ┌─────────────┐
+                        │  compile.py │──► concepts/*.md ──► ChromaDB
+                        └──────┬──────┘    (curated articles)
+                               │
+                               ▼
+                        ┌──────────────────┐
+                        │ compile_truth.py │──► compiled-truth.md
+                        └──────────────────┘    (zero cost, pure Python)
+
+
+                   RETRIEVAL DURING A SESSION
+                   ==========================
+
+  session prompt ──► always has: index.md + compiled-truth.md + codebase shape
+
+                ──► on-demand:
+                     • search_knowledge(query, type, min_confidence, ...)
+                     • search_raw_daily(query, date_range, ...)
+                     • get_article(slug)
+                     • list_contradictions()
+                     • get_codebase_overview / get_file_deps / get_route_map / ...
+```
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full retrieval pipeline and four-store data model.
+
+---
+
+## Quick Start
+
+### 1. Clone into your project
+
+```bash
+git clone https://github.com/hzlatarski/symfony-claude-context-engine.git .claude/memory-compiler
+cd .claude/memory-compiler
+uv sync
+```
+
+### 2. Configure hooks
+
+Merge into your project's `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/session-start.py", "timeout": 15}]}],
+    "PreCompact":   [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/pre-compact.py",   "timeout": 10}]}],
+    "SessionEnd":   [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/session-end.py",   "timeout": 10}]}]
+  }
+}
+```
+
+### 3. Register MCP servers
+
+Create or merge `.mcp.json` at your project root:
+
+```json
+{
+  "mcpServers": {
+    "symfony-code-intel": {
+      "command": "uv",
+      "args": ["run", "--directory", ".claude/memory-compiler", "python", "scripts/mcp_server.py"]
+    },
+    "knowledge-compiler": {
+      "command": "uv",
+      "args": ["run", "--directory", ".claude/memory-compiler", "python", "scripts/knowledge_mcp_server.py"]
+    }
+  }
+}
+```
+
+### 4. Seed knowledge and build the vector index
+
+```bash
+cp sources.yaml.example sources.yaml
+# Edit sources.yaml to point at your project's docs / specs / memories
+
+uv run python scripts/ingest.py           # compile source files into articles
+uv run python scripts/reindex.py --all    # backfill ChromaDB
+```
+
+### 5. Use it
+
+Sessions accumulate automatically. Ask Claude to "search the knowledge base for X" and watch it call `search_knowledge`. After any doubt, verify with `search_raw_daily` or read the compiled article directly with `get_article`.
+
+---
+
+## Key Commands
+
+```bash
+# Knowledge pipeline
+uv run python scripts/compile.py               # compile daily logs → articles
+uv run python scripts/ingest.py                # compile source files → articles
+uv run python scripts/compile_truth.py         # regenerate compiled-truth.md (pure Python)
+uv run python scripts/query.py "question"      # ask the KB (uses Sonnet)
+
+# Vector store
+uv run python scripts/reindex.py               # incremental (hash-based)
+uv run python scripts/reindex.py --all         # force full rebuild
+uv run python scripts/reindex.py --articles-only
+uv run python scripts/reindex.py --daily-only
+
+# Drift detection & quality
+uv run python scripts/lint.py                  # full lint (structural + contradictions)
+uv run python scripts/lint.py --structural-only
+uv run python scripts/lint.py --resolve        # clear contradiction quarantine
+uv run python scripts/canary.py                # run drift canaries
+uv run python scripts/canary.py --dry-run      # list canaries without running
+```
+
+---
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MEMORY_COMPILER_DISABLED_HOOKS` | _(unset)_ | Disable hooks: `all` or comma-separated (`session-start,session-end,pre-compact`) |
+| `MEMORY_COMPILER_MODEL_FLUSH` | `claude-haiku-4-5-20251001` | Model for session flush (cheap) |
+| `MEMORY_COMPILER_MODEL_COMPILE` | `claude-sonnet-4-6` | Model for daily-log compilation |
+| `MEMORY_COMPILER_MODEL_INGEST` | `claude-sonnet-4-6` | Model for source-file ingestion |
+| `MEMORY_COMPILER_MODEL_QUERY` | `claude-sonnet-4-6` | Model for interactive queries |
+| `MEMORY_COMPILER_MODEL_CANARY` | `claude-haiku-4-5-20251001` | Model for drift canary checks |
+| `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | `95` | Set to `50` to compact earlier in long sessions |
+
+### `sources.yaml`
+
+See `sources.yaml.example`. Each source group has an `id`, `type` (markdown built-in; PDF / URL planned), glob `include` / `exclude` patterns, a category tag, and a description.
+
+### Article Format
+
+```markdown
+---
+title: "Concept Name"
+type: fact              # fact|event|discovery|preference|advice|decision
+confidence: 0.85
+sources:
+  - "daily/2026-04-01.md"
+created: 2026-04-01
+updated: 2026-04-03
+---
+
+## Truth
+
+### Observed
+
+- Fact A from source [src:daily/2026-04-01.md]
+- Fact B corroborated by two sources [src:daily/2026-04-01.md] [src:daily/2026-04-03.md]
+
+### Synthesized
+
+- Inferred pattern: A + B together imply X [src:daily/2026-04-01.md]
+
+### Related Concepts
+
+- [[concepts/related-concept]] — how it connects (one line)
+
+---
+
+## Timeline
+
+### 2026-04-01 | daily/2026-04-01.md
+- Initial discovery during project setup
+- Decided to use X approach because Y
+```
+
+See [AGENTS.md](AGENTS.md) for the complete schema and schema rules.
+
+---
+
+## Cost
+
+All LLM costs use your existing Claude subscription (Max / Team / Enterprise) — no separate API key needed.
+
+| Operation | Model | Cost | When |
+|---|---|---|---|
+| Session flush | Haiku | ~$0.005-0.02 | Every session end (automatic) |
+| Daily compilation | Sonnet | ~$0.20-0.60 | After 6 PM (automatic) |
+| Source ingestion | Sonnet | ~$0.20-0.60/file | Manual |
+| Compiled truth | _pure Python_ | **$0.00** | After every compile/ingest |
+| Structural lint | _pure Python_ | **$0.00** | Manual |
+| Contradiction lint | Sonnet | ~$0.15-0.25 | Manual |
+| Canary drift check | Haiku | ~$0.05-0.20 | Manual/scheduled |
+| Query | Sonnet | ~$0.15-0.40 | Manual |
+| **Vector store** | _local ONNX_ | **$0.00** | Always |
+
+Typical automatic cost: **$0.25-0.75 per day** for 10-15 sessions.
+
+### Why Costs Are Stable
+
+The upstream `claude-memory-compiler` dumps all existing wiki articles into every compile/ingest prompt — costs grow linearly with knowledge-base size. This fork fixes that with the three-level retrieval pattern: `index.md` (always, tiny) + `compiled-truth.md` (always, fixed budget) + on-demand `search_knowledge` / `get_article`. Cost per operation is approximately constant from 50 articles to 5,000.
+
+---
+
+## What Makes This Different From MemPalace
+
+MemPalace's thesis is "store everything verbatim, let vector search sort it out." This engine agrees that verbatim matters — that's the drawer layer — but it also believes **curated structure is worth the LLM cost**. The result:
+
+| | MemPalace | This engine |
+|---|---|---|
+| Storage | Verbatim drawers in ChromaDB | Verbatim daily chunks **and** compiled concept articles |
+| Curation | None — LLM extraction rejected on principle | LLM compiles, with anti-drift defenses |
+| Retrieval | Semantic search only | Semantic search **plus** priority-scored compiled-truth **plus** knowledge graph wikilinks |
+| Drift detection | Fact-checker not wired up | Canaries, confidence decay, contradiction quarantine, skeptical compile prompt |
+| Code awareness | Domain-agnostic | Dedicated Symfony code-intel MCP server |
+| Metadata filters | Wing/room/hall metadata | Memory type, confidence, zone, quarantine state |
+| Cost | ~$0 runtime | ~$0.25-0.75/day automatic |
+
+Neither approach is "right" — they're different tradeoffs. This engine is the tool you want when your knowledge base must **read like documentation**, not like a grep-pile.
+
+---
+
+## Obsidian Integration
+
+The knowledge base is pure markdown with `[[wikilinks]]`. Point an Obsidian vault at `knowledge/` for graph view, backlinks, and search alongside the MCP tools.
+
+---
+
+## Technical Reference
+
+- **[AGENTS.md](AGENTS.md)** — article schema, hook architecture, script internals, source handler API
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — retrieval pipeline, four-store data model, MCP routing
+
+## Credits
+
+- Forked from [coleam00/claude-memory-compiler](https://github.com/coleam00/claude-memory-compiler) by Cole Medin
+- Inspired by [Andrej Karpathy's LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
+- Verbatim drawer layer concept from [MemPalace](https://github.com/MemPalace/mempalace)
+- Built on the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk) and [FastMCP](https://github.com/modelcontextprotocol/python-sdk)
+
+## License
+
+MIT

@@ -1,0 +1,22 @@
+[project]
+name = "llm-personal-kb"
+version = "0.1.0"
+description = "Personal knowledge base compiled from AI conversations - inspired by Karpathy's LLM KB architecture"
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.1.29",
+    "mcp[cli]>=1.27.0",
+    "pytest>=9.0.3",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
+    "tzdata>=2024.1",
+    "chromadb>=0.5.0",
+    "onnxruntime>=1.18.0",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+pythonpath = [".", "scripts"]
+testpaths = ["tests"]
