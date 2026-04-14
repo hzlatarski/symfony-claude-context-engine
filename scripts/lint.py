@@ -39,22 +39,45 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 # from corrupting the quarantine set.
 VALID_SLUG_PREFIXES = ("concepts/", "connections/", "qa/")
 
+# Wikilink prefixes that point at wiki articles on disk (and therefore
+# are subject to broken-link / backlink linting). Anything else inside
+# ``[[...]]`` is treated as an external citation — for example, the
+# ``[[sources/...]]`` references the compile prompt produces to anchor
+# articles to their original source files. Those targets live OUTSIDE
+# the wiki tree, so trying to resolve them under ``knowledge/`` would
+# always fail and get flagged as broken when they're actually fine.
+_WIKI_LINK_PREFIXES = ("concepts/", "connections/", "qa/")
+
+
+def _is_wiki_link(link: str) -> bool:
+    """True if ``link`` targets a wiki article (vs. an external citation)."""
+    return any(link.startswith(p) for p in _WIKI_LINK_PREFIXES)
+
 
 def check_broken_links() -> list[dict]:
-    """Check for [[wikilinks]] that point to non-existent articles."""
+    """Check for [[wikilinks]] that point to non-existent wiki articles.
+
+    Only ``concepts/``, ``connections/``, and ``qa/`` prefixes are
+    validated — see ``_is_wiki_link``. ``[[sources/...]]`` and
+    ``[[daily/...]]`` references point outside the wiki tree (to
+    external source files and raw daily logs respectively) and would
+    always falsely fail an existence check under ``knowledge/``.
+    """
     issues = []
     for article in list_wiki_articles():
         content = article.read_text(encoding="utf-8")
         rel = article.relative_to(KNOWLEDGE_DIR)
         for link in extract_wikilinks(content):
-            if link.startswith("daily/"):
-                continue  # daily log references are valid
+            if not _is_wiki_link(link):
+                continue
             if not wiki_article_exists(link):
                 issues.append({
                     "severity": "error",
                     "check": "broken_link",
                     "file": str(rel),
                     "detail": f"Broken link: [[{link}]] - target does not exist",
+                    "auto_fixable": True,
+                    "broken_target": link,
                 })
     return issues
 
@@ -108,6 +131,8 @@ def check_stale_articles() -> list[dict]:
                     "check": "stale_article",
                     "file": f"daily/{rel}",
                     "detail": f"Stale: {rel} has changed since last compilation",
+                    "auto_fixable": True,
+                    "daily_name": rel,
                 })
     return issues
 
@@ -121,7 +146,7 @@ def check_missing_backlinks() -> list[dict]:
         source_link = str(rel).replace(".md", "").replace("\\", "/")
 
         for link in extract_wikilinks(content):
-            if link.startswith("daily/"):
+            if not _is_wiki_link(link):
                 continue
             target_path = KNOWLEDGE_DIR / f"{link}.md"
             if target_path.exists():
@@ -133,6 +158,8 @@ def check_missing_backlinks() -> list[dict]:
                         "file": str(rel),
                         "detail": f"[[{source_link}]] links to [[{link}]] but not vice versa",
                         "auto_fixable": True,
+                        "source_slug": source_link,
+                        "target_slug": link,
                     })
     return issues
 
@@ -185,6 +212,8 @@ def check_source_anchors() -> list[dict]:
                     "check": "broken_source_anchor",
                     "file": str(rel),
                     "detail": f"Broken anchor: [src:{anchor}] - file does not exist",
+                    "auto_fixable": True,
+                    "broken_anchor": anchor,
                 })
 
     return issues
@@ -333,7 +362,12 @@ async def check_contradictions() -> list[dict]:
         query,
     )
 
-    wiki_content = read_all_wiki_content()
+    from compile_truth import COMPILED_TRUTH_FILE
+    
+    if COMPILED_TRUTH_FILE.exists():
+        wiki_content = COMPILED_TRUTH_FILE.read_text(encoding="utf-8")
+    else:
+        wiki_content = "(No compiled truth found. Please run compile_truth.py first)"
 
     prompt = f"""Review this knowledge base for contradictions, inconsistencies, or
 conflicting claims across articles.
@@ -455,6 +489,27 @@ def main():
         action="store_true",
         help="Clear the contradiction quarantine (after human review)",
     )
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help=(
+            "Run self-healing fixers for auto-fixable issues "
+            "(missing_backlink, broken_link, stale_article, "
+            "broken_source_anchor, missing_memory_type). "
+            "Each fix is logged to knowledge/log.md."
+        ),
+    )
+    parser.add_argument(
+        "--fix-only",
+        nargs="+",
+        metavar="CHECK",
+        help=(
+            "Restrict --fix to specific check names. Useful for "
+            "canarying one category at a time on large knowledge "
+            "bases. Example: --fix --fix-only stale_article "
+            "missing_backlink"
+        ),
+    )
     args = parser.parse_args()
 
     if args.resolve:
@@ -493,6 +548,37 @@ def main():
         print(f"    Found {len(issues)} issue(s)")
     else:
         print("  Skipping: Contradictions (--structural-only)")
+
+    # Run self-healing fixers before reporting so the report reflects
+    # the post-fix state — users running ``lint --fix`` want to see
+    # only the issues that still need human attention.
+    if args.fix:
+        from lint_fixes import FIX_REGISTRY, apply_fixes
+
+        only_checks: set[str] | None = None
+        if args.fix_only:
+            only_checks = set(args.fix_only)
+            unknown = only_checks - set(FIX_REGISTRY.keys())
+            if unknown:
+                print(
+                    f"Error: unknown --fix-only check(s): {sorted(unknown)}. "
+                    f"Valid checks: {sorted(FIX_REGISTRY.keys())}"
+                )
+                return 2
+            print(f"  Fix scope (--fix-only): {sorted(only_checks)}")
+        elif "fix_only" in vars(args) and args.fix_only is None:
+            pass  # --fix without --fix-only: run every fixer
+
+        fixed, attempted = apply_fixes(all_issues, only_checks=only_checks)
+        print(f"\nAuto-fix: {fixed}/{attempted} fixable issues resolved")
+        if fixed:
+            print("  Re-running checks to reflect post-fix state...")
+            all_issues = []
+            for name, check_fn in checks:
+                all_issues.extend(check_fn())
+    elif args.fix_only:
+        print("Error: --fix-only requires --fix")
+        return 2
 
     # Generate and save report
     report = generate_report(all_issues)

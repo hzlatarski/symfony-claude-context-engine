@@ -35,6 +35,18 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run python hooks/post-tool-use.py",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

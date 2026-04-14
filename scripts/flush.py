@@ -63,6 +63,159 @@ def save_flush_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
 
 
+# -----------------------------------------------------------------------------
+# Tool drawer — structured PostToolUse events captured by hooks/post-tool-use.py
+# -----------------------------------------------------------------------------
+#
+# The PostToolUse hook writes one JSONL line per tool call to
+# ``knowledge/daily/YYYY-MM-DD.tools.jsonl``. Unlike the transcript (which
+# Haiku has to re-parse from markdown), these records are already structured:
+# tool name, input digest, result size, ok flag. Injecting a compact summary
+# of them into the flush prompt gives the model ground-truth about what the
+# session actually DID, so its summary of decisions and actions is less
+# reconstruction and more reporting.
+#
+# Tiering: higher-priority tools are the ones that represent "real work"
+# (file changes, shell commands, subagent dispatches, web fetches). Read /
+# Grep / Glob are discovery noise — useful for counts but rarely for the
+# "notable operations" list. TodoWrite is internal planning and never
+# surfaces as a notable operation.
+
+_TOOL_PRIORITY: dict[str, int] = {
+    "Edit": 3, "Write": 3, "NotebookEdit": 3,
+    "Bash": 3,
+    "Task": 3, "Agent": 3,
+    "WebFetch": 2, "WebSearch": 2,
+    "Skill": 2,
+    "Read": 1, "Grep": 1, "Glob": 1,
+    "TodoWrite": 0,
+}
+
+
+def _describe_event(tool: str, inp: dict) -> str:
+    """One-line human label for a tool event, tool-aware."""
+    if not isinstance(inp, dict):
+        return ""
+    if tool in ("Edit", "Write", "Read", "NotebookEdit"):
+        return inp.get("file_path", "") or ""
+    if tool == "Bash":
+        return inp.get("command", "") or ""
+    if tool == "Grep":
+        pattern = inp.get("pattern", "") or ""
+        path = inp.get("path", "") or ""
+        return f"{pattern}" + (f" in {path}" if path else "")
+    if tool == "Glob":
+        pattern = inp.get("pattern", "") or ""
+        path = inp.get("path", "") or ""
+        return f"{pattern}" + (f" in {path}" if path else "")
+    if tool in ("Task", "Agent"):
+        desc = inp.get("description", "") or ""
+        sub = inp.get("subagent_type") or "?"
+        return f"[{sub}] {desc}"
+    if tool == "WebFetch":
+        return inp.get("url", "") or ""
+    if tool == "WebSearch":
+        return inp.get("query", "") or ""
+    if tool == "Skill":
+        return inp.get("skill", "") or ""
+    return ""
+
+
+def load_tool_events(
+    session_id: str,
+    daily_dir: Path,
+    today_iso: str | None = None,
+) -> list[dict]:
+    """Read today's tool drawer and return events for ``session_id``.
+
+    Defensive against every failure mode the drawer could present: missing
+    file, malformed JSONL, events from other sessions, corrupt metadata.
+    A flush must NEVER crash because the drawer is weird — the transcript
+    path alone still produces a usable summary.
+    """
+    if today_iso is None:
+        today_iso = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+    path = daily_dir / f"{today_iso}.tools.jsonl"
+    if not path.exists():
+        return []
+
+    events: list[dict] = []
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logging.warning("tool drawer read failed: %s", exc)
+        return []
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("session_id") == session_id:
+            events.append(event)
+    return events
+
+
+def format_tool_events(events: list[dict], max_notable: int = 40) -> str:
+    """Render tool events into a compact plain-text block for the flush prompt.
+
+    Two sections: a one-line counts summary, and a ranked "notable operations"
+    list capped at ``max_notable``. Ranking is tool-priority first (so file
+    edits and shell commands surface ahead of reads), then original order to
+    preserve causality within a tier.
+
+    Returns an empty string if ``events`` is empty — callers should skip the
+    whole prompt section in that case.
+    """
+    if not events:
+        return ""
+
+    counts: dict[str, int] = {}
+    for event in events:
+        tool = event.get("tool") or "unknown"
+        counts[tool] = counts.get(tool, 0) + 1
+
+    counts_str = ", ".join(
+        f"{tool}: {count}"
+        for tool, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    )
+
+    ranked = sorted(
+        enumerate(events),
+        key=lambda iv: (
+            -_TOOL_PRIORITY.get(iv[1].get("tool") or "", 0),
+            iv[0],
+        ),
+    )
+
+    notable_lines: list[str] = []
+    for _, event in ranked:
+        if len(notable_lines) >= max_notable:
+            break
+        tool = event.get("tool") or "?"
+        if _TOOL_PRIORITY.get(tool, 0) == 0:
+            continue  # skip TodoWrite and other internal-planning noise
+        label = _describe_event(tool, event.get("input") or {})
+        if not label:
+            continue
+        err_suffix = "" if event.get("ok", True) else " [ERROR]"
+        notable_lines.append(f"- [{tool}] {label}{err_suffix}")
+
+    lines = [
+        f"Tool calls this session: {len(events)} ({counts_str})",
+    ]
+    if notable_lines:
+        lines.append("")
+        lines.append("Notable operations (ranked by significance):")
+        lines.extend(notable_lines)
+    return "\n".join(lines)
+
+
 def append_to_daily_log(content: str, section: str = "Session") -> None:
     """Append content to today's daily log.
 
@@ -136,8 +289,12 @@ def update_wip_file(wip_content: str) -> None:
     WIP_FILE.write_text(header + wip_content + "\n", encoding="utf-8")
 
 
-async def run_flush(context: str) -> tuple[str, float]:
+async def run_flush(context: str, tool_events_text: str = "") -> tuple[str, float]:
     """Use Claude Agent SDK to extract important knowledge from conversation context.
+
+    ``tool_events_text`` is the rendered drawer summary from
+    ``format_tool_events`` — empty string when no PostToolUse drawer was
+    captured (early sessions, disabled hook, etc).
 
     Returns (response_text, cost_usd).
     """
@@ -147,6 +304,19 @@ async def run_flush(context: str) -> tuple[str, float]:
         ResultMessage,
         TextBlock,
         query,
+    )
+
+    tool_events_section = (
+        f"\n## Tool Activity (ground truth)\n\n"
+        f"The following structured log comes from the PostToolUse hook — "
+        f"each line is a real tool call Claude Code made during the session. "
+        f"Use it as **ground truth** for what was actually done. When the "
+        f"conversation text and the tool log disagree, trust the tool log. "
+        f"Cite file paths and commands from here when summarizing decisions "
+        f"and actions.\n\n"
+        f"```\n{tool_events_text}\n```\n"
+        if tool_events_text
+        else ""
     )
 
     prompt = f"""Review the conversation context below and respond with a concise summary
@@ -183,7 +353,7 @@ Skip anything that is:
 
 Only include sections that have actual content. If nothing is worth saving,
 respond with exactly: FLUSH_OK
-
+{tool_events_section}
 ## Conversation Context
 
 {context}"""
@@ -317,8 +487,24 @@ def main():
 
     logging.info("Flushing session %s: %d chars", session_id, len(context))
 
+    # Load structured tool events from today's PostToolUse drawer (if any).
+    # This supplements the transcript with ground-truth about what the
+    # session actually did — file edits, shell commands, subagent dispatches —
+    # so Haiku doesn't have to reconstruct them from the conversation text.
+    try:
+        tool_events = load_tool_events(session_id, DAILY_DIR)
+        tool_events_text = format_tool_events(tool_events)
+        if tool_events_text:
+            logging.info(
+                "Loaded %d tool events for session %s (%d chars summary)",
+                len(tool_events), session_id, len(tool_events_text),
+            )
+    except Exception as exc:
+        logging.warning("Tool drawer load failed: %s", exc)
+        tool_events_text = ""
+
     # Run the LLM extraction
-    response, flush_cost = asyncio.run(run_flush(context))
+    response, flush_cost = asyncio.run(run_flush(context, tool_events_text))
 
     # Append to daily log
     if "FLUSH_OK" in response:

@@ -245,9 +245,20 @@ def migrate_state_schema(state: dict) -> dict:
 
 # ── Wikilink helpers ──────────────────────────────────────────────────
 
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
 def extract_wikilinks(content: str) -> list[str]:
-    """Extract all [[wikilinks]] from markdown content."""
-    return re.findall(r"\[\[([^\]]+)\]\]", content)
+    """Extract all [[wikilinks]] from markdown content.
+
+    Wikilinks inside HTML comments are skipped — they're explicitly
+    disabled markers (typically used by the lint --fix broken_link
+    fallback to deactivate a link without losing the original text).
+    Counting them as live links would re-flag previously-fixed errors
+    on every subsequent lint run.
+    """
+    stripped = _HTML_COMMENT_RE.sub("", content)
+    return re.findall(r"\[\[([^\]]+)\]\]", stripped)
 
 
 def wiki_article_exists(link: str) -> bool:

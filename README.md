@@ -46,12 +46,15 @@ A **second** MCP server (`knowledge-compiler`) — separate from the code-intel 
 
 | Tool | What it returns |
 |---|---|
-| `search_knowledge(query, ...)` | Semantic search over curated articles with filters for memory `type`, `min_confidence`, `zone`, quarantine state |
-| `search_raw_daily(query, date_from, date_to)` | Semantic search over verbatim drawer chunks (daily logs, never summarized) |
+| `search_knowledge(query, ...)` | Semantic search over curated articles with filters for memory `type`, `min_confidence`, `zone`, quarantine state. Returns **slim snippets** (~220 chars), not full bodies. |
+| `search_raw_daily(query, date_from, date_to)` | Semantic search over verbatim drawer chunks (daily logs, never summarized). Slim snippets. |
 | `get_article(slug)` | Full markdown + parsed frontmatter for one article |
+| `get_articles([slugs])` | Batch-fetch full bodies for multiple slugs in one round trip. Missing slugs return `{slug, error: "not_found"}` so one bad slug doesn't abort the batch. |
 | `list_contradictions()` | Current contradiction-quarantine list |
 
 Backed by **ChromaDB** with the bundled `all-MiniLM-L6-v2` ONNX embedder — fully local, zero API cost, ~90 MB one-time model download on first use.
+
+**Token-efficient two-step retrieval** — inspired by claude-mem's `search → get_observations` split, `search_knowledge` returns just `{slug, title, snippet, distance, metadata}` (~50–100 tokens per hit) so the agent can scan cheaply and then fetch full bodies only for the winners via `get_article(s)`. Saves ~10× context on multi-hit queries where most matches turn out to be irrelevant.
 
 ### 4. Anti-Drift Hardening (Six Defenses)
 
@@ -70,7 +73,18 @@ Typical LLM wikis decay: compilers hallucinate, facts contradict earlier facts, 
 
 Every article carries a `type:` — one of `fact`, `event`, `discovery`, `preference`, `advice`, `decision`. Used as a first-class filter in `search_knowledge` so you can ask the agent to surface "only preferences about testing" or "only decisions from the last sprint." Unknown values fail `lint.check_memory_types`.
 
-### 6. O(1) Prompt Cost
+### 6. Structured Tool Drawer (PostToolUse Capture)
+
+A lossless, machine-readable log of every tool call Claude Code makes during a session, captured live by the `PostToolUse` hook and fed back into the flush pipeline as **ground-truth input for Haiku**.
+
+- **Live capture** — `hooks/post-tool-use.py` fires after every tool invocation, writes one JSONL line to `knowledge/daily/YYYY-MM-DD.tools.jsonl` with `{ts, session_id, tool, input_digest, result_size, ok}`. Pure stdlib, broad-exception-wrapped, ~5s timeout — never breaks the session.
+- **Tool-aware digests** — the hook keeps only the load-bearing fields per tool (`file_path` for Edit/Write/Read, `command` for Bash, `pattern`+`path` for Grep, `description`+`subagent_type` for Task, etc.), and caps everything else at 240 chars. The raw transcript still has the full payload if you need it.
+- **Ground truth for flush.py** — `flush.py` loads today's drawer filtered by `session_id`, renders a compact ranked summary via `format_tool_events` (tool counts + ranked notable operations with priority tiering), and injects it into the Haiku flush prompt with instructions to trust the tool log over the conversation text when they disagree. Result: flush summaries cite real file paths and commands instead of reconstructing them from transcript prose.
+- **Idempotent** — duplicated lines from replayed sessions do no harm; the compile pipeline already de-dupes on content hash.
+
+This closes a hard gap in the upstream compiler: previously, Haiku had to infer "what was done this session" from the conversation text alone, which is lossier than reading the actual tool-call stream. Idea borrowed from [thedotmack/claude-mem](https://github.com/thedotmack/claude-mem)'s `PostToolUse` capture pattern; the drawer format and flush integration are local.
+
+### 7. O(1) Prompt Cost
 
 The upstream compiler dumps every article into every prompt — cost scales linearly with knowledge base size. This fork uses a three-level retrieval pattern:
 
@@ -91,13 +105,22 @@ Cost stays constant from 50 articles to 5,000.
   ┌─────────────┐  SessionStart hook   ┌──────────────────┐
   │ Claude Code │◄── compiled-truth ───│ session-start.py │
   │   session   │    + index + wip     └──────────────────┘
-  └──────┬──────┘
-         │ SessionEnd / PreCompact hook
-         ▼
-  ┌──────────────┐  background spawn   ┌─────────────┐
+  └──┬───────┬──┘
+     │       │ PostToolUse hook (every tool call)
+     │       ▼
+     │  ┌───────────────────┐     ┌────────────────────────────┐
+     │  │ post-tool-use.py  │────►│ knowledge/daily/            │
+     │  └───────────────────┘     │   YYYY-MM-DD.tools.jsonl    │
+     │                            │ (structured drawer layer)   │
+     │                            └──────────────┬──────────────┘
+     │ SessionEnd / PreCompact hook              │
+     ▼                                           │
+  ┌──────────────┐  background spawn   ┌─────────┴───┐
   │session-end.py│────────────────────►│  flush.py   │
   └──────────────┘  (detached proc)    └──────┬──────┘
-                                              │
+                                              │     (loads drawer as
+                                              │      ground truth for
+                                              │      the Haiku prompt)
                                ┌──────────────┼──────────────┐
                                ▼              ▼              ▼
                         daily log       wip.md        ChromaDB
@@ -149,12 +172,15 @@ Merge into your project's `.claude/settings.json`:
 ```json
 {
   "hooks": {
-    "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/session-start.py", "timeout": 15}]}],
-    "PreCompact":   [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/pre-compact.py",   "timeout": 10}]}],
-    "SessionEnd":   [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/session-end.py",   "timeout": 10}]}]
+    "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/session-start.py",  "timeout": 15}]}],
+    "PreCompact":   [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/pre-compact.py",    "timeout": 10}]}],
+    "SessionEnd":   [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/session-end.py",    "timeout": 10}]}],
+    "PostToolUse":  [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/post-tool-use.py",  "timeout": 5 }]}]
   }
 }
 ```
+
+`PostToolUse` fires after every tool call Claude Code makes and writes a structured JSONL drawer (`knowledge/daily/YYYY-MM-DD.tools.jsonl`) that `flush.py` later reads as ground-truth input for the Haiku flush summary — see "Structured Tool Drawer" above.
 
 ### 3. Register MCP servers
 

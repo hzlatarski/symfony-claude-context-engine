@@ -119,6 +119,44 @@ class TestSearchKnowledgeImpl:
         with pytest.raises(ValueError, match="zone_filter"):
             _search_knowledge_impl("anything", zone_filter="unknown")
 
+    def test_invalid_mode_raises(self, seeded_store):
+        from knowledge_mcp_server import _search_knowledge_impl
+        with pytest.raises(ValueError, match="mode"):
+            _search_knowledge_impl("anything", mode="weird")
+
+    def test_mode_dispatch_routes_to_backends(self, seeded_store, monkeypatch):
+        """Each mode value must dispatch to its corresponding backend."""
+        import bm25_store
+        import hybrid_search
+        import knowledge_mcp_server
+        import vector_store
+
+        calls = []
+
+        def make_spy(name):
+            def spy(**kwargs):
+                calls.append(name)
+                return []
+            return spy
+
+        monkeypatch.setattr(vector_store, "search_articles", make_spy("vector"))
+        monkeypatch.setattr(bm25_store, "search_articles", make_spy("bm25"))
+        monkeypatch.setattr(hybrid_search, "search_articles", make_spy("hybrid"))
+        monkeypatch.setattr(
+            knowledge_mcp_server, "vector_store", vector_store, raising=False
+        )
+        monkeypatch.setattr(
+            knowledge_mcp_server, "bm25_store", bm25_store, raising=False
+        )
+        monkeypatch.setattr(
+            knowledge_mcp_server, "hybrid_search", hybrid_search, raising=False
+        )
+
+        knowledge_mcp_server._search_knowledge_impl("q", mode="vector")
+        knowledge_mcp_server._search_knowledge_impl("q", mode="bm25")
+        knowledge_mcp_server._search_knowledge_impl("q", mode="hybrid")
+        assert calls == ["vector", "bm25", "hybrid"]
+
     def test_quarantined_excluded_by_default(self, seeded_store):
         seeded_store.upsert_article(
             slug="concepts/quarantined-one",
@@ -156,6 +194,180 @@ class TestSearchKnowledgeImpl:
         )
         slugs = {r["slug"] for r in results}
         assert "concepts/quarantined-two" in slugs
+
+
+class TestSlimSearchShape:
+    """Search tools return token-efficient snippets, not full bodies.
+
+    Borrowed from claude-mem's search → get_observations split: the search
+    response carries just enough to pick interesting slugs; full bodies come
+    from a follow-up ``get_article`` / ``get_articles`` call.
+    """
+
+    def test_search_returns_snippet_not_full_text(self, seeded_store):
+        long_body = (
+            "Stimulus controller identifiers use kebab-case; filenames use underscores. "
+            * 30
+        )
+        seeded_store.upsert_article(
+            slug="concepts/long-stimulus-article",
+            title="Long Stimulus Article",
+            zone="observed",
+            text=long_body,
+            metadata={
+                "type": "fact",
+                "confidence": 0.9,
+                "quarantined": False,
+                "updated": "2026-04-12",
+            },
+        )
+
+        from knowledge_mcp_server import SNIPPET_CHARS, _search_knowledge_impl
+        results = _search_knowledge_impl("long stimulus article kebab underscore", limit=5)
+        hit = next(r for r in results if r["slug"] == "concepts/long-stimulus-article")
+
+        # No full-text field on the slim shape — agents must call get_article
+        assert "text" not in hit
+        # Snippet is truncated; the ellipsis marker means "body was cut"
+        assert "snippet" in hit
+        assert len(hit["snippet"]) <= SNIPPET_CHARS + 1  # +1 for the "…" glyph
+        assert hit["snippet"].endswith("…")
+
+    def test_search_includes_title_from_metadata(self, seeded_store):
+        from knowledge_mcp_server import _search_knowledge_impl
+        results = _search_knowledge_impl("stimulus naming convention", limit=3)
+        hit = next(r for r in results if r["slug"] == "concepts/stimulus-naming")
+        # upsert_article stores the title kwarg in metadata; slim shape surfaces it
+        assert hit["title"] == "Stimulus Naming"
+
+    def test_search_title_falls_back_to_slug(self, seeded_store, monkeypatch):
+        """If no title in metadata, the slim shape falls back to the slug."""
+        import knowledge_mcp_server
+
+        def fake_backend(**kwargs):
+            return [{
+                "id": "concepts/no-title",
+                "slug": "concepts/no-title",
+                "text": "body",
+                "metadata": {"type": "fact"},  # no title key
+                "distance": 0.1,
+            }]
+
+        monkeypatch.setattr(
+            knowledge_mcp_server.hybrid_search, "search_articles", fake_backend
+        )
+        results = knowledge_mcp_server._search_knowledge_impl("anything")
+        assert results[0]["title"] == "concepts/no-title"
+
+    def test_short_body_snippet_has_no_ellipsis(self, seeded_store, monkeypatch):
+        import knowledge_mcp_server
+
+        def fake_backend(**kwargs):
+            return [{
+                "id": "concepts/short",
+                "slug": "concepts/short",
+                "text": "short body",
+                "metadata": {"type": "fact", "title": "Short"},
+                "distance": 0.1,
+            }]
+
+        monkeypatch.setattr(
+            knowledge_mcp_server.hybrid_search, "search_articles", fake_backend
+        )
+        results = knowledge_mcp_server._search_knowledge_impl("anything")
+        assert results[0]["snippet"] == "short body"
+        assert not results[0]["snippet"].endswith("…")
+
+    def test_slim_metadata_drops_large_keys(self, seeded_store, monkeypatch):
+        """Only the load-bearing metadata flags survive the slim projection."""
+        import knowledge_mcp_server
+
+        def fake_backend(**kwargs):
+            return [{
+                "id": "concepts/fat",
+                "slug": "concepts/fat",
+                "text": "some content",
+                "metadata": {
+                    "type": "fact",
+                    "confidence": 0.9,
+                    "zone": "observed",
+                    "quarantined": False,
+                    "updated": "2026-04-12",
+                    "title": "Fat",
+                    "huge_blob": "x" * 5000,  # must NOT leak into the response
+                    "internal_debug_info": {"chroma": "stuff"},
+                },
+                "distance": 0.1,
+            }]
+
+        monkeypatch.setattr(
+            knowledge_mcp_server.hybrid_search, "search_articles", fake_backend
+        )
+        results = knowledge_mcp_server._search_knowledge_impl("anything")
+        md = results[0]["metadata"]
+        assert set(md.keys()) <= {"type", "confidence", "zone", "quarantined", "updated"}
+        assert "huge_blob" not in md
+        assert "internal_debug_info" not in md
+
+
+class TestGetArticlesImpl:
+    """Batch fetch for full article bodies — companion to the slim search."""
+
+    def test_batch_fetches_multiple_articles(self, tmp_path, monkeypatch):
+        import config
+
+        monkeypatch.setattr(config, "KNOWLEDGE_DIR", tmp_path)
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "foo.md").write_text(
+            "---\ntitle: Foo\ntype: fact\nconfidence: 0.8\n---\n\nfoo body\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "concepts" / "bar.md").write_text(
+            "---\ntitle: Bar\ntype: decision\nconfidence: 0.6\n---\n\nbar body\n",
+            encoding="utf-8",
+        )
+
+        from knowledge_mcp_server import _get_articles_impl
+        results = _get_articles_impl(["concepts/foo", "concepts/bar"])
+
+        assert len(results) == 2
+        # Order preserved from input list
+        assert [r["slug"] for r in results] == ["concepts/foo", "concepts/bar"]
+        assert "foo body" in results[0]["content"]
+        assert "bar body" in results[1]["content"]
+        assert results[0]["frontmatter"]["title"] == "Foo"
+        assert results[1]["frontmatter"]["type"] == "decision"
+
+    def test_missing_slug_returns_error_marker_not_exception(self, tmp_path, monkeypatch):
+        """A single bad slug must not abort the whole batch."""
+        import config
+
+        monkeypatch.setattr(config, "KNOWLEDGE_DIR", tmp_path)
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "real.md").write_text(
+            "---\ntitle: Real\ntype: fact\n---\n\nreal body\n",
+            encoding="utf-8",
+        )
+
+        from knowledge_mcp_server import _get_articles_impl
+        results = _get_articles_impl([
+            "concepts/real",
+            "concepts/ghost",
+            "concepts/also-ghost",
+        ])
+
+        assert len(results) == 3
+        assert results[0]["slug"] == "concepts/real"
+        assert "real body" in results[0]["content"]
+        assert results[1] == {"slug": "concepts/ghost", "error": "not_found"}
+        assert results[2] == {"slug": "concepts/also-ghost", "error": "not_found"}
+
+    def test_empty_slug_list_returns_empty_list(self, tmp_path, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "KNOWLEDGE_DIR", tmp_path)
+
+        from knowledge_mcp_server import _get_articles_impl
+        assert _get_articles_impl([]) == []
 
 
 class TestSearchRawDailyImpl:

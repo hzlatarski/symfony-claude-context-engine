@@ -67,6 +67,9 @@ def _flatten_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
             flat[k] = v
         elif isinstance(v, (list, tuple)):
             flat[k] = ",".join(str(x) for x in v)
+            # Add dedicated boolean flags to support exact-match filtering in ChromaDB
+            for x in v:
+                flat[f"{k}_{x}"] = True
     return flat
 
 

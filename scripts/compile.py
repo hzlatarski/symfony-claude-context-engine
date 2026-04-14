@@ -201,7 +201,6 @@ Read the daily log above and compile it into wiki articles following the schema 
         "cost_usd": cost,
     }
     state["total_cost"] = state.get("total_cost", 0.0) + cost
-    save_state(state)
 
     return cost
 
@@ -251,13 +250,19 @@ def main():
     if args.dry_run:
         return
 
-    # Compile each file sequentially
-    total_cost = 0.0
-    for i, log_path in enumerate(to_compile, 1):
-        print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
-        cost = asyncio.run(compile_daily_log(log_path, state))
-        total_cost += cost
-        print(f"  Done.")
+    # Compile each file concurrently
+    print(f"\nCompiling {len(to_compile)} logs concurrently...")
+    
+    async def process_all():
+        tasks = [compile_daily_log(log, state) for log in to_compile]
+        return await asyncio.gather(*tasks)
+
+    costs = asyncio.run(process_all())
+    total_cost = sum(costs)
+    print("  Done.")
+    
+    # Save aggregated state safely to disk after concurrent batch finishes
+    save_state(state)
 
     articles = list_wiki_articles()
 

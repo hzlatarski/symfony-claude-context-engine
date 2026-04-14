@@ -49,6 +49,11 @@ def reindex_articles(force: bool = False) -> tuple[int, int]:
     Returns ``(embedded, skipped)``. State is always persisted via
     ``try/finally`` so a mid-run exception doesn't lose the hash cache
     for articles that were successfully embedded before the failure.
+
+    Also invalidates the in-process BM25 index when at least one article
+    was re-embedded, so a long-running MCP server picks up fresh articles
+    on its next query without a restart. Cross-process invalidation is
+    handled by the state.json mtime sentinel inside ``bm25_store``.
     """
     state = load_state()
     vector_hashes = state.setdefault("vector_article_hashes", {})
@@ -72,6 +77,13 @@ def reindex_articles(force: bool = False) -> tuple[int, int]:
             embedded += 1
     finally:
         save_state(state)
+
+    if embedded:
+        try:
+            import bm25_store
+            bm25_store.invalidate()
+        except ImportError:
+            pass
 
     return embedded, skipped
 
