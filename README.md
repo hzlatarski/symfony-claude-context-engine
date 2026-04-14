@@ -84,7 +84,28 @@ A lossless, machine-readable log of every tool call Claude Code makes during a s
 
 This closes a hard gap in the upstream compiler: previously, Haiku had to infer "what was done this session" from the conversation text alone, which is lossier than reading the actual tool-call stream. Idea borrowed from [thedotmack/claude-mem](https://github.com/thedotmack/claude-mem)'s `PostToolUse` capture pattern; the drawer format and flush integration are local.
 
-### 7. O(1) Prompt Cost
+### 7. Web Viewer (`scripts/viewer.py`)
+
+A read-only FastAPI dashboard over the knowledge store. One command, no build step, no auth, bound to localhost:
+
+```bash
+uv run python scripts/viewer.py
+# → http://127.0.0.1:37778
+```
+
+| Route | What it shows |
+|---|---|
+| `/` | Overview: article counts, quarantine status, today's tool calls, today's flush cost, memory-type histogram, recently updated articles |
+| `/articles` | Filterable article list — by memory type, min confidence, quarantine mode (hide/only/all), and substring search |
+| `/articles/{slug}` | Single article with frontmatter badges, rendered markdown, `[[wikilinks]]` rewritten to internal links, raw-markdown drawer |
+| `/daily` & `/daily/{date}` | Daily log index + rendered detail |
+| `/tools` & `/tools/{date}` | Per-day tool-drawer browser with event counts, error counts, and per-event table |
+| `/contradictions` | Current quarantine list |
+| `/stats` | Chroma collection sizes, recent 20 flush records with per-session costs |
+
+**Design notes.** Dark "tactical" theme matching the MHB project aesthetic. Memory-type tinting (`fact` blue, `event` amber, `discovery` purple, `preference` pink, `advice` teal, `decision` red) is driven by a single `type_colors` Jinja global so nav chips, badges, and card borders stay in sync — the type-tinted card border idea is borrowed from [thedotmack/claude-mem](https://github.com/thedotmack/claude-mem)'s React viewer. Read-only on principle: no mutation endpoints anywhere, and binding to `127.0.0.1` (not `0.0.0.0`) means it's never accessible from the LAN. Port `37778` is one above claude-mem's `37777` to avoid collision when both tools live on the same box.
+
+### 8. O(1) Prompt Cost
 
 The upstream compiler dumps every article into every prompt — cost scales linearly with knowledge base size. This fork uses a three-level retrieval pattern:
 

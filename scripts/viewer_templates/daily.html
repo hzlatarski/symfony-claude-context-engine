@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Daily logs — memory-compiler{% endblock %}
+{% block content %}
+  <h1>Daily logs</h1>
+  <p class="page-subtitle">Verbatim session transcripts, newest first.</p>
+
+  {% if daily %}
+    <table>
+      <thead>
+        <tr>
+          <th>Date</th>
+          <th class="num">Size</th>
+          <th>Tool drawer</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in daily %}
+          <tr>
+            <td class="mono"><a href="/daily/{{ row.date }}">{{ row.date }}</a></td>
+            <td class="num mono">{{ (row.size_bytes / 1024)|round(1) }} KB</td>
+            <td>
+              {% if row.has_drawer %}
+                <a href="/tools/{{ row.date }}">view drawer</a>
+              {% else %}
+                <span style="color: var(--muted);">—</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <div class="empty">No daily logs yet. They're created automatically on session end.</div>
+  {% endif %}
+{% endblock %}

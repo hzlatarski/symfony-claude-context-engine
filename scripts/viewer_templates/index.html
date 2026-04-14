@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Overview — memory-compiler{% endblock %}
+{% block content %}
+  <h1>Overview</h1>
+  <p class="page-subtitle">Knowledge base snapshot, session activity, and system health.</p>
+
+  <div class="stat-grid">
+    <div class="stat">
+      <div class="label">Articles</div>
+      <div class="value">{{ total_articles }}</div>
+      <div class="sub">{{ chroma_articles }} indexed in Chroma</div>
+    </div>
+    <div class="stat {% if quarantined_count %}danger{% else %}ok{% endif %}">
+      <div class="label">Contradictions</div>
+      <div class="value">{{ quarantined_count }}</div>
+      <div class="sub">{% if quarantined_count %}<a href="/contradictions">review quarantine</a>{% else %}none in quarantine{% endif %}</div>
+    </div>
+    <div class="stat">
+      <div class="label">Daily logs</div>
+      <div class="value">{{ daily_count }}</div>
+      <div class="sub">{{ chroma_daily_chunks }} embedded chunks</div>
+    </div>
+    <div class="stat">
+      <div class="label">Today's tool calls</div>
+      <div class="value">{{ today_tool_count }}</div>
+      <div class="sub"><a href="/tools/{{ today }}">{{ today }} drawer</a></div>
+    </div>
+    <div class="stat {% if today_flush_cost > 0.5 %}warn{% endif %}">
+      <div class="label">Today's flush cost</div>
+      <div class="value">${{ "%.3f"|format(today_flush_cost) }}</div>
+      <div class="sub">{{ total_flushes_tracked }} flushes tracked</div>
+    </div>
+    <div class="stat">
+      <div class="label">Ingested sources</div>
+      <div class="value">{{ ingest_files_count }}</div>
+      <div class="sub">files in state.json</div>
+    </div>
+  </div>
+
+  {% if type_counts %}
+    <h2>Memory composition</h2>
+    <div class="chip-row">
+      {% for type, count in type_counts %}
+        {% if type in memory_types %}
+          <a class="chip" href="/articles?type={{ type }}" style="color: {{ type_colors[type] }}; border-color: {{ type_colors[type] }}66;">
+            {{ type }} · {{ count }}
+          </a>
+        {% else %}
+          <a class="chip" href="/articles">(untyped) · {{ count }}</a>
+        {% endif %}
+      {% endfor %}
+    </div>
+  {% endif %}
+
+  <h2>Recently updated articles</h2>
+  {% if recent %}
+    {% for a in recent %}
+      <div class="card type-{{ a.type }}{% if a.quarantined %} quarantined{% endif %}">
+        <div class="card-title"><a href="/articles/{{ a.slug }}">{{ a.title }}</a></div>
+        <div class="card-meta">
+          {% if a.type %}<span class="badge type-{{ a.type }}">{{ a.type }}</span>{% endif %}
+          {% if a.confidence >= 0.75 %}
+            <span class="badge confidence-high">conf {{ "%.2f"|format(a.confidence) }}</span>
+          {% elif a.confidence >= 0.4 %}
+            <span class="badge confidence-med">conf {{ "%.2f"|format(a.confidence) }}</span>
+          {% elif a.confidence > 0 %}
+            <span class="badge confidence-low">conf {{ "%.2f"|format(a.confidence) }}</span>
+          {% endif %}
+          {% if a.updated %}<span class="badge">updated {{ a.updated }}</span>{% endif %}
+          {% if a.source_count %}<span class="badge">{{ a.source_count }} src</span>{% endif %}
+          {% if a.quarantined %}<span class="badge quarantined">quarantined</span>{% endif %}
+        </div>
+        <div class="card-excerpt">{{ a.excerpt }}</div>
+      </div>
+    {% endfor %}
+  {% else %}
+    <div class="empty">No articles compiled yet. Run <code>uv run python scripts/compile.py</code>.</div>
+  {% endif %}
+
+  {% if contradictions %}
+    <h2>Quarantined</h2>
+    {% for slug in contradictions %}
+      <div class="card quarantined">
+        <div class="card-title"><a href="/articles/{{ slug }}">{{ slug }}</a></div>
+        <div class="card-meta"><span class="badge quarantined">quarantined</span></div>
+      </div>
+    {% endfor %}
+    {% if total_contradictions > contradictions|length %}
+      <p style="color: var(--muted); font-size: 12px;">
+        Showing {{ contradictions|length }} of {{ total_contradictions }} —
+        <a href="/contradictions">see all</a>.
+      </p>
+    {% endif %}
+  {% endif %}
+{% endblock %}

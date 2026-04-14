@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Contradictions — memory-compiler{% endblock %}
+{% block content %}
+  <h1>Contradiction quarantine</h1>
+  <p class="page-subtitle">
+    Articles flagged by <code>lint.py</code>. Excluded from <code>compiled-truth.md</code>
+    and <code>search_knowledge</code> until resolved with <code>lint --resolve</code>.
+  </p>
+
+  {% if rows %}
+    {% for row in rows %}
+      <div class="card quarantined">
+        <div class="card-title">
+          {% if row.exists %}
+            <a href="/articles/{{ row.slug }}">{{ row.article.title if row.article.title else row.slug }}</a>
+          {% else %}
+            <span style="color: var(--muted);">{{ row.slug }}</span>
+          {% endif %}
+        </div>
+        <div class="card-meta">
+          <span class="badge quarantined">quarantined</span>
+          {% if row.exists and row.article.type %}<span class="badge type-{{ row.article.type }}">{{ row.article.type }}</span>{% endif %}
+          {% if not row.exists %}<span class="badge" style="color: var(--muted);">file missing</span>{% endif %}
+          <span class="badge">{{ row.slug }}</span>
+        </div>
+        {% if row.exists %}
+          <div class="card-excerpt">{{ row.article.excerpt }}</div>
+        {% endif %}
+      </div>
+    {% endfor %}
+  {% else %}
+    <div class="empty">No contradictions. 🎯</div>
+  {% endif %}
+{% endblock %}

@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Stats — memory-compiler{% endblock %}
+{% block content %}
+  <h1>Stats &amp; costs</h1>
+  <p class="page-subtitle">Vector store counts, flush cost history, and ingest state.</p>
+
+  <div class="stat-grid">
+    <div class="stat">
+      <div class="label">Articles in Chroma</div>
+      <div class="value">{{ chroma.articles }}</div>
+    </div>
+    <div class="stat">
+      <div class="label">Daily chunks in Chroma</div>
+      <div class="value">{{ chroma.daily_chunks }}</div>
+    </div>
+    <div class="stat {% if today_flush_cost > 0.5 %}warn{% endif %}">
+      <div class="label">Today's flush cost</div>
+      <div class="value">${{ "%.3f"|format(today_flush_cost) }}</div>
+    </div>
+    <div class="stat">
+      <div class="label">Flushes tracked</div>
+      <div class="value">{{ total_flushes_tracked }}</div>
+    </div>
+    <div class="stat">
+      <div class="label">Ingested source files</div>
+      <div class="value">{{ ingest_files_count }}</div>
+    </div>
+  </div>
+
+  <h2>Recent flush history</h2>
+  {% if flush_costs %}
+    <table>
+      <thead>
+        <tr>
+          <th>When</th>
+          <th>Session</th>
+          <th>Result</th>
+          <th class="num">Cost (USD)</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for entry in flush_costs %}
+          <tr>
+            <td class="mono">{{ entry.when }}</td>
+            <td class="mono" style="font-size: 11px; color: var(--muted);">{{ entry.session_id or "?" }}</td>
+            <td>
+              {% set result = entry.result or "?" %}
+              {% if result == "saved" %}
+                <span class="badge" style="color: var(--success); border-color: #10b98140;">saved</span>
+              {% elif result == "error" %}
+                <span class="badge quarantined">error</span>
+              {% else %}
+                <span class="badge">{{ result }}</span>
+              {% endif %}
+            </td>
+            <td class="num mono">${{ "%.4f"|format(entry.cost_usd or 0) }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <div class="empty">No flush history recorded yet.</div>
+  {% endif %}
+{% endblock %}

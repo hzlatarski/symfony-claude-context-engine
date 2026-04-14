@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Articles — memory-compiler{% endblock %}
+{% block content %}
+  <h1>Articles</h1>
+  <p class="page-subtitle">Curated knowledge base. {{ shown }} of {{ total }} shown.</p>
+
+  <form class="filter-bar" method="get" action="/articles">
+    <label for="type">type</label>
+    <select name="type" id="type">
+      <option value="">all</option>
+      {% for t in memory_types %}
+        <option value="{{ t }}" {% if t == type %}selected{% endif %}>{{ t }}</option>
+      {% endfor %}
+    </select>
+
+    <label for="min_confidence">min conf</label>
+    <input type="number" name="min_confidence" id="min_confidence" min="0" max="1" step="0.05"
+           value="{{ min_confidence if min_confidence is not none else '' }}" style="width: 80px;">
+
+    <label for="quarantine">quarantine</label>
+    <select name="quarantine" id="quarantine">
+      <option value="hide" {% if quarantine == 'hide' %}selected{% endif %}>hide</option>
+      <option value="only" {% if quarantine == 'only' %}selected{% endif %}>only</option>
+      <option value="all"  {% if quarantine == 'all'  %}selected{% endif %}>all</option>
+    </select>
+
+    <label for="q">search</label>
+    <input type="text" name="q" id="q" value="{{ q }}" placeholder="title, slug, excerpt" style="width: 220px;">
+
+    <button type="submit">apply</button>
+    <span class="count">{{ shown }} / {{ total }}</span>
+  </form>
+
+  {% if articles %}
+    {% for a in articles %}
+      <div class="card type-{{ a.type }}{% if a.quarantined %} quarantined{% endif %}">
+        <div class="card-title"><a href="/articles/{{ a.slug }}">{{ a.title }}</a></div>
+        <div class="card-meta">
+          {% if a.type %}<span class="badge type-{{ a.type }}">{{ a.type }}</span>{% endif %}
+          {% if a.confidence >= 0.75 %}
+            <span class="badge confidence-high">conf {{ "%.2f"|format(a.confidence) }}</span>
+          {% elif a.confidence >= 0.4 %}
+            <span class="badge confidence-med">conf {{ "%.2f"|format(a.confidence) }}</span>
+          {% elif a.confidence > 0 %}
+            <span class="badge confidence-low">conf {{ "%.2f"|format(a.confidence) }}</span>
+          {% endif %}
+          {% if a.updated %}<span class="badge">updated {{ a.updated }}</span>{% endif %}
+          {% if a.source_count %}<span class="badge">{{ a.source_count }} src</span>{% endif %}
+          {% if a.quarantined %}<span class="badge quarantined">quarantined</span>{% endif %}
+          <span class="badge">{{ a.slug }}</span>
+        </div>
+        <div class="card-excerpt">{{ a.excerpt }}</div>
+      </div>
+    {% endfor %}
+  {% else %}
+    <div class="empty">No articles match these filters.</div>
+  {% endif %}
+{% endblock %}

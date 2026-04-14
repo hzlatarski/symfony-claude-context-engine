@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}{{ date }} — Tool drawer{% endblock %}
+{% block content %}
+  <div class="breadcrumb"><a href="/tools">Tool drawer</a> / {{ date }}</div>
+  <h1>{{ date }}</h1>
+
+  <div class="stat-grid">
+    <div class="stat">
+      <div class="label">Total events</div>
+      <div class="value">{{ summary.total }}</div>
+    </div>
+    <div class="stat {% if summary.errors %}danger{% else %}ok{% endif %}">
+      <div class="label">Errors</div>
+      <div class="value">{{ summary.errors }}</div>
+    </div>
+    <div class="stat">
+      <div class="label">Sessions</div>
+      <div class="value">{{ summary.sessions }}</div>
+    </div>
+  </div>
+
+  <h2>By tool</h2>
+  <div class="chip-row">
+    {% for tool, count in summary.by_tool %}
+      <span class="chip">{{ tool }} · {{ count }}</span>
+    {% endfor %}
+  </div>
+
+  <h2>Event stream</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Tool</th>
+        <th>Input</th>
+        <th class="num">Size</th>
+        <th>Status</th>
+        <th>Session</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in events %}
+        <tr>
+          <td class="mono">{{ e.ts[11:19] if e.ts else "" }}</td>
+          <td class="mono"><span class="badge">{{ e.tool or "?" }}</span></td>
+          <td class="mono" style="max-width: 480px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+            {%- for k, v in (e.input or {}).items() -%}
+              <span style="color: var(--muted);">{{ k }}=</span><span>{{ v }}</span>{% if not loop.last %} · {% endif %}
+            {%- endfor -%}
+          </td>
+          <td class="num mono">{{ e.result_size or 0 }}</td>
+          <td>
+            {% if e.ok is not defined or e.ok %}
+              <span style="color: var(--success);">ok</span>
+            {% else %}
+              <span style="color: var(--danger);">err</span>
+            {% endif %}
+          </td>
+          <td class="mono" style="font-size: 10px; color: var(--muted);">{{ (e.session_id or "")[:8] }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}

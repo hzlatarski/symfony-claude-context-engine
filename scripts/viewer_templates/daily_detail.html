@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}{{ date }} — Daily log{% endblock %}
+{% block content %}
+  <div class="breadcrumb"><a href="/daily">Daily logs</a> / {{ date }}</div>
+  <h1>{{ date }}</h1>
+  <p class="page-subtitle">
+    Raw session log.
+    {% if has_drawer %}<a href="/tools/{{ date }}">View tool drawer for this day →</a>{% endif %}
+  </p>
+
+  <div class="article-body">
+    {{ rendered_html|safe }}
+  </div>
+{% endblock %}

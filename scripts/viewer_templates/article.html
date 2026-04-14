@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}{{ frontmatter.title or slug }} — memory-compiler{% endblock %}
+{% block content %}
+  <div class="breadcrumb"><a href="/articles">Articles</a> / {{ slug }}</div>
+  <h1>{{ frontmatter.title or slug }}</h1>
+
+  <div class="card-meta" style="margin-bottom: 18px;">
+    {% if frontmatter.type %}<span class="badge type-{{ frontmatter.type }}">{{ frontmatter.type }}</span>{% endif %}
+    {% if frontmatter.confidence is defined %}
+      {% set c = frontmatter.confidence|float %}
+      {% if c >= 0.75 %}
+        <span class="badge confidence-high">conf {{ "%.2f"|format(c) }}</span>
+      {% elif c >= 0.4 %}
+        <span class="badge confidence-med">conf {{ "%.2f"|format(c) }}</span>
+      {% elif c > 0 %}
+        <span class="badge confidence-low">conf {{ "%.2f"|format(c) }}</span>
+      {% endif %}
+    {% endif %}
+    {% if frontmatter.updated %}<span class="badge">updated {{ frontmatter.updated }}</span>{% endif %}
+    {% if frontmatter.created %}<span class="badge">created {{ frontmatter.created }}</span>{% endif %}
+    {% if frontmatter.quarantined %}<span class="badge quarantined">quarantined</span>{% endif %}
+    {% if frontmatter.zone %}<span class="badge zone-{{ frontmatter.zone }}">zone: {{ frontmatter.zone }}</span>{% endif %}
+  </div>
+
+  {% if frontmatter.sources %}
+    <h2>Sources</h2>
+    <ul style="font-family: var(--mono); font-size: 12px; color: var(--muted-strong);">
+      {% for src in frontmatter.sources %}
+        <li>{{ src }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+
+  <div class="article-body">
+    {{ rendered_html|safe }}
+  </div>
+
+  <details style="margin-top: 24px; color: var(--muted-strong); font-size: 12px;">
+    <summary style="cursor: pointer;">Raw markdown</summary>
+    <pre>{{ raw_content }}</pre>
+  </details>
+{% endblock %}

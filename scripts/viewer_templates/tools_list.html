@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Tool drawer — memory-compiler{% endblock %}
+{% block content %}
+  <h1>Tool drawer</h1>
+  <p class="page-subtitle">
+    Structured PostToolUse events captured per session. One row per day.
+    <code>flush.py</code> reads these as ground-truth input when summarizing daily logs.
+  </p>
+
+  {% if rows %}
+    <table>
+      <thead>
+        <tr>
+          <th>Date</th>
+          <th class="num">Events</th>
+          <th class="num">Errors</th>
+          <th class="num">Sessions</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+          <tr>
+            <td class="mono">{{ row.date }}</td>
+            <td class="num mono">{{ row.total }}</td>
+            <td class="num mono {% if row.errors %}error{% endif %}" {% if row.errors %}style="color: var(--danger);"{% endif %}>
+              {{ row.errors }}
+            </td>
+            <td class="num mono">{{ row.sessions }}</td>
+            <td><a href="/tools/{{ row.date }}">open →</a></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <div class="empty">
+      No tool drawers yet. The <code>PostToolUse</code> hook writes them automatically
+      when registered — see <code>hooks/post-tool-use.py</code>.
+    </div>
+  {% endif %}
+{% endblock %}
