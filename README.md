@@ -6,7 +6,23 @@ A long-term memory system for Claude Code, purpose-built for Symfony projects. S
 
 **Target stack:** Symfony 7.x, PHP 8.2+, Twig, Stimulus.js, AssetMapper.
 
-**Lineage:** Forked from [coleam00/claude-memory-compiler](https://github.com/coleam00/claude-memory-compiler), itself inspired by [Andrej Karpathy's LLM Knowledge Base](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f). Substantially extended with a Symfony code-intelligence layer, anti-drift hardening, and a semantic retrieval surface inspired by [MemPalace](https://github.com/MemPalace/mempalace).
+**Lineage:** Forked from [coleam00/claude-memory-compiler](https://github.com/coleam00/claude-memory-compiler), itself inspired by [Andrej Karpathy's LLM Knowledge Base](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f). Substantially extended with a Symfony code-intelligence layer, anti-drift hardening, and a semantic retrieval surface inspired by [MemPalace](https://github.com/MemPalace/mempalace) and [thedotmack/claude-mem](https://github.com/thedotmack/claude-mem).
+
+---
+
+## Key Features
+
+- 🖥 **[Web Viewer UI](#web-viewer)** — Read-only FastAPI dashboard at **<http://127.0.0.1:37778>**. One command (`uv run python scripts/viewer.py`), no build step, no auth. Browse articles, daily logs, tool drawer, contradictions, and cost history.
+- 🧠 **Curated memory, not a grep-pile** — Sessions compile into structured articles with Truth + Timeline format, `[[wikilinks]]`, and `[src:path]` provenance anchors. Human-readable, diffable, Obsidian-compatible.
+- 🏷 **Memory type taxonomy** — Every article is a `fact`, `event`, `discovery`, `preference`, `advice`, or `decision`. First-class filter in `search_knowledge` so "only preferences about testing" is one call.
+- 🔍 **Hybrid BM25 + vector search** — Two dedicated MCP servers: `knowledge-compiler` for semantic+lexical retrieval, `symfony-code-intel` for live codebase structure. Fused via Reciprocal Rank Fusion.
+- ⚡ **Token-efficient retrieval** — `search_knowledge` returns slim ~220-char snippets; `get_articles([slugs])` batch-fetches full bodies only for the winners. ~10× context savings on multi-hit queries.
+- 🛠 **Symfony code intelligence** — Six live-parsing MCP tools: `get_codebase_overview`, `get_file_deps`, `get_route_map`, `get_template_graph`, `get_stimulus_map`, `get_hotspots`. Mtime-cached, sub-second.
+- 📚 **Structured tool drawer** — `PostToolUse` hook writes a JSONL log of every tool call to `knowledge/daily/*.tools.jsonl`. `flush.py` reads it as ground-truth input for Haiku summaries — so daily logs cite real file paths and commands, not reconstructions.
+- 🧪 **Anti-drift hardening** — Source anchors, confidence decay (90-day half-life), contradiction quarantine, canary questions, skeptical compile prompt, observed-vs-synthesized zones.
+- 📉 **O(1) prompt cost** — Priority-scored `compiled-truth.md` keeps session-start context constant from 50 articles to 5,000. Upstream compiler scales linearly.
+- 🆓 **Local embeddings, zero API cost** — Bundled `all-MiniLM-L6-v2` ONNX model, ~90 MB one-time download. Chroma runs fully offline.
+- 💾 **Knowledge in git** — Entire store is plain markdown under `knowledge/`. Check it into your repo; your team shares memory via normal `git pull`.
 
 ---
 
@@ -84,28 +100,7 @@ A lossless, machine-readable log of every tool call Claude Code makes during a s
 
 This closes a hard gap in the upstream compiler: previously, Haiku had to infer "what was done this session" from the conversation text alone, which is lossier than reading the actual tool-call stream. Idea borrowed from [thedotmack/claude-mem](https://github.com/thedotmack/claude-mem)'s `PostToolUse` capture pattern; the drawer format and flush integration are local.
 
-### 7. Web Viewer (`scripts/viewer.py`)
-
-A read-only FastAPI dashboard over the knowledge store. One command, no build step, no auth, bound to localhost:
-
-```bash
-uv run python scripts/viewer.py
-# → http://127.0.0.1:37778
-```
-
-| Route | What it shows |
-|---|---|
-| `/` | Overview: article counts, quarantine status, today's tool calls, today's flush cost, memory-type histogram, recently updated articles |
-| `/articles` | Filterable article list — by memory type, min confidence, quarantine mode (hide/only/all), and substring search |
-| `/articles/{slug}` | Single article with frontmatter badges, rendered markdown, `[[wikilinks]]` rewritten to internal links, raw-markdown drawer |
-| `/daily` & `/daily/{date}` | Daily log index + rendered detail |
-| `/tools` & `/tools/{date}` | Per-day tool-drawer browser with event counts, error counts, and per-event table |
-| `/contradictions` | Current quarantine list |
-| `/stats` | Chroma collection sizes, recent 20 flush records with per-session costs |
-
-**Design notes.** Dark "tactical" theme matching the MHB project aesthetic. Memory-type tinting (`fact` blue, `event` amber, `discovery` purple, `preference` pink, `advice` teal, `decision` red) is driven by a single `type_colors` Jinja global so nav chips, badges, and card borders stay in sync — the type-tinted card border idea is borrowed from [thedotmack/claude-mem](https://github.com/thedotmack/claude-mem)'s React viewer. Read-only on principle: no mutation endpoints anywhere, and binding to `127.0.0.1` (not `0.0.0.0`) means it's never accessible from the LAN. Port `37778` is one above claude-mem's `37777` to avoid collision when both tools live on the same box.
-
-### 8. O(1) Prompt Cost
+### 7. O(1) Prompt Cost
 
 The upstream compiler dumps every article into every prompt — cost scales linearly with knowledge base size. This fork uses a three-level retrieval pattern:
 
@@ -235,6 +230,38 @@ uv run python scripts/reindex.py --all    # backfill ChromaDB
 ### 5. Use it
 
 Sessions accumulate automatically. Ask Claude to "search the knowledge base for X" and watch it call `search_knowledge`. After any doubt, verify with `search_raw_daily` or read the compiled article directly with `get_article`.
+
+### 6. Browse the dashboard
+
+```bash
+uv run python scripts/viewer.py
+# → http://127.0.0.1:37778
+```
+
+See [Web Viewer](#web-viewer) below for everything it shows.
+
+---
+
+## Web Viewer
+
+A read-only FastAPI dashboard over the knowledge store. One command, no build step, no auth, bound to localhost.
+
+```bash
+uv run python scripts/viewer.py
+# → http://127.0.0.1:37778
+```
+
+| Route | What it shows |
+|---|---|
+| `/` | Overview: article counts, quarantine status, today's tool calls, today's flush cost, memory-type histogram, recently updated articles |
+| `/articles` | Filterable article list — by memory type, min confidence, quarantine mode (hide/only/all), and substring search |
+| `/articles/{slug}` | Single article with frontmatter badges, rendered markdown, `[[wikilinks]]` rewritten to internal links, raw-markdown drawer |
+| `/daily` & `/daily/{date}` | Daily log index + rendered detail |
+| `/tools` & `/tools/{date}` | Per-day tool-drawer browser with event counts, error counts, and per-event table |
+| `/contradictions` | Current quarantine list |
+| `/stats` | Chroma collection sizes, recent 20 flush records with per-session costs |
+
+**Design notes.** Dark "tactical" theme matching the MHB project aesthetic. Memory-type tinting (`fact` blue, `event` amber, `discovery` purple, `preference` pink, `advice` teal, `decision` red) is driven by a single `type_colors` Jinja global so nav chips, badges, and card borders stay in sync — the type-tinted card border idea is borrowed from [thedotmack/claude-mem](https://github.com/thedotmack/claude-mem)'s React viewer. Read-only on principle: no mutation endpoints anywhere, and binding to `127.0.0.1` (not `0.0.0.0`) means it's never accessible from the LAN. Port `37778` is one above claude-mem's `37777` to avoid collision when both tools live on the same box.
 
 ---
 
