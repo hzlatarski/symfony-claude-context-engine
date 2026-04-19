@@ -6,7 +6,6 @@ enhancement: appends a formatted context block to the transcript.
 from __future__ import annotations
 
 import time
-from typing import Literal
 
 from whisper.types import EnhanceResult, Hit
 
@@ -38,15 +37,12 @@ def enhance_verbatim(
     # Build the enhanced prompt
     enhanced_prompt = transcript
 
-    # If there are hits, append a context block
+    # If there are hits, append a formatted context block
     if hits:
-        context_lines = [""]  # Start with blank line for spacing
+        context_parts = ["\n\n## Retrieved Context\n"]
         for hit in hits:
-            context_lines.append(f"[{hit.id}] {hit.path} — {hit.title}")
-            context_lines.append(f"> {hit.snippet}")
-            context_lines.append("")  # Blank line between hits
-
-        enhanced_prompt = transcript + "\n".join(context_lines)
+            context_parts.append(f"\n[{hit.id}] {hit.path} — {hit.title}\n> {hit.snippet}")
+        enhanced_prompt = transcript + "".join(context_parts)
 
     # Handle defaults for optional list parameters
     scope_used_list = scope_used if scope_used is not None else []

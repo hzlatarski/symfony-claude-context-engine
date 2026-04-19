@@ -78,7 +78,7 @@ def test_enhance_verbatim_formats_context_block_correctly():
         hits=[hit],
     )
 
-    # Should contain the expected format somewhere
+    assert "## Retrieved Context" in result.enhanced_prompt
     assert "[c1] concepts/authentication — Auth Strategies" in result.enhanced_prompt
     assert "> multi-factor authentication is recommended" in result.enhanced_prompt
 
@@ -160,7 +160,7 @@ def test_enhance_verbatim_default_scope_used_is_none():
 
     result = enhance_verbatim(transcript="hi", hits=[])
 
-    assert result.scope_used == [] or result.scope_used is None or isinstance(result.scope_used, list)
+    assert result.scope_used == []
 
 
 def test_enhance_verbatim_accepts_scope_used():
@@ -182,7 +182,7 @@ def test_enhance_verbatim_default_queries_used_is_none():
 
     result = enhance_verbatim(transcript="hi", hits=[])
 
-    assert result.queries_used == [] or result.queries_used is None or isinstance(result.queries_used, list)
+    assert result.queries_used == []
 
 
 def test_enhance_verbatim_accepts_queries_used():
