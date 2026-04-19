@@ -59,3 +59,14 @@ def test_clean_raises_on_empty_response(mock_client):
 
     with pytest.raises(EnhanceError):
         enhance_clean("hello")
+
+
+def test_clean_uses_clean_system_prompt(mock_client):
+    mock_client.messages.create.return_value = _mock_response("ok")
+    from whisper.enhance import enhance_clean
+    import whisper.prompts as p
+
+    enhance_clean("hello")
+
+    _args, kwargs = mock_client.messages.create.call_args
+    assert kwargs["system"] == p.CLEAN_SYSTEM_PROMPT

@@ -33,15 +33,15 @@ def _extract_text(resp) -> str:
         resp: Response object with content list.
 
     Returns:
-        The text content from the first text block.
+        The text content from all text blocks joined together.
 
     Raises:
         EnhanceError: If no text blocks are found in response.
     """
-    for block in resp.content:
-        if block.type == "text":
-            return block.text
-    raise EnhanceError("No text blocks found in LLM response")
+    texts = [block.text for block in resp.content if getattr(block, "type", None) == "text"]
+    if not texts:
+        raise EnhanceError("No text blocks found in LLM response")
+    return "".join(texts).strip()
 
 
 def enhance_verbatim(
@@ -115,6 +115,9 @@ def enhance_clean(transcript: str) -> str:
     Raises:
         EnhanceError: If response contains no text blocks.
     """
+    if not transcript.strip():
+        return transcript
+
     client = _get_client()
     response = client.messages.create(
         model=MODEL_CLEAN,
