@@ -113,3 +113,21 @@ def test_post_re_enhance_invalid_scope_override_returns_422(client):
     )
 
     assert resp.status_code == 422
+
+
+def test_viewer_startup_preloads_whisper_model(monkeypatch, tmp_path):
+    """When the viewer boots, whisper.transcribe.preload_model is called."""
+    from unittest.mock import MagicMock
+    import whisper.transcribe as t
+
+    preload_mock = MagicMock()
+    monkeypatch.setattr(t, "preload_model", preload_mock)
+
+    from viewer import create_app
+    app = create_app(knowledge_dir=tmp_path)
+
+    # Trigger FastAPI startup handlers
+    with TestClient(app):
+        pass
+
+    assert preload_mock.called

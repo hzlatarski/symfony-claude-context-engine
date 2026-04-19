@@ -595,6 +595,15 @@ def create_app(knowledge_dir: Path | None = None) -> FastAPI:
             },
         )
 
+    # ── whisper model pre-warm ────────────────────────────────────────
+    @app.on_event("startup")
+    def _preload_whisper_model() -> None:
+        try:
+            from whisper.transcribe import preload_model
+            preload_model()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("whisper model preload failed at startup: %s", exc)
+
     # ── whisper voice-to-prompt endpoints ────────────────────────────
     from whisper.orchestrator import (
         enhance_from_audio,
