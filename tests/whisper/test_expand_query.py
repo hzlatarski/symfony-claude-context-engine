@@ -95,6 +95,16 @@ def test_expand_empty_queries_raises(mock_client):
         expand("transcript")
 
 
+def test_expand_queries_field_non_list_raises(mock_client):
+    mock_client.messages.create.return_value = _mock_anthropic_response(
+        json.dumps({"queries": "just a string not a list", "intent": "audit", "scope": ["articles"]})
+    )
+    from whisper.expand_query import expand, ExpansionError
+
+    with pytest.raises(ExpansionError):
+        expand("transcript")
+
+
 def test_expand_malformed_json_raises(mock_client):
     mock_client.messages.create.return_value = _mock_anthropic_response(
         "not valid json at all { queries: hi"
@@ -114,3 +124,22 @@ def test_expand_scope_defaults_to_articles_if_all_items_invalid(mock_client):
     result = expand("transcript")
 
     assert result.scope == ["articles"]
+
+
+def test_expand_caps_query_count_and_length(mock_client):
+    """Defense against Haiku returning a runaway list or giant strings."""
+    # 20 queries, each 1000 chars — both caps should engage
+    long = "a" * 1000
+    mock_client.messages.create.return_value = _mock_anthropic_response(
+        json.dumps({
+            "queries": [f"q{i}-{long}" for i in range(20)],
+            "intent": "audit",
+            "scope": ["articles"],
+        })
+    )
+    from whisper.expand_query import expand, MAX_QUERIES, MAX_QUERY_LENGTH
+
+    result = expand("transcript")
+
+    assert len(result.queries) == MAX_QUERIES
+    assert all(len(q) <= MAX_QUERY_LENGTH for q in result.queries)

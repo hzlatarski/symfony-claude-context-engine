@@ -24,6 +24,10 @@ VALID_INTENTS = {
 
 VALID_SCOPES = {"articles", "code", "daily"}
 
+MAX_QUERIES = 10            # Haiku prompted for 3-5; cap provides safety margin
+MAX_QUERY_LENGTH = 500      # per-query char cap defends retrieval embedding
+EXPAND_TIMEOUT_SECONDS = 15.0   # tight budget for voice UX; Haiku is normally sub-second
+
 
 class ExpansionError(Exception):
     """Raised when the Haiku call or its output is unusable."""
@@ -90,6 +94,7 @@ def expand(transcript: str) -> Expansion:
         max_tokens=512,
         system=QUERY_EXPANSION_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": transcript}],
+        timeout=EXPAND_TIMEOUT_SECONDS,
     )
 
     # Anthropic Messages API returns content as a list of blocks
@@ -103,9 +108,14 @@ def expand(transcript: str) -> Expansion:
     queries = data.get("queries")
     if not isinstance(queries, list) or not queries:
         raise ExpansionError("Haiku response missing 'queries' list")
-    queries = [q for q in queries if isinstance(q, str) and q.strip()]
+    queries = [
+        q.strip()[:MAX_QUERY_LENGTH]
+        for q in queries
+        if isinstance(q, str) and q.strip()
+    ]
     if not queries:
         raise ExpansionError("Haiku response 'queries' contained no valid strings")
+    queries = queries[:MAX_QUERIES]
 
     return Expansion(
         queries=queries,
