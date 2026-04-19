@@ -6,12 +6,42 @@ enhance_clean which uses Haiku to grammar-clean transcripts.
 """
 from __future__ import annotations
 
+import functools
 import time
 import anthropic
 
 from config import MODEL_CLEAN
 from whisper.types import EnhanceResult, Hit
 from whisper.prompts import CLEAN_SYSTEM_PROMPT
+
+
+class EnhanceError(Exception):
+    """Raised when text extraction from LLM response fails."""
+    pass
+
+
+@functools.lru_cache(maxsize=1)
+def _get_client() -> anthropic.Anthropic:
+    """Get or create a cached Anthropic client."""
+    return anthropic.Anthropic()
+
+
+def _extract_text(resp) -> str:
+    """Extract text from response content.
+
+    Args:
+        resp: Response object with content list.
+
+    Returns:
+        The text content from the first text block.
+
+    Raises:
+        EnhanceError: If no text blocks are found in response.
+    """
+    for block in resp.content:
+        if block.type == "text":
+            return block.text
+    raise EnhanceError("No text blocks found in LLM response")
 
 
 def enhance_verbatim(
@@ -69,12 +99,7 @@ def enhance_verbatim(
     )
 
 
-def enhance_clean(
-    transcript: str,
-    intent: str = "generic",
-    scope_used: list[str] | None = None,
-    queries_used: list[str] | None = None,
-) -> EnhanceResult:
+def enhance_clean(transcript: str) -> str:
     """Clean mode enhancement: call Haiku to grammar-clean transcript.
 
     Takes a transcript and uses Claude Haiku with CLEAN_SYSTEM_PROMPT
@@ -83,45 +108,23 @@ def enhance_clean(
 
     Args:
         transcript: The original transcript text to clean.
-        intent: The user's intent (default "generic").
-        scope_used: List of scopes used for retrieval (default None -> []).
-        queries_used: List of queries used for retrieval (default None -> []).
 
     Returns:
-        EnhanceResult with mode="clean", citations=[], warnings=[].
-    """
-    start_time_ms = int(time.perf_counter() * 1000)
+        Cleaned transcript string with stripped whitespace.
 
-    # Create Anthropic client and call LLM
-    client = anthropic.Anthropic()
+    Raises:
+        EnhanceError: If response contains no text blocks.
+    """
+    client = _get_client()
     response = client.messages.create(
         model=MODEL_CLEAN,
-        max_tokens=1024,
+        max_tokens=2048,
         system=CLEAN_SYSTEM_PROMPT,
         messages=[
             {"role": "user", "content": transcript}
         ],
     )
 
-    # Extract cleaned text from response
-    enhanced_prompt = response.content[0].text
-
-    # Handle defaults for optional list parameters
-    scope_used_list = scope_used if scope_used is not None else []
-    queries_used_list = queries_used if queries_used is not None else []
-
-    # Calculate timing
-    end_time_ms = int(time.perf_counter() * 1000)
-    llm_ms = end_time_ms - start_time_ms
-
-    return EnhanceResult(
-        transcript=transcript,
-        enhanced_prompt=enhanced_prompt,
-        mode="clean",
-        citations=[],
-        intent=intent,
-        scope_used=scope_used_list,
-        queries_used=queries_used_list,
-        warnings=[],
-        timings_ms={"llm_ms": llm_ms},
-    )
+    # Extract cleaned text from response and strip whitespace
+    cleaned_text = _extract_text(response)
+    return cleaned_text.strip()
