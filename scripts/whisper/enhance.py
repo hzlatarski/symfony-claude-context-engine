@@ -1,13 +1,17 @@
 """Enhance pipeline — transform transcript + hits into enhanced prompts.
 
 This module provides the enhance_verbatim function which performs zero-LLM
-enhancement: appends a formatted context block to the transcript.
+enhancement: appends a formatted context block to the transcript, and
+enhance_clean which uses Haiku to grammar-clean transcripts.
 """
 from __future__ import annotations
 
 import time
+import anthropic
 
+from config import MODEL_CLEAN
 from whisper.types import EnhanceResult, Hit
+from whisper.prompts import CLEAN_SYSTEM_PROMPT
 
 
 def enhance_verbatim(
@@ -62,4 +66,62 @@ def enhance_verbatim(
         queries_used=queries_used_list,
         warnings=[],
         timings_ms={"enhance_ms": enhance_ms},
+    )
+
+
+def enhance_clean(
+    transcript: str,
+    intent: str = "generic",
+    scope_used: list[str] | None = None,
+    queries_used: list[str] | None = None,
+) -> EnhanceResult:
+    """Clean mode enhancement: call Haiku to grammar-clean transcript.
+
+    Takes a transcript and uses Claude Haiku with CLEAN_SYSTEM_PROMPT
+    to perform grammar cleanup, removing filler words and fixing
+    punctuation while preserving meaning and voice.
+
+    Args:
+        transcript: The original transcript text to clean.
+        intent: The user's intent (default "generic").
+        scope_used: List of scopes used for retrieval (default None -> []).
+        queries_used: List of queries used for retrieval (default None -> []).
+
+    Returns:
+        EnhanceResult with mode="clean", citations=[], warnings=[].
+    """
+    start_time_ms = int(time.perf_counter() * 1000)
+
+    # Create Anthropic client and call LLM
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model=MODEL_CLEAN,
+        max_tokens=1024,
+        system=CLEAN_SYSTEM_PROMPT,
+        messages=[
+            {"role": "user", "content": transcript}
+        ],
+    )
+
+    # Extract cleaned text from response
+    enhanced_prompt = response.content[0].text
+
+    # Handle defaults for optional list parameters
+    scope_used_list = scope_used if scope_used is not None else []
+    queries_used_list = queries_used if queries_used is not None else []
+
+    # Calculate timing
+    end_time_ms = int(time.perf_counter() * 1000)
+    llm_ms = end_time_ms - start_time_ms
+
+    return EnhanceResult(
+        transcript=transcript,
+        enhanced_prompt=enhanced_prompt,
+        mode="clean",
+        citations=[],
+        intent=intent,
+        scope_used=scope_used_list,
+        queries_used=queries_used_list,
+        warnings=[],
+        timings_ms={"llm_ms": llm_ms},
     )
