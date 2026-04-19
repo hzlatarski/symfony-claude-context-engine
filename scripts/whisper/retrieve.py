@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from knowledge_mcp_server import (
+    _search_codebase_impl,
     _search_knowledge_impl,
     _search_raw_daily_impl,
 )
@@ -24,17 +25,6 @@ VALID_SCOPES = {"articles", "code", "daily"}
 RRF_K = 60  # Textbook RRF constant; same used by hybrid_search
 TOP_N_DEFAULT = 12
 PER_QUERY_LIMIT = 5
-
-
-def _search_codebase_impl(query: str, limit: int = PER_QUERY_LIMIT) -> list[dict[str, Any]]:
-    """Stub for codebase search — wired up in a later task.
-
-    Kept as a module-level name so tests can monkeypatch it and so the
-    downstream retrieve() call flow is identical to the article/daily
-    channels. Returns an empty list until a real code-search backend
-    (e.g. a Tree-sitter + BM25 index) is plugged in.
-    """
-    return []
 
 
 def rrf_merge(
