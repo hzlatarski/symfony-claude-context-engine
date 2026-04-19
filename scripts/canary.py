@@ -299,20 +299,25 @@ def main():
 
     # Run whisper drift canary (only when not filtering by --id)
     whisper_failed = False
+    whisper_errored = False
     if not args.id:
         print("\n[whisper] whisper:tailwind-rebuild")
         wresult = run_whisper_canary()
         label = "PASS" if wresult["passed"] else "FAIL"
         print(f"  {label} — {wresult['detail']}")
         if not wresult["passed"]:
-            whisper_failed = True
+            if wresult["detail"].startswith("exception:"):
+                whisper_errored = True
+            else:
+                whisper_failed = True
 
     passed_count = sum(1 for r in results if r.status == "passed")
     failed_count = sum(1 for r in results if r.status == "failed")
     errored_count = sum(1 for r in results if r.status == "errored")
 
-    if errored_count > 0:
-        print(f"\n{errored_count} canary/canaries errored (infrastructure failure - retry may help)")
+    if errored_count > 0 or whisper_errored:
+        total_errored = errored_count + int(whisper_errored)
+        print(f"\n{total_errored} canary/canaries errored (infrastructure failure - retry may help)")
         return 2  # different exit code from drift failures
     if failed_count > 0 or whisper_failed:
         print(f"\n{failed_count + int(whisper_failed)} canary/canaries failed - knowledge base may be drifting!")

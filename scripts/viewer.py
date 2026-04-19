@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -343,7 +344,7 @@ def _today_flush_total(state: dict[str, Any]) -> float:
 
 
 def _chroma_stats() -> dict[str, int]:
-    """Ask vector_store how many articles + daily chunks are indexed.
+    """Ask vector_store + codebase_store how many items are indexed.
 
     Swallowed in a broad try/except because Chroma initialization can fail
     if the ONNX model isn't cached yet — the viewer should still boot and
@@ -351,9 +352,12 @@ def _chroma_stats() -> dict[str, int]:
     """
     try:
         import vector_store
-        return vector_store.stats()
+        import codebase_store
+        s = vector_store.stats()
+        s.update(codebase_store.stats())
+        return s
     except Exception:
-        return {"articles": 0, "daily_chunks": 0}
+        return {"articles": 0, "daily_chunks": 0, "codebase_chunks": 0}
 
 
 # -----------------------------------------------------------------------------
@@ -368,7 +372,16 @@ def create_app(knowledge_dir: Path | None = None) -> FastAPI:
     for tests — TestClient can point at a temp dir full of fixture articles
     without touching the real knowledge store.
     """
-    app = FastAPI(title="memory-compiler viewer", docs_url=None, redoc_url=None)
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        try:
+            from whisper.transcribe import preload_model
+            preload_model()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("whisper model preload failed at startup: %s", exc)
+        yield
+
+    app = FastAPI(title="memory-compiler viewer", docs_url=None, redoc_url=None, lifespan=_lifespan)
     kb = knowledge_dir or config.KNOWLEDGE_DIR
 
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -423,6 +436,7 @@ def create_app(knowledge_dir: Path | None = None) -> FastAPI:
                 "total_flushes_tracked": len(flush_state.get("flush_costs", [])),
                 "chroma_articles": chroma.get("articles", 0),
                 "chroma_daily_chunks": chroma.get("daily_chunks", 0),
+                "chroma_codebase_chunks": chroma.get("codebase_chunks", 0),
                 "ingest_files_count": len(ingest_state.get("ingested", {})),
                 "contradictions": contradictions[:10],
                 "total_contradictions": len(contradictions),
@@ -565,6 +579,69 @@ def create_app(knowledge_dir: Path | None = None) -> FastAPI:
             request, "contradictions.html", {"rows": rows},
         )
 
+    _FT_COLORS: dict[str, str] = {
+        "php": "#60a5fa",   # blue
+        "js": "#f59e0b",    # amber
+        "twig": "#34d399",  # emerald
+        "yaml": "#a78bfa",  # purple
+    }
+
+    @app.get("/code", response_class=HTMLResponse)
+    def code_search(
+        request: Request,
+        q: str | None = Query(None),
+        file_type: str | None = Query(None),
+    ) -> HTMLResponse:
+        import codebase_store
+
+        valid_ft = file_type if file_type in _FT_COLORS else None
+        file_types = sorted(_FT_COLORS)
+
+        results = None
+        if q:
+            raw = codebase_store.search_codebase(query=q, limit=20, file_type=valid_ft)
+            results = []
+            for hit in raw:
+                meta = hit.get("metadata") or {}
+                text = hit.get("text") or ""
+                lines = text.splitlines()
+                snippet_lines = lines[:60]
+                snippet = "\n".join(snippet_lines)
+                if len(lines) > 60:
+                    snippet += "\n…"
+                results.append({
+                    "rel_path": hit.get("rel_path") or meta.get("rel_path", ""),
+                    "file_type": meta.get("file_type", ""),
+                    "start_line": meta.get("start_line"),
+                    "end_line": meta.get("end_line"),
+                    "symbols": meta.get("symbols", ""),
+                    "snippet": snippet,
+                    "distance": hit.get("distance", 0.0),
+                })
+
+        chroma_total = 0
+        type_counts: list[tuple[str, int]] = []
+        try:
+            chroma_total = codebase_store.stats().get("codebase_chunks", 0)
+            ts = codebase_store.type_stats()
+            type_counts = [(ft, ts.get(ft, 0)) for ft in file_types]
+        except Exception:
+            pass
+
+        return templates.TemplateResponse(
+            request,
+            "code.html",
+            {
+                "q": q or "",
+                "file_type": valid_ft or "",
+                "file_types": file_types,
+                "results": results,
+                "ft_colors": _FT_COLORS,
+                "total_chunks": chroma_total,
+                "type_counts": type_counts,
+            },
+        )
+
     @app.get("/stats", response_class=HTMLResponse)
     def stats(request: Request) -> HTMLResponse:
         flush_state = load_flush_state()
@@ -594,15 +671,6 @@ def create_app(knowledge_dir: Path | None = None) -> FastAPI:
                 "total_flushes_tracked": len(flush_state.get("flush_costs", [])),
             },
         )
-
-    # ── whisper model pre-warm ────────────────────────────────────────
-    @app.on_event("startup")
-    def _preload_whisper_model() -> None:
-        try:
-            from whisper.transcribe import preload_model
-            preload_model()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("whisper model preload failed at startup: %s", exc)
 
     # ── whisper voice-to-prompt endpoints ────────────────────────────
     from whisper.orchestrator import (
