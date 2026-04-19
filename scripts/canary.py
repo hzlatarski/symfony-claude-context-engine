@@ -221,6 +221,37 @@ def generate_report(results: list[CanaryResult]) -> str:
     return "\n".join(lines)
 
 
+def run_whisper_canary() -> dict:
+    """Drift canary for the grounded rewrite pipeline.
+
+    Uses a pre-transcribed voice-style phrase ('how do I run the tailwind
+    rebuild command?') so the canary is deterministic and doesn't require
+    Whisper to be loaded. Asserts the rewrite cites the rebuild command
+    string from the feedback memory.
+
+    Returns a dict compatible with the other canary entries:
+        {"name": str, "passed": bool, "detail": str}
+    """
+    from whisper.orchestrator import enhance_from_transcript
+
+    transcript = "how do I run the tailwind rebuild command"
+    expected_substrings = ["@tailwindcss/cli", "var/tailwind/app.built.css"]
+
+    try:
+        result = enhance_from_transcript(transcript=transcript, mode="rewrite")
+    except Exception as exc:  # noqa: BLE001
+        return {"name": "whisper:tailwind-rebuild", "passed": False, "detail": f"exception: {exc}"}
+
+    missing = [s for s in expected_substrings if s not in result.enhanced_prompt]
+    if missing:
+        return {
+            "name": "whisper:tailwind-rebuild",
+            "passed": False,
+            "detail": f"prompt missing expected substrings: {missing}",
+        }
+    return {"name": "whisper:tailwind-rebuild", "passed": True, "detail": "ok"}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run canary questions against the knowledge base")
     parser.add_argument("--id", type=str, help="Run a specific canary by id")
@@ -266,6 +297,16 @@ def main():
     report_path.write_text(report, encoding="utf-8")
     print(f"\nReport saved to: {report_path}")
 
+    # Run whisper drift canary (only when not filtering by --id)
+    whisper_failed = False
+    if not args.id:
+        print("\n[whisper] whisper:tailwind-rebuild")
+        wresult = run_whisper_canary()
+        label = "PASS" if wresult["passed"] else "FAIL"
+        print(f"  {label} — {wresult['detail']}")
+        if not wresult["passed"]:
+            whisper_failed = True
+
     passed_count = sum(1 for r in results if r.status == "passed")
     failed_count = sum(1 for r in results if r.status == "failed")
     errored_count = sum(1 for r in results if r.status == "errored")
@@ -273,8 +314,8 @@ def main():
     if errored_count > 0:
         print(f"\n{errored_count} canary/canaries errored (infrastructure failure - retry may help)")
         return 2  # different exit code from drift failures
-    if failed_count > 0:
-        print(f"\n{failed_count} canary/canaries failed - knowledge base may be drifting!")
+    if failed_count > 0 or whisper_failed:
+        print(f"\n{failed_count + int(whisper_failed)} canary/canaries failed - knowledge base may be drifting!")
         return 1
     print(f"\nAll {passed_count} canaries passed.")
     return 0

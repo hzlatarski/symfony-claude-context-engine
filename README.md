@@ -13,6 +13,7 @@ A long-term memory system for Claude Code, purpose-built for Symfony projects. S
 ## Key Features
 
 - 🖥 **[Web Viewer UI](#web-viewer)** — Read-only FastAPI dashboard at **<http://127.0.0.1:37778>**. One command (`uv run python scripts/viewer.py`), no build step, no auth. Browse articles, daily logs, tool drawer, contradictions, and cost history.
+- 🎙 **[Voice-to-enhanced-prompt](#whisper-prompt)** — Mic page at **<http://127.0.0.1:37778/whisper>**. Speak a question; the pipeline transcribes it locally (faster-whisper, CPU), expands it via Haiku query-expansion, retrieves grounding from the knowledge base, and rewrites it into a fully grounded Claude prompt. Three modes: verbatim, rewrite, clean.
 - 🧠 **Curated memory, not a grep-pile** — Sessions compile into structured articles with Truth + Timeline format, `[[wikilinks]]`, and `[src:path]` provenance anchors. Human-readable, diffable, Obsidian-compatible.
 - 🏷 **Memory type taxonomy** — Every article is a `fact`, `event`, `discovery`, `preference`, `advice`, or `decision`. First-class filter in `search_knowledge` so "only preferences about testing" is one call.
 - 🔍 **Hybrid BM25 + vector search** — Two dedicated MCP servers: `knowledge-compiler` for semantic+lexical retrieval, `symfony-code-intel` for live codebase structure. Fused via Reciprocal Rank Fusion.
@@ -262,6 +263,72 @@ uv run python scripts/viewer.py
 | `/stats` | Chroma collection sizes, recent 20 flush records with per-session costs |
 
 **Design notes.** Dark "tactical" theme matching the MHB project aesthetic. Memory-type tinting (`fact` blue, `event` amber, `discovery` purple, `preference` pink, `advice` teal, `decision` red) is driven by a single `type_colors` Jinja global so nav chips, badges, and card borders stay in sync — the type-tinted card border idea is borrowed from [thedotmack/claude-mem](https://github.com/thedotmack/claude-mem)'s React viewer. Read-only on principle: no mutation endpoints anywhere, and binding to `127.0.0.1` (not `0.0.0.0`) means it's never accessible from the LAN. Port `37778` is one above claude-mem's `37777` to avoid collision when both tools live on the same box.
+
+---
+
+## whisper-prompt
+
+A voice-to-enhanced-prompt pipeline baked into the Web Viewer. Speak a question; the pipeline transcribes it locally, expands it into multi-angle search queries, retrieves grounding from the knowledge base, and rewrites your words into a precise, citation-grounded Claude prompt.
+
+```bash
+uv run python scripts/viewer.py
+# → http://127.0.0.1:37778/whisper
+```
+
+### How it works
+
+```
+Mic → faster-whisper (CPU) → Haiku query expansion
+    → parallel BM25+vector retrieval (articles / code / daily)
+    → RRF merge → Sonnet grounded rewrite → enhanced prompt + citations
+```
+
+1. **Transcribe** — faster-whisper runs fully local (no API call). Model is pre-warmed at viewer startup so the first request has no cold-start penalty.
+2. **Expand** — Haiku decomposes the transcript into 3–5 targeted sub-queries (articles, code, daily scopes).
+3. **Retrieve** — parallel BM25 + vector searches across the selected scopes; results merged via Reciprocal Rank Fusion.
+4. **Rewrite** — Sonnet rewrites the transcript into a complete, grounded prompt with inline `[[wikilink]]` citations.
+
+### Modes
+
+| Mode | What it produces |
+|------|-----------------|
+| **verbatim** | Your transcript, unchanged — no rewrite, just grounding citations appended |
+| **rewrite** | Full Sonnet rewrite grounded in retrieved knowledge — default |
+| **clean** | Rewrite without `[[wikilink]]` citations — paste-ready for non-wiki contexts |
+
+### Keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Space` | Toggle recording |
+| `Cmd/Ctrl+Enter` | Copy enhanced prompt |
+| `Cmd/Ctrl+R` | Re-enhance with current scope |
+| `1` / `2` / `3` | Switch mode (verbatim / rewrite / clean) |
+
+### Scope override
+
+After transcription, toggle the **articles**, **code**, and **daily** scope chips to re-run retrieval against only the stores you care about. Pressing **Regenerate** re-calls `/api/whisper/re-enhance` with the cached transcript and new scope — no re-transcription.
+
+### Configuration
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `MEMORY_COMPILER_MODEL_FLUSH` | `claude-haiku-4-5-20251001` | Used for query expansion |
+| `MEMORY_COMPILER_MODEL_COMPILE` | `claude-sonnet-4-6` | Used for grounded rewrite |
+| `WHISPER_MODEL_SIZE` | `base` | faster-whisper model size (`tiny`, `base`, `small`, `medium`, `large-v3`) |
+
+### Cost per utterance
+
+| Step | Model | Typical cost |
+|------|-------|-------------|
+| Transcription | local (CPU) | **$0.00** |
+| Query expansion | Haiku | ~$0.001 |
+| Grounded rewrite | Sonnet | ~$0.01–0.03 |
+| **Total** | | **~$0.01–0.03** |
+
+### Drift canary
+
+`canary.py` includes a dedicated whisper pipeline canary (`whisper:tailwind-rebuild`) that feeds a pre-canned transcript through the grounded rewrite and asserts the result cites the expected command strings from the feedback memory. Run automatically when you run `uv run python scripts/canary.py` without `--id`.
 
 ---
 

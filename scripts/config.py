@@ -52,6 +52,13 @@ MODEL_COMPILE = os.environ.get("MEMORY_COMPILER_MODEL_COMPILE", "claude-sonnet-4
 MODEL_INGEST = os.environ.get("MEMORY_COMPILER_MODEL_INGEST", "claude-sonnet-4-6")
 MODEL_QUERY = os.environ.get("MEMORY_COMPILER_MODEL_QUERY", "claude-sonnet-4-6")
 MODEL_CANARY = os.environ.get("MEMORY_COMPILER_MODEL_CANARY", "claude-haiku-4-5-20251001")
+MODEL_REWRITE = os.environ.get("MEMORY_COMPILER_MODEL_REWRITE", "claude-sonnet-4-6")
+MODEL_EXPAND = os.environ.get("MEMORY_COMPILER_MODEL_EXPAND", "claude-haiku-4-5-20251001")
+MODEL_CLEAN = os.environ.get("MEMORY_COMPILER_MODEL_CLEAN", "claude-haiku-4-5-20251001")
+
+# ── Whisper (voice transcription) ─────────────────────────────────────
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base")
+WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 
 
 def now_iso() -> str:

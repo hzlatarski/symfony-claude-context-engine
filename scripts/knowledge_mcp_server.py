@@ -214,6 +214,47 @@ def _list_contradictions_impl() -> dict[str, Any]:
     return {"quarantined": slugs, "count": len(slugs)}
 
 
+_CODEBASE_FILE_TYPES = {"php", "js", "twig", "yaml"}
+
+
+def _search_codebase_impl(
+    query: str,
+    limit: int = 5,
+    file_type: str | None = None,
+) -> list[dict]:
+    """Search indexed source code chunks by semantic similarity.
+
+    Validates file_type before dispatching to codebase_store so the
+    agent gets a clear ValueError instead of silently-empty results
+    when passing an unsupported extension.
+    """
+    if file_type is not None and file_type not in _CODEBASE_FILE_TYPES:
+        raise ValueError(
+            f"file_type must be one of {sorted(_CODEBASE_FILE_TYPES)}, got {file_type!r}"
+        )
+
+    import codebase_store
+
+    raw = codebase_store.search_codebase(query=query, limit=limit, file_type=file_type)
+    out = []
+    for hit in raw:
+        text = hit.get("text") or ""
+        meta = hit.get("metadata") or {}
+        preview = text[:300]
+        if len(text) > 300:
+            preview = preview.rstrip() + "…"
+        rel = hit.get("rel_path") or meta.get("rel_path", "")
+        start = meta.get("start_line")
+        end = meta.get("end_line")
+        path = f"{rel}:{start}-{end}" if start and end else rel
+        entry: dict = {"path": path, "preview": preview}
+        symbols = meta.get("symbols") or ""
+        if symbols:
+            entry["symbols"] = symbols
+        out.append(entry)
+    return out
+
+
 # -----------------------------------------------------------------------------
 # FastMCP server bindings
 # -----------------------------------------------------------------------------
@@ -370,6 +411,44 @@ def _make_server():
             ``{quarantined: [slug, ...], count: int}``
         """
         return _list_contradictions_impl()
+
+    @server.tool()
+    def search_codebase(
+        query: str,
+        limit: int = 5,
+        file_type: str | None = None,
+    ) -> list[dict]:
+        """Search indexed source code files by semantic similarity.
+
+        Use when you need to find code that implements a concept — e.g.
+        "how does authentication work?" returns actual PHP/Twig/JS file
+        paths with code excerpts, not prose articles about them.
+        Complements search_knowledge (which searches compiled articles).
+
+        Run `index_codebase.py --all` first if the index is empty.
+        The index is auto-updated after every Write/Edit via the
+        PostToolUse hook — no manual refresh needed in normal operation.
+
+        Indexed: src/**/*.php, assets/controllers/**/*.js,
+        templates/**/*.twig, config/**/*.yaml
+
+        Args:
+            query: natural-language question or code identifier
+            limit: max results (default 5)
+            file_type: restrict to 'php', 'js', 'twig', or 'yaml'
+
+        Returns:
+            List of slim hits: ``{path, preview}`` plus ``symbols`` when
+            non-empty. ``path`` is ``rel_path:start-end`` (git/IDE-style
+            line range, relative to the Symfony project root) — pass the
+            file portion to the ``Read`` tool with ``offset=start`` and
+            ``limit=end-start`` to get the full chunk canonically from
+            disk (the index may lag edits; Read cannot). ``preview`` is
+            a ~300-char excerpt to decide if a hit is worth expanding.
+            ``symbols`` (PHP only) lists class/method names in the chunk
+            and anchors identifier-shaped queries.
+        """
+        return _search_codebase_impl(query=query, limit=limit, file_type=file_type)
 
     return server
 

@@ -44,16 +44,32 @@ for path in (str(_ROOT), str(_HERE)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from fastapi import FastAPI, HTTPException, Query, Request  # noqa: E402
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile  # noqa: E402
+from pydantic import BaseModel as _BaseModel  # noqa: E402
 from fastapi.responses import HTMLResponse, RedirectResponse  # noqa: E402
 from fastapi.templating import Jinja2Templates  # noqa: E402
 from markdown_it import MarkdownIt  # noqa: E402
 
 import yaml  # noqa: E402
 
+import logging  # noqa: E402
+
 import config  # noqa: E402
 from compile_truth import strip_frontmatter  # noqa: E402
 from utils import load_contradictions  # noqa: E402
+
+
+logger = logging.getLogger(__name__)
+
+
+# Request model for the /api/whisper/re-enhance endpoint.
+# Defined at module level so Pydantic v2 can fully resolve the type at import
+# time; local class definitions inside create_app() cause forward-reference
+# errors when FastAPI registers the route.
+class _ReEnhanceRequest(_BaseModel):
+    transcript: str
+    mode: str = "rewrite"
+    scope_override: list[str] | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -578,6 +594,81 @@ def create_app(knowledge_dir: Path | None = None) -> FastAPI:
                 "total_flushes_tracked": len(flush_state.get("flush_costs", [])),
             },
         )
+
+    # ── whisper model pre-warm ────────────────────────────────────────
+    @app.on_event("startup")
+    def _preload_whisper_model() -> None:
+        try:
+            from whisper.transcribe import preload_model
+            preload_model()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("whisper model preload failed at startup: %s", exc)
+
+    # ── whisper voice-to-prompt endpoints ────────────────────────────
+    from whisper.orchestrator import (
+        enhance_from_audio,
+        enhance_from_transcript,
+        NoSpeechError,
+    )
+    from whisper.types import EnhanceResult as _WhResult
+    from dataclasses import asdict as _asdict
+
+    def _result_to_json(r: _WhResult) -> dict:
+        return {
+            "transcript": r.transcript,
+            "enhanced_prompt": r.enhanced_prompt,
+            "mode": r.mode,
+            "citations": [_asdict(h) for h in r.citations],
+            "intent": r.intent,
+            "scope_used": r.scope_used,
+            "queries_used": r.queries_used,
+            "warnings": r.warnings,
+            "timings_ms": r.timings_ms,
+        }
+
+    @app.get("/whisper", response_class=HTMLResponse)
+    def whisper_page(request: Request) -> HTMLResponse:
+        return templates.TemplateResponse(
+            request,
+            "whisper.html",
+            {"request": request},
+        )
+
+    @app.post("/api/whisper/enhance")
+    async def whisper_enhance_endpoint(
+        audio: UploadFile = File(...),  # noqa: B008
+        mode: str = Form(...),
+        language: str = Form("auto"),
+    ):
+        from fastapi.concurrency import run_in_threadpool
+        if mode not in ("verbatim", "rewrite", "clean"):
+            raise HTTPException(status_code=422, detail=f"invalid mode: {mode!r}")
+        audio_bytes = await audio.read()
+        try:
+            result = await run_in_threadpool(
+                enhance_from_audio, audio_bytes, mode, language,
+            )
+        except NoSpeechError:
+            raise HTTPException(status_code=422, detail="no_speech_detected")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("whisper enhance failed")
+            raise HTTPException(status_code=503, detail=f"transcription_failed: {exc}")
+        return _result_to_json(result)
+
+    @app.post("/api/whisper/re-enhance")
+    async def whisper_re_enhance_endpoint(payload: _ReEnhanceRequest = Body(...)) -> dict:  # noqa: B008
+        from fastapi.concurrency import run_in_threadpool
+        transcript = payload.transcript
+        mode = payload.mode
+        scope_override = payload.scope_override
+        if not transcript.strip():
+            raise HTTPException(status_code=422, detail="empty transcript")
+        if mode not in ("verbatim", "rewrite", "clean"):
+            raise HTTPException(status_code=422, detail=f"invalid mode: {mode!r}")
+        result = await run_in_threadpool(
+            enhance_from_transcript, transcript, mode, scope_override,
+        )
+        return _result_to_json(result)
 
     return app
 
