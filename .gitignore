@@ -44,3 +44,4 @@ scripts/uv.lock
 Thumbs.db
 
 .obsidian/
+.worktrees/
