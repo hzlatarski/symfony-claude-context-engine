@@ -139,13 +139,6 @@ _ANCHOR_RE = re.compile(r"\[src:([^\]]+)\]")
 _LINE_RANGE_SUFFIX_RE = re.compile(r":\d+-\d+$")
 
 
-@dataclass
-class RewriteOutput:
-    """Output of enhance_rewrite: the rewritten prompt + any warnings."""
-    prompt: str
-    warnings: list[str]
-
-
 def _build_context_block(hits: list[Hit]) -> str:
     """Render retrieved hits as a <context> block for the rewrite prompt."""
     lines = ["<context>"]
@@ -195,7 +188,13 @@ def verify_anchors(rewritten: str, hits: list[Hit]) -> tuple[str, list[str]]:
     return cleaned, warnings
 
 
-def enhance_rewrite(transcript: str, hits: list[Hit]) -> RewriteOutput:
+def enhance_rewrite(
+    transcript: str,
+    hits: list[Hit],
+    intent: str = "generic",
+    scope_used: list[str] | None = None,
+    queries_used: list[str] | None = None,
+) -> EnhanceResult:
     """Grounded Sonnet rewrite of the transcript using retrieved context.
 
     Takes a transcript and retrieved context hits, sends them to Claude
@@ -206,10 +205,12 @@ def enhance_rewrite(transcript: str, hits: list[Hit]) -> RewriteOutput:
     Args:
         transcript: The original transcript text to rewrite.
         hits: The list of retrieval hits to use as context.
+        intent: The user's intent (default "generic").
+        scope_used: List of scopes used for retrieval (default None -> []).
+        queries_used: List of queries used for retrieval (default None -> []).
 
     Returns:
-        RewriteOutput with prompt (rewritten text with verified anchors)
-        and warnings (list of any hallucinated paths that were stripped).
+        EnhanceResult with mode="rewrite", citations=hits, and verified anchors.
 
     Raises:
         EnhanceError: when hits is empty (caller should downgrade to verbatim).
@@ -217,16 +218,39 @@ def enhance_rewrite(transcript: str, hits: list[Hit]) -> RewriteOutput:
     if not hits:
         raise EnhanceError("enhance_rewrite requires at least one retrieved hit")
 
+    start_time_ms = int(time.perf_counter() * 1000)
+
     context_block = _build_context_block(hits)
     user_message = f"<transcript>\n{transcript}\n</transcript>\n\n{context_block}"
 
     client = _get_client()
+    llm_start_ms = int(time.perf_counter() * 1000)
     resp = client.messages.create(
         model=MODEL_REWRITE,
-        max_tokens=4096,
+        max_tokens=2048,
         system=REWRITE_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_message}],
     )
+    llm_end_ms = int(time.perf_counter() * 1000)
+    llm_ms = llm_end_ms - llm_start_ms
+
     raw = _extract_text(resp)
-    cleaned, warnings = verify_anchors(raw, hits)
-    return RewriteOutput(prompt=cleaned, warnings=warnings)
+    cleaned, anchor_warnings = verify_anchors(raw, hits)
+
+    scope_used_list = scope_used if scope_used is not None else []
+    queries_used_list = queries_used if queries_used is not None else []
+
+    end_time_ms = int(time.perf_counter() * 1000)
+    enhance_ms = end_time_ms - start_time_ms
+
+    return EnhanceResult(
+        transcript=transcript,
+        enhanced_prompt=cleaned,
+        mode="rewrite",
+        citations=hits,
+        intent=intent,
+        scope_used=scope_used_list,
+        queries_used=queries_used_list,
+        warnings=anchor_warnings,
+        timings_ms={"llm_ms": llm_ms, "enhance_ms": enhance_ms},
+    )
