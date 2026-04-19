@@ -22,6 +22,18 @@ class EnhanceError(Exception):
     pass
 
 
+@dataclass
+class RewriteOutput:
+    """Lightweight result from enhance_rewrite, consumed by the orchestrator.
+
+    Keeps the orchestrator decoupled from the full EnhanceResult structure —
+    it only needs the rewritten prompt text and any anchor-verification warnings.
+    """
+
+    prompt: str
+    warnings: list[str]
+
+
 @functools.lru_cache(maxsize=1)
 def _get_client() -> anthropic.Anthropic:
     """Get or create a cached Anthropic client."""
