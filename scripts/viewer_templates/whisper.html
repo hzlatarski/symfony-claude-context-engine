@@ -1,0 +1,371 @@
+{% extends "base.html" %}
+{% block title %}whisper-prompt · memory-compiler viewer{% endblock %}
+{% block content %}
+<style>
+  .whisper-wrap { max-width: 960px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+  .mode-row { display: flex; gap: 16px; }
+  .mode-row label { cursor: pointer; padding: 6px 12px; border: 1px solid #333; border-radius: 6px; }
+  .mode-row input[type=radio] { margin-right: 6px; }
+  .mode-row label.active { background: #1d4ed8; border-color: #3b82f6; color: #fff; }
+  .rec-panel { border: 1px solid #333; border-radius: 8px; padding: 32px; text-align: center; }
+  .rec-btn { font-size: 18px; padding: 16px 32px; border-radius: 999px; border: 1px solid #555; background: #1f2937; color: #fff; cursor: pointer; }
+  .rec-btn.recording { background: #b91c1c; border-color: #ef4444; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+  .rec-hint { margin-top: 10px; color: #94a3b8; font-size: 12px; }
+  .elapsed { margin-top: 8px; font-variant-numeric: tabular-nums; color: #93c5fd; }
+  .step-row { display: flex; gap: 8px; flex-wrap: wrap; font-size: 12px; color: #94a3b8; }
+  .step-row .step.active { color: #fbbf24; }
+  .step-row .step.done { color: #34d399; }
+  .panel { border: 1px solid #333; border-radius: 8px; padding: 12px; background: #0f172a; }
+  .panel h3 { margin: 0 0 8px 0; font-size: 12px; text-transform: uppercase; color: #94a3b8; letter-spacing: 0.08em; display: flex; align-items: center; gap: 8px; }
+  .panel h3 .copy-btn { margin-left: auto; }
+  .copy-btn { font-size: 11px; padding: 4px 10px; border: 1px solid #334155; background: #1e293b; color: #cbd5f5; border-radius: 4px; cursor: pointer; }
+  .copy-btn:active { background: #334155; }
+  .panel pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-family: ui-monospace, monospace; font-size: 13px; color: #e2e8f0; }
+  .scope-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .chip { padding: 4px 10px; border: 1px solid #334155; background: #1e293b; color: #94a3b8; border-radius: 999px; cursor: pointer; font-size: 12px; user-select: none; }
+  .chip.on { background: #1d4ed8; border-color: #3b82f6; color: #fff; }
+  .regenerate-btn { margin-left: auto; padding: 4px 12px; border: 1px solid #0369a1; background: #075985; color: #fff; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .citations-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+  .citations-list li { padding: 6px 8px; border-left: 3px solid #3b82f6; background: #0b1220; font-size: 12px; color: #cbd5f5; }
+  .citations-list .c-path { color: #60a5fa; font-family: ui-monospace, monospace; }
+  .timings { font-size: 11px; color: #64748b; }
+  .banner { padding: 8px 12px; border-radius: 6px; font-size: 12px; }
+  .banner.warning { background: #422006; color: #fbbf24; border: 1px solid #92400e; }
+  .banner.error { background: #450a0a; color: #fca5a5; border: 1px solid #7f1d1d; }
+  [hidden] { display: none !important; }
+</style>
+
+<div class="whisper-wrap">
+  <h2>whisper-prompt</h2>
+
+  <div class="mode-row" id="mode-row">
+    <label data-mode="verbatim"><input type="radio" name="mode" value="verbatim"> Verbatim</label>
+    <label data-mode="rewrite"><input type="radio" name="mode" value="rewrite" checked> Rewrite</label>
+    <label data-mode="clean"><input type="radio" name="mode" value="clean"> Clean</label>
+  </div>
+
+  <div class="rec-panel">
+    <button id="rec-btn" class="rec-btn">● Record</button>
+    <div class="rec-hint">click or press Space to toggle</div>
+    <div id="elapsed" class="elapsed" hidden>0.0s</div>
+    <div id="step-row" class="step-row" style="margin-top: 12px;" hidden>
+      <span class="step" data-step="transcribe">Transcribing</span>
+      <span class="step" data-step="expand_query">Expanding</span>
+      <span class="step" data-step="retrieve">Retrieving</span>
+      <span class="step" data-step="enhance">Enhancing</span>
+    </div>
+  </div>
+
+  <div id="error-banner" class="banner error" hidden></div>
+  <div id="warning-banner" class="banner warning" hidden></div>
+
+  <div class="panel" id="transcript-panel" hidden>
+    <h3>Transcript <button class="copy-btn" data-copy="transcript">copy</button></h3>
+    <pre id="transcript-text"></pre>
+  </div>
+
+  <div class="scope-row" id="scope-row" hidden>
+    <span style="font-size: 11px; color: #64748b; margin-right: 4px;">Scope:</span>
+    <span class="chip" data-scope="articles">articles</span>
+    <span class="chip" data-scope="code">code</span>
+    <span class="chip" data-scope="daily">daily</span>
+    <button id="regen-btn" class="regenerate-btn">↻ Regenerate</button>
+  </div>
+
+  <div class="panel" id="prompt-panel" hidden>
+    <h3>Enhanced prompt
+      <button class="copy-btn" data-copy="prompt">copy</button>
+      <button class="copy-btn" data-copy="prompt-open">copy + open</button>
+    </h3>
+    <pre id="prompt-text"></pre>
+  </div>
+
+  <div class="panel" id="citations-panel" hidden>
+    <h3>Citations (<span id="citations-count">0</span>)</h3>
+    <ul class="citations-list" id="citations-list"></ul>
+  </div>
+
+  <div class="timings" id="timings" hidden></div>
+</div>
+
+<script>
+(function () {
+  const recBtn = document.getElementById('rec-btn');
+  const stepRow = document.getElementById('step-row');
+  const elapsedEl = document.getElementById('elapsed');
+  const transcriptPanel = document.getElementById('transcript-panel');
+  const transcriptText = document.getElementById('transcript-text');
+  const scopeRow = document.getElementById('scope-row');
+  const promptPanel = document.getElementById('prompt-panel');
+  const promptText = document.getElementById('prompt-text');
+  const citationsPanel = document.getElementById('citations-panel');
+  const citationsList = document.getElementById('citations-list');
+  const citationsCount = document.getElementById('citations-count');
+  const timingsEl = document.getElementById('timings');
+  const errorBanner = document.getElementById('error-banner');
+  const warningBanner = document.getElementById('warning-banner');
+  const regenBtn = document.getElementById('regen-btn');
+
+  let mediaRecorder = null;
+  let chunks = [];
+  let startTs = 0;
+  let elapsedTimer = null;
+  let lastTranscript = '';
+  let lastScope = [];
+
+  // --- mode persistence ---
+  const SAVED_MODE = localStorage.getItem('whisper.mode') || 'rewrite';
+  document.querySelectorAll('input[name=mode]').forEach(r => {
+    r.checked = r.value === SAVED_MODE;
+    if (r.checked) r.closest('label').classList.add('active');
+  });
+  document.getElementById('mode-row').addEventListener('change', (e) => {
+    if (e.target.name === 'mode') {
+      localStorage.setItem('whisper.mode', e.target.value);
+      document.querySelectorAll('#mode-row label').forEach(l => l.classList.remove('active'));
+      e.target.closest('label').classList.add('active');
+    }
+  });
+
+  function currentMode() {
+    return document.querySelector('input[name=mode]:checked').value;
+  }
+
+  // --- recording ---
+  async function startRecording() {
+    resetResultPanels();
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+      chunks = [];
+      mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+      mediaRecorder.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop());
+        stopElapsedTimer();
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+        await sendAudio(blob);
+      };
+      mediaRecorder.start();
+      startTs = Date.now();
+      startElapsedTimer();
+      recBtn.textContent = '■ Stop';
+      recBtn.classList.add('recording');
+      elapsedEl.hidden = false;
+    } catch (err) {
+      showError('Microphone permission denied or unavailable: ' + err.message);
+    }
+  }
+
+  function stopRecording() {
+    if (!mediaRecorder || mediaRecorder.state !== 'recording') return;
+    recBtn.textContent = '… processing';
+    recBtn.disabled = true;
+    recBtn.classList.remove('recording');
+    mediaRecorder.stop();
+  }
+
+  function startElapsedTimer() {
+    elapsedTimer = setInterval(() => {
+      elapsedEl.textContent = ((Date.now() - startTs) / 1000).toFixed(1) + 's';
+    }, 100);
+  }
+  function stopElapsedTimer() {
+    clearInterval(elapsedTimer);
+    elapsedTimer = null;
+  }
+
+  async function sendAudio(blob) {
+    stepRow.hidden = false;
+    markStep('transcribe', 'active');
+    const form = new FormData();
+    form.append('audio', blob, 'recording.webm');
+    form.append('mode', currentMode());
+    form.append('language', 'auto');
+    try {
+      const resp = await fetch('/api/whisper/enhance', { method: 'POST', body: form });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ detail: 'unknown' }));
+        showError('Enhance failed: ' + (err.detail || resp.statusText));
+        resetRecordButton();
+        return;
+      }
+      const result = await resp.json();
+      renderResult(result);
+    } catch (err) {
+      showError('Network error: ' + err.message);
+    } finally {
+      resetRecordButton();
+    }
+  }
+
+  function resetRecordButton() {
+    recBtn.textContent = '● Record';
+    recBtn.disabled = false;
+    recBtn.classList.remove('recording');
+  }
+
+  function markStep(stepKey, klass) {
+    document.querySelectorAll('.step').forEach(el => {
+      if (el.dataset.step === stepKey) el.className = 'step ' + klass;
+    });
+  }
+
+  function resetResultPanels() {
+    errorBanner.hidden = true; warningBanner.hidden = true;
+    transcriptPanel.hidden = true; scopeRow.hidden = true;
+    promptPanel.hidden = true; citationsPanel.hidden = true;
+    timingsEl.hidden = true;
+    document.querySelectorAll('.step').forEach(el => el.className = 'step');
+  }
+
+  function showError(msg) {
+    errorBanner.textContent = msg;
+    errorBanner.hidden = false;
+  }
+  function showWarnings(warnings) {
+    if (!warnings || warnings.length === 0) return;
+    warningBanner.textContent = warnings.join(' · ');
+    warningBanner.hidden = false;
+  }
+
+  function renderResult(result) {
+    lastTranscript = result.transcript;
+    lastScope = result.scope_used;
+    markStep('transcribe', 'done'); markStep('expand_query', 'done');
+    markStep('retrieve', 'done'); markStep('enhance', 'done');
+
+    transcriptText.textContent = result.transcript;
+    transcriptPanel.hidden = false;
+
+    // Scope chips
+    document.querySelectorAll('.chip').forEach(c => {
+      c.classList.toggle('on', result.scope_used.includes(c.dataset.scope));
+    });
+    scopeRow.hidden = false;
+
+    promptText.textContent = result.enhanced_prompt;
+    promptPanel.hidden = false;
+
+    citationsList.innerHTML = '';
+    result.citations.forEach(h => {
+      const li = document.createElement('li');
+      const badge = h.source === 'code' ? '💻' : (h.source === 'daily' ? '🗒' : '📝');
+      const link = buildCitationLink(h);
+      li.innerHTML = `[${escapeHtml(h.id)}] ${badge} <a class="c-path" href="${link}" target="_blank">${escapeHtml(h.path)}</a> — ${escapeHtml(h.title)}`;
+      citationsList.appendChild(li);
+    });
+    citationsCount.textContent = result.citations.length;
+    citationsPanel.hidden = false;
+
+    const t = result.timings_ms;
+    timingsEl.textContent = 'Timings: ' + Object.entries(t).map(([k, v]) => `${k} ${v}ms`).join(' · ');
+    timingsEl.hidden = false;
+
+    showWarnings(result.warnings);
+  }
+
+  function buildCitationLink(h) {
+    if (h.source === 'code') {
+      // vscode://file/ABS? We don't know the absolute path; fall back to article viewer
+      // which won't know the path either. Best-effort: link to search with the path.
+      return '/articles?q=' + encodeURIComponent(h.path);
+    }
+    return '/articles/' + encodeURIComponent(h.path);
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+
+  // --- regenerate ---
+  regenBtn.addEventListener('click', async () => {
+    if (!lastTranscript) return;
+    const selected = Array.from(document.querySelectorAll('.chip.on')).map(c => c.dataset.scope);
+    if (selected.length === 0) {
+      showError('Select at least one scope chip.');
+      return;
+    }
+    regenBtn.disabled = true;
+    regenBtn.textContent = '↻ Regenerating…';
+    try {
+      const resp = await fetch('/api/whisper/re-enhance', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          transcript: lastTranscript,
+          mode: currentMode(),
+          scope_override: selected,
+        }),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ detail: 'unknown' }));
+        showError('Regenerate failed: ' + (err.detail || resp.statusText));
+        return;
+      }
+      const result = await resp.json();
+      renderResult(result);
+    } finally {
+      regenBtn.disabled = false;
+      regenBtn.textContent = '↻ Regenerate';
+    }
+  });
+
+  // scope chips toggle their own on-state
+  document.querySelectorAll('.chip').forEach(c => {
+    c.addEventListener('click', () => c.classList.toggle('on'));
+  });
+
+  // --- copy buttons ---
+  document.querySelectorAll('.copy-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const kind = btn.dataset.copy;
+      const text = kind === 'transcript' ? transcriptText.textContent : promptText.textContent;
+      try {
+        await navigator.clipboard.writeText(text);
+        btn.textContent = 'copied';
+        setTimeout(() => {
+          btn.textContent = kind === 'prompt-open' ? 'copy + open' : 'copy';
+        }, 1500);
+        if (kind === 'prompt-open') {
+          window.location.href = 'vscode://';
+        }
+      } catch (err) {
+        showError('Copy failed: ' + err.message);
+      }
+    });
+  });
+
+  // --- record button ---
+  recBtn.addEventListener('click', () => {
+    if (mediaRecorder && mediaRecorder.state === 'recording') stopRecording();
+    else startRecording();
+  });
+
+  // --- keyboard shortcuts ---
+  document.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (e.code === 'Space') {
+      e.preventDefault();
+      recBtn.click();
+    } else if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      const copyBtn = document.querySelector('.copy-btn[data-copy=prompt]');
+      if (copyBtn) copyBtn.click();
+    } else if ((e.ctrlKey || e.metaKey) && e.key === 'r') {
+      if (!regenBtn.disabled && !regenBtn.hidden) {
+        e.preventDefault();
+        regenBtn.click();
+      }
+    } else if (['1', '2', '3'].includes(e.key)) {
+      const modes = ['verbatim', 'rewrite', 'clean'];
+      const r = document.querySelector(`input[name=mode][value=${modes[parseInt(e.key, 10) - 1]}]`);
+      if (r) { r.checked = true; r.dispatchEvent(new Event('change', { bubbles: true })); }
+    }
+  });
+})();
+</script>
+{% endblock %}
