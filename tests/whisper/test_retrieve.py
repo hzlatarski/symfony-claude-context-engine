@@ -8,7 +8,6 @@ Mocks the three search_*_impl functions so we can verify:
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -159,6 +158,34 @@ def test_retrieve_scope_filtered_to_valid_channels(mock_searches):
 
     assert ksearch.called
     assert csearch.called
+
+
+def test_retrieve_converts_daily_hits_to_hit_dataclass(mock_searches):
+    _, _, dsearch = mock_searches
+    dsearch.return_value = [_daily_hit("daily/2026-04-15", "Today's log")]
+    from whisper.retrieve import retrieve
+
+    hits = retrieve(queries=["q1"], scope=["daily"])
+
+    assert len(hits) == 1
+    assert hits[0].source == "daily"
+    assert hits[0].category is None
+    assert hits[0].path == "daily/2026-04-15"
+    assert hits[0].title == "Today's log"
+
+
+def test_retrieve_failed_job_returns_empty_gracefully(mock_searches, caplog):
+    import logging
+
+    ksearch, _, _ = mock_searches
+    ksearch.side_effect = RuntimeError("chroma unavailable")
+    from whisper.retrieve import retrieve
+
+    with caplog.at_level(logging.WARNING, logger="whisper.retrieve"):
+        hits = retrieve(queries=["q1"], scope=["articles"])
+
+    assert hits == []
+    assert any("failed" in r.message for r in caplog.records)
 
 
 def test_rrf_prefers_items_ranked_high_in_multiple_queries():

@@ -45,25 +45,6 @@ def rrf_merge(
     return sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
 
 
-def _run_knowledge(query: str) -> list[dict[str, Any]]:
-    return _search_knowledge_impl(query=query, limit=PER_QUERY_LIMIT)
-
-
-def _run_codebase(query: str) -> list[dict[str, Any]]:
-    return _search_codebase_impl(query=query, limit=PER_QUERY_LIMIT)
-
-
-def _run_daily(query: str) -> list[dict[str, Any]]:
-    return _search_raw_daily_impl(query=query, limit=PER_QUERY_LIMIT)
-
-
-_CHANNEL_RUNNERS = {
-    "articles": _run_knowledge,
-    "code": _run_codebase,
-    "daily": _run_daily,
-}
-
-
 def _hit_key(channel: str, raw: dict[str, Any]) -> str:
     """Stable identity for a hit, so RRF can de-dupe across queries."""
     if channel == "code":
@@ -119,27 +100,20 @@ def retrieve(queries: list[str], scope: list[str], top_n: int = TOP_N_DEFAULT) -
     if not channels:
         return []
 
-    # Resolve runners lazily so monkeypatched module-level names are picked up.
-    runners = {
-        "articles": _run_knowledge,
-        "code": _run_codebase,
-        "daily": _run_daily,
-    }
-
     # Fan out: (channel, query) → raw hits, in parallel via threadpool.
     # The search impls are sync and CPU/IO bound via Chroma; threads are fine.
     jobs: list[tuple[str, str]] = [(c, q) for c in channels for q in queries]
     raw_by_job: dict[tuple[str, str], list[dict[str, Any]]] = {}
 
     def _dispatch(channel: str, query: str) -> list[dict[str, Any]]:
-        # Read the current module-level impl each call so monkeypatch wins.
-        import whisper.retrieve as _self
-
+        # Use globals() so monkeypatched module-level names are picked up at
+        # call time rather than at function-definition time.
+        g = globals()
         if channel == "articles":
-            return _self._search_knowledge_impl(query=query, limit=PER_QUERY_LIMIT)
+            return g["_search_knowledge_impl"](query=query, limit=PER_QUERY_LIMIT)
         if channel == "code":
-            return _self._search_codebase_impl(query=query, limit=PER_QUERY_LIMIT)
-        return _self._search_raw_daily_impl(query=query, limit=PER_QUERY_LIMIT)
+            return g["_search_codebase_impl"](query=query, limit=PER_QUERY_LIMIT)
+        return g["_search_raw_daily_impl"](query=query, limit=PER_QUERY_LIMIT)
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(jobs)))) as ex:
         future_to_job = {
