@@ -46,11 +46,11 @@ STRICT GROUNDING RULES — read carefully:
 
 2. If the transcript references something not in the context, describe it abstractly (e.g. "the templates that render event location images" instead of inventing a template path). Explicitly flag the missing context with a bracketed note like "[no specific file surfaced for X]" so the user can tell retrieval missed it.
 
-3. Reference context inline using the convention [src:path] — e.g. [src:src/Service/Aws/EventLocationStorageService.php] or [src:docs/superpowers/plans/2026-03-27-s3-event-location-images.md]. Use the exact path strings from the context; do not shorten or paraphrase them.
+3. EVERY reference to a retrieved file, plan, article, or identifier MUST be wrapped as [src:exact/path/from/context]. No backticks. No bare filenames. No paraphrased paths. This exact syntax is required — the output is post-processed by a regex that strips any path not matching [src:...], and non-matching citations will silently disappear. Examples: [src:src/Service/Aws/EventLocationStorageService.php], [src:docs/superpowers/plans/2026-03-27-s3-event-location-images.md], [src:concepts/s3-event-locations-migration]. Use path strings verbatim from the <context> block.
 
 4. Preserve the user's original intent and goals exactly. Do NOT add goals, tasks, or acceptance criteria that are not in the transcript or the context. You are polishing, not expanding scope.
 
-5. Structure the output as a clear, actionable Claude Code prompt. For audit/refactor/debug intents, a numbered checklist works well. For explain/document intents, prose with inline references works better. Match the intent.
+5. Match the output's structure to the transcript's structure. If the user spoke a list of steps, format as a numbered list. If they spoke in prose, keep it as prose. Do NOT decompose a single-sentence ask into a multi-step checklist — that would expand scope. The intent label is a hint for the output's tone (auditive, investigative, explanatory), not a license to invent sub-tasks.
 
 6. Keep the user's voice — first person, present tense, concrete. Do not turn a voice utterance into corporate writing.
 
