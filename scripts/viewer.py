@@ -28,6 +28,7 @@ don't need either because our store is markdown-on-disk).
 from __future__ import annotations
 
 import json
+import os
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -745,13 +746,13 @@ def main() -> None:
     """Entry point for ``uv run python scripts/viewer.py``.
 
     Bound to ``127.0.0.1`` on purpose — the viewer has zero auth, so it must
-    not be reachable from the LAN. Port 37778 is one above claude-mem's 37777
-    to avoid collision when both tools live on the same box (we're inspired
-    by them, not fighting over a port).
+    not be reachable from the LAN. Port 8765 used to avoid Windows Hyper-V
+    dynamic port reservations that commonly block 37778.
     """
     import uvicorn
+    port = int(os.environ.get("VIEWER_PORT", "9000"))
     app = create_app()
-    uvicorn.run(app, host="127.0.0.1", port=37778, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
 
 
 if __name__ == "__main__":

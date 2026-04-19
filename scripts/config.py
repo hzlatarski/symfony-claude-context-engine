@@ -6,6 +6,16 @@ from datetime import datetime, timezone
 # ── Paths ──────────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = ROOT_DIR.parent.parent  # Outer Symfony project root (outside .claude/)
+
+# Load .env.local from the Symfony project root so ANTHROPIC_API_KEY etc. are
+# available when running standalone scripts (viewer.py, canary.py, query.py).
+try:
+    from dotenv import load_dotenv
+    _env_local = PROJECT_ROOT / ".env.local"
+    if _env_local.exists():
+        load_dotenv(_env_local, override=False)
+except ImportError:
+    pass
 # Knowledge base lives at project root so the Agent SDK can write to it
 # (Claude Code blocks writes inside .claude/ even with bypassPermissions)
 KNOWLEDGE_DIR = PROJECT_ROOT / "knowledge"
@@ -27,6 +37,7 @@ SOURCES_FILE = ROOT_DIR / "sources.yaml"
 CHROMA_DB_DIR = KNOWLEDGE_DIR / "chroma"
 CHROMA_COLLECTION_ARTICLES = "articles"
 CHROMA_COLLECTION_DAILY = "daily_chunks"
+CHROMA_COLLECTION_CODEBASE = "codebase"
 
 # Memory type taxonomy (Phase 3). Centralized here so vector_store,
 # lint, and the knowledge MCP server share one source of truth.
