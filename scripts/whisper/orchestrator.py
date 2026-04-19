@@ -52,6 +52,7 @@ def enhance_verbatim(transcript: str, hits: list) -> str:
     This thin wrapper lives at module level so tests can monkeypatch it
     independently of the underlying whisper.enhance implementation.
     """
+    # Intentionally returns only the prompt string; the orchestrator builds the full EnhanceResult.
     result = _enhance_verbatim_impl(transcript, hits)
     return result.enhanced_prompt
 
