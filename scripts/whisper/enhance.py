@@ -143,7 +143,7 @@ def _build_context_block(hits: list[Hit]) -> str:
     """Render retrieved hits as a <context> block for the rewrite prompt."""
     lines = ["<context>"]
     for h in hits:
-        badge = {"article": "ARTICLE", "code": "CODE", "daily": "DAILY"}[h.source]
+        badge = {"article": "ARTICLE", "code": "CODE", "daily": "DAILY"}.get(h.source, h.source.upper())
         cat = f" category={h.category}" if h.category else ""
         lines.append(f"[{h.id}] {badge}{cat} path={h.path}")
         lines.append(f"  title: {h.title}")
@@ -180,7 +180,7 @@ def verify_anchors(rewritten: str, hits: list[Hit]) -> tuple[str, list[str]]:
     def replace(match: re.Match) -> str:
         raw = match.group(1).strip()
         if raw in valid_paths:
-            return match.group(0)
+            return f"[src:{raw}]"
         warnings.append(f"Removed unverifiable anchor: {raw}")
         return raw  # drop the [src:...] markup, keep the path text
 

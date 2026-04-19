@@ -510,3 +510,13 @@ def test_enhance_rewrite_many_hits_flow(mock_client):
     result = enhance_rewrite("x", hits)
 
     assert len(result.citations) == 10
+
+
+def test_verify_anchors_strips_whitespace_from_anchor_paths():
+    hits = [_hit("c1", "article", "concepts/foo")]
+    from whisper.enhance import verify_anchors
+
+    cleaned, warnings = verify_anchors("[src:  concepts/foo  ]", hits)
+
+    assert cleaned == "[src:concepts/foo]"
+    assert warnings == []
