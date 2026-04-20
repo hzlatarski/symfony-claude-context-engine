@@ -13,7 +13,7 @@ A long-term memory system for Claude Code, purpose-built for Symfony projects. S
 ## Key Features
 
 - 🖥 **[Web Viewer UI](#web-viewer)** — Read-only FastAPI dashboard at **<http://127.0.0.1:37778>**. One command (`uv run python scripts/viewer.py`), no build step, no auth. Browse articles, daily logs, tool drawer, contradictions, and cost history.
-- 🎙 **[Voice-to-enhanced-prompt](#whisper-prompt)** — Mic page at **<http://127.0.0.1:37778/whisper>**. Speak a question; the pipeline transcribes it locally (faster-whisper, CPU), expands it via Haiku query-expansion, retrieves grounding from the knowledge base, and rewrites it into a fully grounded Claude prompt. Three modes: raw, clean, rewrite.
+- 🎙 **[Voice-to-enhanced-prompt](#whisper-prompt)** — Mic page at **<http://127.0.0.1:37778/whisper>**. Speak a question; the pipeline transcribes it locally (faster-whisper, CPU), expands it via Haiku query-expansion, retrieves grounding from the knowledge base, and rewrites it into a fully grounded Claude prompt. Three modes: raw, clean, context.
 - 🖱 **[WhisperTray](#whisptertray)** — Standalone Windows system-tray dictation app. Global hotkey (customizable) starts recording from any window; a floating pill overlay shows state; on stop, the audio is transcribed and enhanced, then auto-pasted back into the window that was focused before recording started.
 - 🧠 **Curated memory, not a grep-pile** — Sessions compile into structured articles with Truth + Timeline format, `[[wikilinks]]`, and `[src:path]` provenance anchors. Human-readable, diffable, Obsidian-compatible.
 - 🏷 **Memory type taxonomy** — Every article is a `fact`, `event`, `discovery`, `preference`, `advice`, or `decision`. First-class filter in `search_knowledge` so "only preferences about testing" is one call.
@@ -281,13 +281,13 @@ uv run python scripts/viewer.py
 ```
 Mic → faster-whisper (CPU) → Haiku query expansion
     → parallel BM25+vector retrieval (articles / code / daily)
-    → RRF merge → Sonnet grounded rewrite → enhanced prompt + citations
+    → RRF merge → Sonnet context-grounded rewrite → enhanced prompt + citations
 ```
 
 1. **Transcribe** — faster-whisper runs fully local (no API call). Model is pre-warmed at viewer startup so the first request has no cold-start penalty.
 2. **Expand** — Haiku decomposes the transcript into 3–5 targeted sub-queries (articles, code, daily scopes).
 3. **Retrieve** — parallel BM25 + vector searches across the selected scopes; results merged via Reciprocal Rank Fusion.
-4. **Rewrite** — Sonnet rewrites the transcript into a complete, grounded prompt with inline `[[wikilink]]` citations.
+4. **Context** — Sonnet rewrites the transcript into a complete, grounded prompt with inline `[[wikilink]]` citations.
 
 ### Modes
 
@@ -295,7 +295,7 @@ Mic → faster-whisper (CPU) → Haiku query expansion
 |------|-----------------|
 | **raw** | Your transcript, unchanged — no AI, no rephrasing. Fastest. |
 | **clean** | Fix grammar and remove filler words. One quick Haiku call. |
-| **rewrite** | Full Sonnet rewrite grounded in retrieved knowledge — default. |
+| **context** | Full Sonnet rewrite grounded in retrieved knowledge — default. |
 
 ### Keyboard shortcuts
 
@@ -304,7 +304,7 @@ Mic → faster-whisper (CPU) → Haiku query expansion
 | `Space` | Toggle recording |
 | `Cmd/Ctrl+Enter` | Copy enhanced prompt |
 | `Cmd/Ctrl+R` | Re-enhance with current scope |
-| `1` / `2` / `3` | Switch mode (raw / clean / rewrite) |
+| `1` / `2` / `3` | Switch mode (raw / clean / context) |
 
 ### Scope override
 
@@ -315,7 +315,7 @@ After transcription, toggle the **articles**, **code**, and **daily** scope chip
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `MEMORY_COMPILER_MODEL_FLUSH` | `claude-haiku-4-5-20251001` | Used for query expansion |
-| `MEMORY_COMPILER_MODEL_COMPILE` | `claude-sonnet-4-6` | Used for grounded rewrite |
+| `MEMORY_COMPILER_MODEL_COMPILE` | `claude-sonnet-4-6` | Used for context-grounded rewrite |
 | `WHISPER_MODEL_SIZE` | `base` | faster-whisper model size (`tiny`, `base`, `small`, `medium`, `large-v3`) |
 
 ### Cost per utterance
@@ -324,12 +324,12 @@ After transcription, toggle the **articles**, **code**, and **daily** scope chip
 |------|-------|-------------|
 | Transcription | local (CPU) | **$0.00** |
 | Query expansion | Haiku | ~$0.001 |
-| Grounded rewrite | Sonnet | ~$0.01–0.03 |
+| Context-grounded rewrite | Sonnet | ~$0.01–0.03 |
 | **Total** | | **~$0.01–0.03** |
 
 ### Drift canary
 
-`canary.py` includes a dedicated whisper pipeline canary (`whisper:tailwind-rebuild`) that feeds a pre-canned transcript through the grounded rewrite and asserts the result cites the expected command strings from the feedback memory. Run automatically when you run `uv run python scripts/canary.py` without `--id`.
+`canary.py` includes a dedicated whisper pipeline canary (`whisper:tailwind-rebuild`) that feeds a pre-canned transcript through the context-grounded rewrite and asserts the result cites the expected command strings from the feedback memory. Run automatically when you run `uv run python scripts/canary.py` without `--id`.
 
 ---
 
@@ -355,7 +355,7 @@ uv run python whisper_tray/main.py
 |------|----------|------|
 | **raw** | Transcript only — no AI call | $0.00 |
 | **clean** | Haiku grammar fix + filler removal | ~$0.001 |
-| **rewrite** | Expand → retrieve KB → Sonnet grounded rewrite | ~$0.01–0.03 |
+| **context** | Expand → retrieve KB → Sonnet grounded rewrite | ~$0.01–0.03 |
 
 The mode can be changed per-recording from the pill overlay (radio buttons) or locked globally in Settings.
 
@@ -367,7 +367,7 @@ Open Settings from the system tray icon. Options:
 |---------|---------|-------|
 | Hotkey | `<ctrl>+<cmd>` | Click "Record…" to capture any combo |
 | Hotkey mode | `click_toggle` | `click_toggle` = press once to start, again to stop; `hold` = hold to record |
-| Enhancement mode | `rewrite` | `raw` / `clean` / `rewrite` |
+| Enhancement mode | `context` | `raw` / `clean` / `context` |
 | Mode lock | off | Hides the per-recording mode selector on the pill |
 | Auto-paste | on | Ctrl+V into the source window after enhance |
 | Microphone | Auto-detect | Choose any input device by name |

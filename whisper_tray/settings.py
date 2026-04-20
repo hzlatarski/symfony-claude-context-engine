@@ -10,7 +10,7 @@ SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 DEFAULTS: dict[str, Any] = {
     "hotkey": "<ctrl>+<cmd>",
     "hotkey_mode": "click_toggle",
-    "enhancement_mode": "rewrite",
+    "enhancement_mode": "context",
     "mode_lock_enabled": False,
     "auto_paste": True,
     "microphone": "auto",
@@ -27,8 +27,11 @@ def load_settings(path: Path = SETTINGS_FILE) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         settings = {**DEFAULTS, **data}
-        if settings.get("enhancement_mode") == "verbatim":
+        mode = settings.get("enhancement_mode")
+        if mode == "verbatim":
             settings["enhancement_mode"] = "raw"
+        elif mode == "rewrite":
+            settings["enhancement_mode"] = "context"
         return settings
     except (json.JSONDecodeError, OSError):
         return dict(DEFAULTS)

@@ -60,7 +60,8 @@ def _run_enhance_task(
     assert enhance_fn is not None
     assert no_speech_cls is not None
 
-    orchestrator_mode = "verbatim" if mode == "raw" else mode
+    _mode_map = {"raw": "verbatim", "context": "rewrite"}
+    orchestrator_mode = _mode_map.get(mode, mode)
     try:
         result = enhance_fn(audio=audio, mode=orchestrator_mode, language=language)
         entry = HistoryEntry(

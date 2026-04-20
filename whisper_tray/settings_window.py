@@ -83,7 +83,7 @@ class SettingsWindow(tk.Toplevel):
         self._enhance_var = tk.StringVar(
             value=self._settings.get("enhancement_mode", DEFAULTS["enhancement_mode"]))
         ttk.Combobox(self, textvariable=self._enhance_var,
-                     values=["raw", "clean", "rewrite"], state="readonly",
+                     values=["raw", "clean", "context"], state="readonly",
                      width=15).grid(row=row, column=1, **pad)
         row += 1
 
@@ -93,7 +93,7 @@ class SettingsWindow(tk.Toplevel):
         for mode, desc in [
             ("raw",     "Transcript only — no AI, no rephrasing. Fastest."),
             ("clean",   "Fix grammar & remove filler words. One quick AI call."),
-            ("rewrite", "Full prompt with project KB context. Best for Claude Code."),
+            ("context", "Full prompt with project KB context. Best for Claude Code."),
         ]:
             line = tk.Frame(mode_help_frame, bg=BG)
             line.pack(anchor="w")

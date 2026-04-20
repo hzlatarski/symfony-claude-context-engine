@@ -9,11 +9,11 @@ CANCEL_BG = "#444"
 STOP_BG = "#cc2222"
 DONE_BG = "#22aa44"
 WARN_BG = "#cc8800"
-MODE_OPTIONS = ["raw", "clean", "rewrite"]
+MODE_OPTIONS = ["raw", "clean", "context"]
 MODE_HELP = {
     "raw":     "Transcript only — no AI, no rephrasing. Fastest.",
     "clean":   "Fix grammar & remove filler words (um, uh). One quick AI call.",
-    "rewrite": "Full prompt with project KB context. Best for Claude Code.",
+    "context": "Full prompt with project KB context. Best for Claude Code.",
 }
 DOT_CHARS = ["⠋", "⠙", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 

@@ -128,7 +128,7 @@ class TrayIcon:
         mode_help_items = pystray.Menu(
             pystray.MenuItem("raw — transcript only, no AI, fastest", None, enabled=False),
             pystray.MenuItem("clean — fix grammar & remove filler words", None, enabled=False),
-            pystray.MenuItem("rewrite — full KB-grounded Sonnet prompt", None, enabled=False),
+            pystray.MenuItem("context — full prompt with KB context injected", None, enabled=False),
         )
 
         return pystray.Menu(
