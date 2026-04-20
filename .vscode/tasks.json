@@ -1,0 +1,64 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Setup Claude Context Engine",
+      "type": "shell",
+      "command": "uv run --directory .claude/memory-compiler python install.py",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "focus": true
+      },
+      "group": "build",
+      "detail": "One-command install: hooks, MCP servers, API key, memory symlink, ingest + reindex"
+    },
+    {
+      "label": "Start Knowledge Dashboard",
+      "type": "shell",
+      "command": "uv run --directory .claude/memory-compiler python scripts/viewer.py",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      },
+      "isBackground": true,
+      "problemMatcher": [],
+      "detail": "Launch the knowledge viewer at http://127.0.0.1:37778"
+    },
+    {
+      "label": "Run Ingest",
+      "type": "shell",
+      "command": "uv run --directory .claude/memory-compiler python scripts/ingest.py",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "group": "build",
+      "detail": "Ingest source files into the knowledge base"
+    },
+    {
+      "label": "Run Compile",
+      "type": "shell",
+      "command": "uv run --directory .claude/memory-compiler python scripts/compile.py",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "group": "build",
+      "detail": "Compile daily logs into knowledge articles (LLM step)"
+    }
+  ]
+}

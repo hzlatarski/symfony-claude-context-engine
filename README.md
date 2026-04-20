@@ -175,7 +175,46 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full retrieval pipeline
 
 ## Quick Start
 
-### 1. Clone into your project
+### One-command install
+
+```bash
+git clone https://github.com/hzlatarski/symfony-claude-context-engine.git .claude/memory-compiler
+uv run --directory .claude/memory-compiler python install.py
+```
+
+`install.py` does everything in one shot:
+
+1. Merges Claude Code hooks into `.claude/settings.json` (idempotent — safe to re-run)
+2. Registers MCP servers in `.mcp.json` at your project root
+3. Copies `sources.yaml.example` → `sources.yaml` (skipped if already present)
+4. Runs initial ingest + ChromaDB vector reindex
+
+After it finishes, edit `sources.yaml` to point at your project's docs and specs, then open Claude Code — the hooks fire automatically on the next session.
+
+#### VS Code: run setup from the Task Runner
+
+If you use VS Code, the repo includes a `.vscode/tasks.json` that exposes the installer as a runnable task. After cloning:
+
+1. Open the Command Palette → **Tasks: Run Task**
+2. Select **Setup Claude Context Engine**
+
+This runs the same `install.py` command in the integrated terminal — no manual typing required.
+
+### Browse the dashboard
+
+```bash
+uv run --directory .claude/memory-compiler python scripts/viewer.py
+# → http://127.0.0.1:37778
+```
+
+### Manual setup (advanced)
+
+If you prefer to run steps individually or need to integrate into an existing `.claude/settings.json` by hand:
+
+<details>
+<summary>Expand manual steps</summary>
+
+#### 1. Clone and sync deps
 
 ```bash
 git clone https://github.com/hzlatarski/symfony-claude-context-engine.git .claude/memory-compiler
@@ -183,7 +222,7 @@ cd .claude/memory-compiler
 uv sync
 ```
 
-### 2. Configure hooks
+#### 2. Configure hooks
 
 Merge into your project's `.claude/settings.json`:
 
@@ -200,7 +239,7 @@ Merge into your project's `.claude/settings.json`:
 
 `PostToolUse` fires after every tool call Claude Code makes and writes a structured JSONL drawer (`knowledge/daily/YYYY-MM-DD.tools.jsonl`) that `flush.py` later reads as ground-truth input for the Haiku flush summary — see "Structured Tool Drawer" above.
 
-### 3. Register MCP servers
+#### 3. Register MCP servers
 
 Create or merge `.mcp.json` at your project root:
 
@@ -219,7 +258,7 @@ Create or merge `.mcp.json` at your project root:
 }
 ```
 
-### 4. Seed knowledge and build the vector index
+#### 4. Seed knowledge and build the vector index
 
 ```bash
 cp sources.yaml.example sources.yaml
@@ -229,18 +268,13 @@ uv run python scripts/ingest.py           # compile source files into articles
 uv run python scripts/reindex.py --all    # backfill ChromaDB
 ```
 
-### 5. Use it
+#### 5. Use it
 
 Sessions accumulate automatically. Ask Claude to "search the knowledge base for X" and watch it call `search_knowledge`. After any doubt, verify with `search_raw_daily` or read the compiled article directly with `get_article`.
 
-### 6. Browse the dashboard
+</details>
 
-```bash
-uv run python scripts/viewer.py
-# → http://127.0.0.1:37778
-```
-
-See [Web Viewer](#web-viewer) below for everything it shows.
+See [Web Viewer](#web-viewer) below for everything the dashboard shows.
 
 ---
 

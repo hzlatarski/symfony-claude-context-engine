@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""
+One-command installer for Claude Context Engine — Symfony Edition.
+
+Usage (from inside the cloned repo):
+    uv run python install.py
+
+Full one-liner clone + install:
+    git clone https://github.com/hzlatarski/symfony-claude-context-engine.git .claude/memory-compiler
+    uv run --directory .claude/memory-compiler python install.py
+
+What it does:
+    1. Merges Claude Code hooks  →  .claude/settings.json
+    2. Merges MCP server entries →  .mcp.json  (project root)
+    3. Copies sources.yaml.example → sources.yaml  (if not already present)
+    4. Asks for ANTHROPIC_API_KEY  →  writes to .env.local  (if missing)
+    5. Asks about memory symlink   →  links .claude/memory/ to your Claude memory dir
+    6. Runs initial ingest + ChromaDB vector reindex
+"""
+from __future__ import annotations
+
+import json
+import os
+import platform
+import subprocess
+import sys
+from pathlib import Path
+
+# ── Path anchors ──────────────────────────────────────────────────────────────
+HERE = Path(__file__).resolve().parent      # .claude/memory-compiler/
+CLAUDE_DIR = HERE.parent                    # .claude/
+PROJECT_ROOT = HERE.parent.parent           # your Symfony project root
+
+# ── Hook config ───────────────────────────────────────────────────────────────
+HOOKS: dict[str, list] = {
+    "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/session-start.py", "timeout": 15}]}],
+    "PreCompact":   [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/pre-compact.py",    "timeout": 10}]}],
+    "SessionEnd":   [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/session-end.py",    "timeout": 10}]}],
+    "PostToolUse":  [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/post-tool-use.py",  "timeout": 5 }]}],
+}
+
+# ── MCP server config ─────────────────────────────────────────────────────────
+MCP_SERVERS: dict[str, dict] = {
+    "symfony-code-intel": {
+        "command": "uv",
+        "args": ["run", "--directory", ".claude/memory-compiler", "python", "scripts/mcp_server.py"],
+    },
+    "knowledge-compiler": {
+        "command": "uv",
+        "args": ["run", "--directory", ".claude/memory-compiler", "python", "scripts/knowledge_mcp_server.py"],
+    },
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _h1(msg: str) -> None:
+    print(f"\n\033[1;34m▶ {msg}\033[0m")
+
+def _ok(msg: str) -> None:
+    print(f"  \033[32m✓\033[0m {msg}")
+
+def _skip(msg: str) -> None:
+    print(f"  \033[33m–\033[0m {msg}  (already present — skipped)")
+
+def _warn(msg: str) -> None:
+    print(f"  \033[33m!\033[0m {msg}")
+
+def _fail(msg: str) -> None:
+    print(f"  \033[31m✗\033[0m {msg}")
+
+def _ask(prompt: str, default: str = "") -> str:
+    """Prompt user for input; return default on empty enter."""
+    suffix = f" [{default}]" if default else ""
+    try:
+        answer = input(f"  \033[36m?\033[0m {prompt}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    return answer if answer else default
+
+def _confirm(prompt: str, default: bool = True) -> bool:
+    """Ask a yes/no question."""
+    suffix = " [Y/n]" if default else " [y/N]"
+    try:
+        answer = input(f"  \033[36m?\033[0m {prompt}{suffix}: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    if answer in ("y", "yes"):
+        return True
+    if answer in ("n", "no"):
+        return False
+    return default
+
+
+# ── Step 1: merge hooks ───────────────────────────────────────────────────────
+def merge_settings_json() -> None:
+    _h1("Merging hooks → .claude/settings.json")
+    path = CLAUDE_DIR / "settings.json"
+
+    data: dict = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            _warn("settings.json exists but is not valid JSON — starting fresh")
+
+    hooks = data.setdefault("hooks", {})
+    added = 0
+    for event, entries in HOOKS.items():
+        bucket = hooks.setdefault(event, [])
+        our_cmd: str = entries[0]["hooks"][0]["command"]
+        already_there = any(
+            h.get("hooks", [{}])[0].get("command", "") == our_cmd
+            for h in bucket
+        )
+        if not already_there:
+            bucket.extend(entries)
+            added += 1
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    if added:
+        _ok(f"Added {added} hook(s) to {path.relative_to(PROJECT_ROOT)}")
+    else:
+        _skip(f"Hooks already present in {path.relative_to(PROJECT_ROOT)}")
+
+
+# ── Step 2: merge .mcp.json ───────────────────────────────────────────────────
+def merge_mcp_json() -> None:
+    _h1("Merging MCP servers → .mcp.json")
+    path = PROJECT_ROOT / ".mcp.json"
+
+    data: dict = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            _warn(".mcp.json exists but is not valid JSON — starting fresh")
+
+    servers = data.setdefault("mcpServers", {})
+    added = 0
+    for name, config in MCP_SERVERS.items():
+        if name not in servers:
+            servers[name] = config
+            added += 1
+
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    if added:
+        _ok(f"Added {added} MCP server(s) to .mcp.json")
+    else:
+        _skip("MCP servers already present in .mcp.json")
+
+
+# ── Step 3: sources.yaml ──────────────────────────────────────────────────────
+def copy_sources_yaml() -> None:
+    _h1("Setting up sources.yaml")
+    dst = HERE / "sources.yaml"
+    src = HERE / "sources.yaml.example"
+
+    if dst.exists():
+        _skip("sources.yaml")
+        return
+
+    if not src.exists():
+        _warn("sources.yaml.example not found — skipping")
+        return
+
+    dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    _ok("Copied sources.yaml.example → sources.yaml")
+    _warn("Edit sources.yaml to point at your project's docs and specs")
+
+
+# ── Step 4: Anthropic API key ─────────────────────────────────────────────────
+def setup_api_key() -> None:
+    _h1("Anthropic API key")
+
+    # Already in the environment (e.g. set system-wide)
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        _skip("ANTHROPIC_API_KEY already set in environment")
+        return
+
+    env_local = PROJECT_ROOT / ".env.local"
+
+    # Already in .env.local
+    if env_local.exists():
+        content = env_local.read_text(encoding="utf-8")
+        if "ANTHROPIC_API_KEY" in content:
+            _skip("ANTHROPIC_API_KEY already present in .env.local")
+            return
+
+    print("  The compile and flush pipelines require an Anthropic API key.")
+    print("  Get one at https://console.anthropic.com/settings/keys")
+    key = _ask("Paste your ANTHROPIC_API_KEY (leave blank to skip)")
+
+    if not key:
+        _warn("Skipped — you will need to set ANTHROPIC_API_KEY manually before running compile.py")
+        return
+
+    # Append to .env.local (or create it)
+    existing = env_local.read_text(encoding="utf-8") if env_local.exists() else ""
+    separator = "\n" if existing and not existing.endswith("\n") else ""
+    env_local.write_text(existing + separator + f"ANTHROPIC_API_KEY={key}\n", encoding="utf-8")
+    _ok(f"Written to {env_local.relative_to(PROJECT_ROOT)}")
+
+
+# ── Step 5: memory symlink ────────────────────────────────────────────────────
+def setup_memory_symlink() -> None:
+    _h1("Claude persistent memory symlink")
+
+    memory_link = CLAUDE_DIR / "memory"
+
+    if memory_link.exists() or memory_link.is_symlink():
+        _skip(".claude/memory already exists")
+        return
+
+    print("  The 'captured-memory' source in sources.yaml reads from .claude/memory/")
+    print("  This folder holds auto-memory Claude Code writes between sessions.")
+    print()
+
+    # Compute the default path
+    home = Path.home()
+    # Claude Code stores project memory at ~/.claude/projects/<slug>/memory/
+    # Try to guess the slug from the project root path
+    slug = PROJECT_ROOT.as_posix().replace("/", "-").lstrip("-")
+    default_memory = home / ".claude" / "projects" / slug / "memory"
+
+    print(f"  Default location: {default_memory}")
+    if not default_memory.exists():
+        # Try just the directory name as slug
+        name_slug = PROJECT_ROOT.name
+        alt = home / ".claude" / "projects" / f"c--wamp64-www-{name_slug}" / "memory"
+        if alt.exists():
+            default_memory = alt
+        else:
+            print("  (Directory not found yet — Claude Code creates it on first session)")
+
+    if not _confirm("Create .claude/memory → your Claude memory folder?"):
+        _warn("Skipped — captured-memory source will not load until the symlink is created")
+        return
+
+    target_str = _ask("Path to your Claude memory folder", str(default_memory))
+    target = Path(target_str).expanduser().resolve()
+
+    if not target.exists():
+        create = _confirm(f"  {target} does not exist. Create it?", default=True)
+        if create:
+            target.mkdir(parents=True, exist_ok=True)
+            _ok(f"Created {target}")
+        else:
+            _warn("Skipped — symlink not created")
+            return
+
+    try:
+        if platform.system() == "Windows":
+            # Use mklink /J (directory junction — works without admin on Windows 10+)
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(memory_link), str(target)],
+                check=True, capture_output=True,
+            )
+        else:
+            memory_link.symlink_to(target)
+        _ok(f"Linked .claude/memory → {target}")
+    except Exception as exc:
+        _fail(f"Could not create symlink: {exc}")
+        _warn(f"Create it manually:  mklink /J .claude\\memory \"{target}\"  (Windows)")
+        _warn(f"or:  ln -s \"{target}\" .claude/memory  (Mac/Linux)")
+
+
+# ── Step 6: ingest + reindex ──────────────────────────────────────────────────
+def run_ingest_and_reindex() -> None:
+    _h1("Running initial ingest + ChromaDB vector reindex")
+    uv_prefix = ["uv", "run", "--directory", str(HERE)]
+
+    print("  ingest.py …")
+    r = subprocess.run([*uv_prefix, "python", "scripts/ingest.py"], cwd=HERE)
+    if r.returncode != 0:
+        _fail("ingest.py failed — check output above")
+        sys.exit(1)
+    _ok("ingest.py done")
+
+    print("  reindex.py --all …")
+    r = subprocess.run([*uv_prefix, "python", "scripts/reindex.py", "--all"], cwd=HERE)
+    if r.returncode != 0:
+        _fail("reindex.py failed — check output above")
+        sys.exit(1)
+    _ok("reindex.py done (ChromaDB vector index built)")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main() -> None:
+    print("\033[1m")
+    print("╔════════════════════════════════════════════════╗")
+    print("║   Claude Context Engine — Symfony Edition      ║")
+    print("║   Setup                                        ║")
+    print("╚════════════════════════════════════════════════╝")
+    print("\033[0m", end="")
+    print(f"  Project root  :  {PROJECT_ROOT}")
+    print(f"  Engine path   :  {HERE}")
+
+    merge_settings_json()
+    merge_mcp_json()
+    copy_sources_yaml()
+    setup_api_key()
+    setup_memory_symlink()
+    run_ingest_and_reindex()
+
+    print("\n\033[1;32m✅  Setup complete!\033[0m\n")
+    print("Next steps:")
+    print("  1. Edit  .claude/memory-compiler/sources.yaml  to point at your docs")
+    print("  2. Re-run ingest after editing:")
+    print("       uv run --directory .claude/memory-compiler python scripts/ingest.py")
+    print("  3. Start the knowledge dashboard:")
+    print("       uv run --directory .claude/memory-compiler python scripts/viewer.py")
+    print("       → http://127.0.0.1:37778")
+    print("  4. Open Claude Code — hooks fire automatically on next session\n")
+
+
+if __name__ == "__main__":
+    main()
