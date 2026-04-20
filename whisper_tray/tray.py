@@ -125,11 +125,18 @@ class TrayIcon:
 
         lang_items = [lang_item(label, code) for label, code in LANGUAGE_OPTIONS]
 
+        mode_help_items = pystray.Menu(
+            pystray.MenuItem("raw — transcript only, no AI, fastest", None, enabled=False),
+            pystray.MenuItem("clean — fix grammar & remove filler words", None, enabled=False),
+            pystray.MenuItem("rewrite — full KB-grounded Sonnet prompt", None, enabled=False),
+        )
+
         return pystray.Menu(
             pystray.MenuItem("🎙 WhisperTray", None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("⏱ Hide for 1 hour", snooze_1h),
             pystray.MenuItem("⚙ Settings", lambda i, it: self._on_settings()),
+            pystray.MenuItem("❓ Modes", mode_help_items),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("🎤 Microphone", pystray.Menu(*mic_items)),
             pystray.MenuItem("🌐 Language", pystray.Menu(*lang_items)),
