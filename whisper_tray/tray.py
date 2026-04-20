@@ -68,6 +68,10 @@ class TrayIcon:
             self._icon.icon = _make_icon_image("#cc2222" if recording else "#8855ff")
             self._icon.update_menu()
 
+    def update_menu(self) -> None:
+        if self._icon:
+            self._icon.update_menu()
+
     def set_processing(self) -> None:
         if self._icon:
             self._icon.icon = _make_icon_image("#4488ff")
@@ -97,11 +101,11 @@ class TrayIcon:
             return pystray.MenuItem(label, select, checked=checked, radio=True)
 
         def history_item(entry: Any, truncated: str) -> pystray.MenuItem:
-            def reinject(icon: pystray.Icon, item: pystray.MenuItem) -> None:
-                from whisper_tray.injector import inject
-                inject(entry.enhanced_prompt, self._state.settings)
+            def copy_to_clipboard(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+                import pyperclip
+                pyperclip.copy(entry.enhanced_prompt)
 
-            return pystray.MenuItem(truncated, reinject)
+            return pystray.MenuItem(truncated, copy_to_clipboard)
 
         def history_submenu() -> pystray.Menu:
             entries = self._state.history.entries()

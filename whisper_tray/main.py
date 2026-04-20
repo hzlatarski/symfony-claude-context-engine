@@ -43,6 +43,7 @@ def _run_enhance_task(
     inject_fn: Callable | None = None,
     enhance_fn: Callable | None = None,
     no_speech_cls: type[Exception] | None = None,
+    on_history_updated: Callable | None = None,
 ) -> None:
     """Run the enhance pipeline in a background thread.
 
@@ -70,6 +71,8 @@ def _run_enhance_task(
             mode=result.mode,
         )
         history.append(entry)
+        if on_history_updated:
+            on_history_updated()
         if not cancel_event.is_set():
             if pill_ref[0]:
                 pill_ref[0].show_done()
@@ -189,6 +192,7 @@ def main() -> None:
             pill_ref=nonlocal_pill,
             settings=state.settings,
             target_hwnd=state.target_hwnd,
+            on_history_updated=tray.update_menu,
         )
 
     def poll() -> None:

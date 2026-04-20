@@ -12,6 +12,7 @@ no API key, ~90 MB one-time download on first instantiation.
 """
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from config import (
@@ -20,17 +21,21 @@ from config import (
 )
 
 _client: Any = None
+_lock = threading.Lock()
 
 
 def _get_client():
     global _client
     if _client is not None:
         return _client
-    import chromadb
-    import config
+    with _lock:
+        if _client is not None:
+            return _client
+        import chromadb
+        import config
 
-    config.CHROMA_DB_DIR.mkdir(parents=True, exist_ok=True)
-    _client = chromadb.PersistentClient(path=str(config.CHROMA_DB_DIR))
+        config.CHROMA_DB_DIR.mkdir(parents=True, exist_ok=True)
+        _client = chromadb.PersistentClient(path=str(config.CHROMA_DB_DIR))
     return _client
 
 
@@ -184,11 +189,12 @@ def search_articles(
     if zone_filter is not None:
         conditions.append({"zone": {"$eq": zone_filter}})
 
-    result = _articles_collection().query(
-        query_texts=[query],
-        n_results=limit,
-        where=_and_or_single(conditions),
-    )
+    with _lock:
+        result = _articles_collection().query(
+            query_texts=[query],
+            n_results=limit,
+            where=_and_or_single(conditions),
+        )
     return _flatten_results(result)
 
 
@@ -213,11 +219,12 @@ def search_daily(
         if upper is not None:
             conditions.append({"date_int": {"$lte": upper}})
 
-    result = _daily_collection().query(
-        query_texts=[query],
-        n_results=limit,
-        where=_and_or_single(conditions),
-    )
+    with _lock:
+        result = _daily_collection().query(
+            query_texts=[query],
+            n_results=limit,
+            where=_and_or_single(conditions),
+        )
     return _flatten_results(result)
 
 
