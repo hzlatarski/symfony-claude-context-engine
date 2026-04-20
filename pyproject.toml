@@ -20,10 +20,20 @@ dependencies = [
     "httpx>=0.27.0",
     "faster-whisper>=1.0.3",
     "anthropic>=0.42.0",
+    "pynput>=1.7.7",
+    "sounddevice>=0.5.1",
+    "scipy>=1.14.0",
+    "pystray>=0.19.5",
+    "Pillow>=11.0.0",
+    "pyperclip>=1.9.0",
+    "pyautogui>=0.9.54",
 ]
 
 [tool.ruff]
 line-length = 100
+
+[project.scripts]
+whisper-tray = "whisper_tray.main:main"
 
 [tool.pytest.ini_options]
 pythonpath = [".", "scripts"]

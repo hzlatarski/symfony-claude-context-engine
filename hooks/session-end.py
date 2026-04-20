@@ -123,8 +123,14 @@ def main() -> None:
 
     transcript_path = Path(transcript_path_str)
     if not transcript_path.exists():
-        logging.info("SKIP: transcript missing: %s", transcript_path_str)
-        return
+        # On Windows, Claude Code sometimes emits an uppercase drive letter (C:\...)
+        # but the actual filesystem path uses lowercase (c:\...). Try both.
+        if sys.platform == "win32" and len(transcript_path_str) >= 2 and transcript_path_str[1] == ":":
+            alt = transcript_path_str[0].swapcase() + transcript_path_str[1:]
+            transcript_path = Path(alt)
+        if not transcript_path.exists():
+            logging.info("SKIP: transcript missing: %s", transcript_path_str)
+            return
 
     # Extract conversation context in the hook (fast, no API calls)
     try:

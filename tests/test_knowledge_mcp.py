@@ -466,3 +466,63 @@ class TestKnowledgeMcpServerBoot:
         server = _make_server()
         assert server is not None
         assert hasattr(server, "run")
+
+
+class TestSearchCodebaseImpl:
+    @pytest.fixture
+    def seeded_codebase(self, tmp_path, monkeypatch):
+        import config
+        import codebase_store
+
+        monkeypatch.setattr(config, "CHROMA_DB_DIR", tmp_path / "chroma")
+        try:
+            from chromadb.api.shared_system_client import SharedSystemClient
+            SharedSystemClient._identifier_to_system = {}
+        except (ImportError, AttributeError):
+            pass
+        codebase_store._client = None
+        codebase_store.upsert_chunk(
+            chunk_id="src/Security/AppCustomAuthenticator.php::0",
+            rel_path="src/Security/AppCustomAuthenticator.php",
+            text="class AppCustomAuthenticator extends AbstractLoginFormAuthenticator\n{\n    public function authenticate(Request $request): Passport\n    {\n        $email = $request->request->get('email', '');\n        return new Passport(new UserBadge($email));\n    }\n}",
+            metadata={"file_type": "php", "start_line": 1, "end_line": 8, "symbols": "AppCustomAuthenticator,authenticate"},
+        )
+        codebase_store.upsert_chunk(
+            chunk_id="assets/controllers/auth_controller.js::0",
+            rel_path="assets/controllers/auth_controller.js",
+            text="import { Controller } from '@hotwired/stimulus';\nexport default class extends Controller {\n    connect() {\n        this.element.addEventListener('submit', this.handleSubmit.bind(this));\n    }\n}",
+            metadata={"file_type": "js", "start_line": 1, "end_line": 6},
+        )
+        return codebase_store
+
+    def test_returns_code_hits(self, seeded_codebase):
+        from knowledge_mcp_server import _search_codebase_impl
+        results = _search_codebase_impl("how does authentication work?", limit=3)
+        assert len(results) >= 1
+        assert "path" in results[0]
+        assert "preview" in results[0]
+        # path has the form "rel_path:start-end"
+        assert ":" in results[0]["path"] and "-" in results[0]["path"].rsplit(":", 1)[-1]
+
+    def test_filter_by_file_type(self, seeded_codebase):
+        from knowledge_mcp_server import _search_codebase_impl
+        results = _search_codebase_impl("authentication", limit=5, file_type="php")
+        assert all(r["path"].endswith(".php") or ".php:" in r["path"] for r in results)
+
+    def test_preview_is_truncated(self, seeded_codebase):
+        from knowledge_mcp_server import _search_codebase_impl
+        results = _search_codebase_impl("authentication", limit=3)
+        for r in results:
+            assert len(r["preview"]) <= 301  # 300 chars + optional ellipsis char
+
+    def test_symbols_key_omitted_when_empty(self, seeded_codebase):
+        from knowledge_mcp_server import _search_codebase_impl
+        # JS chunk has no symbols field — key should be absent, not empty string
+        results = _search_codebase_impl("stimulus controller connect", limit=5, file_type="js")
+        for r in results:
+            assert "symbols" not in r
+
+    def test_unknown_file_type_raises(self, seeded_codebase):
+        from knowledge_mcp_server import _search_codebase_impl
+        with pytest.raises(ValueError, match="file_type"):
+            _search_codebase_impl("auth", file_type="ruby")

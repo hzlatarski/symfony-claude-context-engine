@@ -13,6 +13,10 @@
       <div class="label">Daily chunks in Chroma</div>
       <div class="value">{{ chroma.daily_chunks }}</div>
     </div>
+    <div class="stat">
+      <div class="label">Code chunks in Chroma</div>
+      <div class="value">{{ chroma.codebase_chunks }}</div>
+    </div>
     <div class="stat {% if today_flush_cost > 0.5 %}warn{% endif %}">
       <div class="label">Today's flush cost</div>
       <div class="value">${{ "%.3f"|format(today_flush_cost) }}</div>

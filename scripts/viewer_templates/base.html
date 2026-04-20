@@ -420,6 +420,10 @@
         <li><a class="nav-link {% if request.url.path.startswith('/daily') %}active{% endif %}" href="/daily">Daily logs</a></li>
         <li><a class="nav-link {% if request.url.path.startswith('/tools') %}active{% endif %}" href="/tools">Tool drawer</a></li>
       </ul>
+      <div class="nav-section-label">Codebase</div>
+      <ul>
+        <li><a class="nav-link {% if request.url.path.startswith('/code') %}active{% endif %}" href="/code">Code search</a></li>
+      </ul>
       <div class="nav-section-label">System</div>
       <ul>
         <li><a class="nav-link {% if request.url.path == '/stats' %}active{% endif %}" href="/stats">Stats &amp; costs</a></li>

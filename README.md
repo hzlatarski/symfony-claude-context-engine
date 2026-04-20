@@ -13,7 +13,8 @@ A long-term memory system for Claude Code, purpose-built for Symfony projects. S
 ## Key Features
 
 - 🖥 **[Web Viewer UI](#web-viewer)** — Read-only FastAPI dashboard at **<http://127.0.0.1:37778>**. One command (`uv run python scripts/viewer.py`), no build step, no auth. Browse articles, daily logs, tool drawer, contradictions, and cost history.
-- 🎙 **[Voice-to-enhanced-prompt](#whisper-prompt)** — Mic page at **<http://127.0.0.1:37778/whisper>**. Speak a question; the pipeline transcribes it locally (faster-whisper, CPU), expands it via Haiku query-expansion, retrieves grounding from the knowledge base, and rewrites it into a fully grounded Claude prompt. Three modes: verbatim, rewrite, clean.
+- 🎙 **[Voice-to-enhanced-prompt](#whisper-prompt)** — Mic page at **<http://127.0.0.1:37778/whisper>**. Speak a question; the pipeline transcribes it locally (faster-whisper, CPU), expands it via Haiku query-expansion, retrieves grounding from the knowledge base, and rewrites it into a fully grounded Claude prompt. Three modes: raw, clean, rewrite.
+- 🖱 **[WhisperTray](#whisptertray)** — Standalone Windows system-tray dictation app. Global hotkey (customizable) starts recording from any window; a floating pill overlay shows state; on stop, the audio is transcribed and enhanced, then auto-pasted back into the window that was focused before recording started.
 - 🧠 **Curated memory, not a grep-pile** — Sessions compile into structured articles with Truth + Timeline format, `[[wikilinks]]`, and `[src:path]` provenance anchors. Human-readable, diffable, Obsidian-compatible.
 - 🏷 **Memory type taxonomy** — Every article is a `fact`, `event`, `discovery`, `preference`, `advice`, or `decision`. First-class filter in `search_knowledge` so "only preferences about testing" is one call.
 - 🔍 **Hybrid BM25 + vector search** — Two dedicated MCP servers: `knowledge-compiler` for semantic+lexical retrieval, `symfony-code-intel` for live codebase structure. Fused via Reciprocal Rank Fusion.
@@ -292,9 +293,9 @@ Mic → faster-whisper (CPU) → Haiku query expansion
 
 | Mode | What it produces |
 |------|-----------------|
-| **verbatim** | Your transcript, unchanged — no rewrite, just grounding citations appended |
-| **rewrite** | Full Sonnet rewrite grounded in retrieved knowledge — default |
-| **clean** | Rewrite without `[[wikilink]]` citations — paste-ready for non-wiki contexts |
+| **raw** | Your transcript, unchanged — no AI, no rephrasing. Fastest. |
+| **clean** | Fix grammar and remove filler words. One quick Haiku call. |
+| **rewrite** | Full Sonnet rewrite grounded in retrieved knowledge — default. |
 
 ### Keyboard shortcuts
 
@@ -303,7 +304,7 @@ Mic → faster-whisper (CPU) → Haiku query expansion
 | `Space` | Toggle recording |
 | `Cmd/Ctrl+Enter` | Copy enhanced prompt |
 | `Cmd/Ctrl+R` | Re-enhance with current scope |
-| `1` / `2` / `3` | Switch mode (verbatim / rewrite / clean) |
+| `1` / `2` / `3` | Switch mode (raw / clean / rewrite) |
 
 ### Scope override
 
@@ -329,6 +330,71 @@ After transcription, toggle the **articles**, **code**, and **daily** scope chip
 ### Drift canary
 
 `canary.py` includes a dedicated whisper pipeline canary (`whisper:tailwind-rebuild`) that feeds a pre-canned transcript through the grounded rewrite and asserts the result cites the expected command strings from the feedback memory. Run automatically when you run `uv run python scripts/canary.py` without `--id`.
+
+---
+
+## WhisperTray
+
+A standalone Windows system-tray dictation app that pairs with the same `whisper.orchestrator` pipeline used by the web viewer's mic page. Press a global hotkey from any application, speak, press stop — the result is transcribed, enhanced, and auto-pasted back into the window you were in before recording started.
+
+```bash
+uv run python whisper_tray/main.py
+```
+
+### How it works
+
+1. **Global hotkey** — `HotkeyListener` (pynput) fires from any focused window, regardless of which app is in front.
+2. **HWND capture** — at the moment recording begins, `GetForegroundWindow()` saves the target window handle before the pill overlay can steal focus.
+3. **Pill overlay** — a frameless topmost `tk.Toplevel` appears at the bottom of the screen showing recording state (animated braille spinner), mode selector, cancel (✕) and stop (■) buttons, and a `?` help popup.
+4. **Transcribe + enhance** — audio is handed to `whisper.orchestrator.enhance_from_audio()` in a thread pool; the same Haiku/Sonnet pipeline used by the mic page runs in the background.
+5. **Auto-paste** — `injector.py` copies the result to the clipboard, calls `SetForegroundWindow(hwnd)` to restore the original window's focus, then fires `Ctrl+V`.
+
+### Modes
+
+| Mode | Pipeline | Cost |
+|------|----------|------|
+| **raw** | Transcript only — no AI call | $0.00 |
+| **clean** | Haiku grammar fix + filler removal | ~$0.001 |
+| **rewrite** | Expand → retrieve KB → Sonnet grounded rewrite | ~$0.01–0.03 |
+
+The mode can be changed per-recording from the pill overlay (radio buttons) or locked globally in Settings.
+
+### Settings
+
+Open Settings from the system tray icon. Options:
+
+| Setting | Default | Notes |
+|---------|---------|-------|
+| Hotkey | `<ctrl>+<cmd>` | Click "Record…" to capture any combo |
+| Hotkey mode | `click_toggle` | `click_toggle` = press once to start, again to stop; `hold` = hold to record |
+| Enhancement mode | `rewrite` | `raw` / `clean` / `rewrite` |
+| Mode lock | off | Hides the per-recording mode selector on the pill |
+| Auto-paste | on | Ctrl+V into the source window after enhance |
+| Microphone | Auto-detect | Choose any input device by name |
+| Language | Auto-detect | Pass language hint to faster-whisper |
+| Launch with Windows | off | Writes a `HKCU\...\Run` registry key |
+
+Settings persist to `~/.whisper-tray/settings.json`.
+
+### First-run wizard
+
+On first launch (no `settings.json` found), a setup wizard prompts for the hotkey and auto-paste preference, then writes `settings.json` and starts the listener.
+
+### Installation
+
+```bash
+# From the memory-compiler root:
+uv sync
+uv run python whisper_tray/main.py
+```
+
+Requires the same `uv` environment as the rest of the project. No separate install step — all deps are already in `pyproject.toml` (`pystray`, `pynput`, `sounddevice`, `pyautogui`, `pyperclip`, `Pillow`).
+
+### Running tests
+
+```bash
+uv run pytest tests/whisper_tray/ -v
+```
 
 ---
 

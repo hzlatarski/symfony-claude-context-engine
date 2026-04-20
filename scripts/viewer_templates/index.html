@@ -35,6 +35,11 @@
       <div class="value">{{ ingest_files_count }}</div>
       <div class="sub">files in state.json</div>
     </div>
+    <div class="stat">
+      <div class="label">Code chunks</div>
+      <div class="value">{{ chroma_codebase_chunks }}</div>
+      <div class="sub"><a href="/code">browse source index</a></div>
+    </div>
   </div>
 
   {% if type_counts %}
