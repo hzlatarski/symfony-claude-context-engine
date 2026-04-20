@@ -545,18 +545,6 @@ def main():
     state["flush_costs"] = flush_costs
     save_flush_state(state)
 
-    # Notify — only when something was actually saved (skip FLUSH_OK / errors
-    # to avoid spamming Windows popups, especially from subagent sessions)
-    if "FLUSH_OK" not in response and "FLUSH_ERROR" not in response:
-        try:
-            from notify import notify
-            today_total = _today_flush_total(state)
-            notify(
-                "Context Engine",
-                f"Flush: ${flush_cost:.2f} (saved) | Today flushes: ${today_total:.2f}",
-            )
-        except Exception as e:
-            logging.debug("Notification failed: %s", e)
 
     # Clean up context file
     context_file.unlink(missing_ok=True)

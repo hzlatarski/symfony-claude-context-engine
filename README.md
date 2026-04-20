@@ -349,6 +349,8 @@ uv run python whisper_tray/main.py
 4. **Transcribe + enhance** — audio is handed to `whisper.orchestrator.enhance_from_audio()` in a thread pool; the same Haiku/Sonnet pipeline used by the mic page runs in the background.
 5. **Auto-paste** — `injector.py` copies the result to the clipboard, calls `SetForegroundWindow(hwnd)` to restore the original window's focus, then fires `Ctrl+V`.
 
+> **Usage tip:** Place your cursor in the target input (chat box, editor, etc.) *before* pressing the hotkey — the destination window is locked in at that moment. You do not need to click back after speaking; focus is restored automatically.
+
 ### Modes
 
 | Mode | Pipeline | Cost |
