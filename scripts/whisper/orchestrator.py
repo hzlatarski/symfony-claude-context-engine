@@ -107,7 +107,21 @@ def _enhance_common(
 ) -> EnhanceResult:
     warnings: list[str] = []
 
-    # Clean mode is the short path: no retrieval, no expansion.
+    # verbatim and clean are both short paths: no retrieval, no expansion.
+    if mode == "verbatim":
+        timings["total"] = _ms_since(t_start)
+        return EnhanceResult(
+            transcript=transcript,
+            enhanced_prompt=transcript,
+            mode="verbatim",
+            citations=[],
+            intent="generic",
+            scope_used=[],
+            queries_used=[],
+            warnings=warnings,
+            timings_ms=timings,
+        )
+
     if mode == "clean":
         t = time.monotonic()
         try:
@@ -148,25 +162,22 @@ def _enhance_common(
     timings["retrieve"] = _ms_since(t)
 
     t = time.monotonic()
-    if mode == "rewrite":
-        if not hits:
-            warnings.append("No project context found; returned verbatim transcript")
-            prompt = enhance_verbatim(transcript, hits)
-            effective_mode: Mode = "verbatim"
-        else:
-            try:
-                rw = enhance_rewrite(transcript, hits)
-                prompt = rw.prompt
-                warnings.extend(rw.warnings)
-                effective_mode = "rewrite"
-            except EnhanceError as exc:
-                logger.warning("rewrite enhance failed, downgrading: %s", exc)
-                prompt = enhance_verbatim(transcript, hits)
-                warnings.append(f"Rewrite failed; returned verbatim transcript: {exc}")
-                effective_mode = "verbatim"
-    else:  # verbatim
-        prompt = enhance_verbatim(transcript, hits)
-        effective_mode = "verbatim"
+    # Only rewrite reaches here (verbatim and clean short-circuit above).
+    if not hits:
+        warnings.append("No project context found; returned verbatim transcript")
+        prompt = transcript
+        effective_mode: Mode = "verbatim"
+    else:
+        try:
+            rw = enhance_rewrite(transcript, hits)
+            prompt = rw.prompt
+            warnings.extend(rw.warnings)
+            effective_mode = "rewrite"
+        except EnhanceError as exc:
+            logger.warning("rewrite enhance failed, downgrading: %s", exc)
+            prompt = transcript
+            warnings.append(f"Rewrite failed; returned verbatim transcript: {exc}")
+            effective_mode = "verbatim"
     timings["enhance"] = _ms_since(t)
     timings["total"] = _ms_since(t_start)
 
