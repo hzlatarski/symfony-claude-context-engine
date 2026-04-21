@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Code Search — memory-compiler{% endblock %}
+{% block content %}
+  <h1>Code Search</h1>
+  <p class="page-subtitle">Semantic search over indexed source files (PHP · JS · Twig · YAML).</p>
+
+  <form class="filter-bar" method="get" action="/code">
+    <label>Query</label>
+    <input type="text" name="q" value="{{ q }}" placeholder="e.g. authentication, ElevenLabs conversation, arena session…" style="width: 340px;" autofocus>
+    <label>Type</label>
+    <select name="file_type">
+      <option value="">All</option>
+      {% for ft in file_types %}
+        <option value="{{ ft }}"{% if file_type == ft %} selected{% endif %}>{{ ft }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit">Search</button>
+    {% if results is not none %}
+      <span class="count">{{ results|length }} hit{{ 's' if results|length != 1 else '' }}</span>
+    {% endif %}
+  </form>
+
+  {% if results is none %}
+    {# Browse mode — show type breakdown stats #}
+    <div class="stat-grid">
+      <div class="stat">
+        <div class="label">Total chunks indexed</div>
+        <div class="value mono">{{ total_chunks }}</div>
+        <div class="sub">150-line windows, 30-line overlap</div>
+      </div>
+      {% for ft, count in type_counts %}
+        <div class="stat" style="border-left: 2px solid {{ ft_colors[ft] }};">
+          <div class="label">{{ ft }}</div>
+          <div class="value mono">{{ count }}</div>
+          <div class="sub">chunks</div>
+        </div>
+      {% endfor %}
+    </div>
+    <div class="empty">Enter a query above to search indexed source code.</div>
+
+  {% elif results|length == 0 %}
+    <div class="empty">No results for "{{ q }}"{% if file_type %} in .{{ file_type }} files{% endif %}.</div>
+
+  {% else %}
+    {% for hit in results %}
+      {% set ft_color = ft_colors.get(hit.file_type, '#7d8494') %}
+      <div class="card" style="border-left-color: {{ ft_color }}; margin-bottom: 14px;">
+        <div class="card-meta" style="margin-bottom: 10px; align-items: flex-start; flex-wrap: wrap; gap: 8px;">
+          <span class="badge" style="color: {{ ft_color }}; border-color: {{ ft_color }}40; flex-shrink: 0;">
+            .{{ hit.file_type }}
+          </span>
+          <span class="mono" style="color: var(--text); font-size: 13px; word-break: break-all;">{{ hit.rel_path }}</span>
+          <span class="badge" style="flex-shrink: 0;">L{{ hit.start_line }}–{{ hit.end_line }}</span>
+          {% if hit.symbols %}
+            <span class="badge" style="color: var(--purple); border-color: #a78bfa40; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block;" title="{{ hit.symbols }}">
+              {{ hit.symbols[:100] }}{% if hit.symbols|length > 100 %}…{% endif %}
+            </span>
+          {% endif %}
+          <span style="margin-left: auto; font-size: 11px; color: var(--muted); font-family: var(--mono); flex-shrink: 0;">
+            dist {{ "%.3f"|format(hit.distance) }}
+          </span>
+        </div>
+        <pre style="margin: 0; max-height: 300px; overflow-y: auto; font-size: 12px; line-height: 1.4;">{{ hit.snippet }}</pre>
+      </div>
+    {% endfor %}
+  {% endif %}
+{% endblock %}
