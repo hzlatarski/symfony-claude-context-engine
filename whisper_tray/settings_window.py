@@ -4,7 +4,7 @@ import shutil
 import sys
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from typing import Any, Callable
 
 import sounddevice as sd
@@ -12,11 +12,17 @@ from pynput import keyboard
 
 from whisper_tray.settings import DEFAULTS, save_settings
 
+# Trimmed to the user's likely languages plus the two most-common Romance ones.
+# Auto-detect is unreliable on short utterances (faster-whisper needs a few
+# seconds of audio to sample language features), so a pinned language is the
+# safer default for most users.
 LANGUAGE_OPTIONS = [
-    ("Auto-detect", "auto"), ("English", "en"), ("German", "de"),
-    ("Spanish", "es"), ("French", "fr"), ("Italian", "it"),
-    ("Portuguese", "pt"), ("Dutch", "nl"), ("Polish", "pl"),
-    ("Russian", "ru"), ("Chinese", "zh"), ("Japanese", "ja"),
+    ("Auto-detect", "auto"),
+    ("English", "en"),
+    ("German", "de"),
+    ("Bulgarian", "bg"),
+    ("Spanish", "es"),
+    ("French", "fr"),
 ]
 BG = "#1e1e2e"
 FG = "#e0e0e0"
@@ -155,7 +161,22 @@ class SettingsWindow(tk.Toplevel):
                   padx=16, command=self.destroy).pack(side=tk.LEFT, padx=4)
 
     def _save(self) -> None:
-        self._settings["hotkey"] = self._hotkey_var.get()
+        # Normalize + validate the hotkey before touching disk so an invalid
+        # combo never gets persisted — otherwise listener.start() crashes the
+        # next app launch with no obvious recovery.
+        hotkey = self._hotkey_var.get().strip().replace(" ", "")
+        try:
+            keyboard.HotKey.parse(hotkey)
+        except Exception as exc:
+            messagebox.showerror(
+                "Invalid hotkey",
+                f"Could not parse hotkey '{hotkey}':\n{exc}\n\n"
+                "Use combos like <ctrl>+<cmd>, <ctrl>+<alt>+w, or <f9>.\n"
+                "Special keys go in angle brackets, literal characters do not.",
+                parent=self,
+            )
+            return
+        self._settings["hotkey"] = hotkey
         self._settings["hotkey_mode"] = self._mode_var.get()
         self._settings["enhancement_mode"] = self._enhance_var.get()
         self._settings["mode_lock_enabled"] = self._mode_lock_var.get()
@@ -201,16 +222,19 @@ class SettingsWindow(tk.Toplevel):
         self._hotkey_listener.start()
 
     def _on_key_press(self, key: Any) -> None:
-        name = self._key_name(key)
-        if name:
-            self._pressed_keys.add(name)
-            combo = "+".join(f"<{k}>" for k in sorted(self._pressed_keys))
+        token = self._key_token(key)
+        if token:
+            self._pressed_keys.add(token)
+            # Modifiers (angle-bracketed) come first, then literal chars.
+            combo = "+".join(
+                sorted(self._pressed_keys, key=lambda k: (not k.startswith("<"), k))
+            )
             self.after(0, self._hotkey_var.set, combo)
 
     def _on_key_release(self, key: Any) -> None:
-        name = self._key_name(key)
-        if name:
-            self._pressed_keys.discard(name)
+        token = self._key_token(key)
+        if token:
+            self._pressed_keys.discard(token)
         if self._pressed_keys:
             return
         if self._hotkey_listener:
@@ -219,12 +243,25 @@ class SettingsWindow(tk.Toplevel):
         self._capturing_hotkey = False
         self.after(0, self._capture_btn.configure, {"text": "Record…"})
 
-    def _key_name(self, key: Any) -> str | None:
+    def _key_token(self, key: Any) -> str | None:
+        """Convert a pynput key event into a pynput-compatible hotkey token.
+
+        Rules:
+            - Literal chars return as-is: 'a', '1', '/'.
+            - Special keys are returned as '<name>', with left/right variants
+              normalised ('ctrl_l' -> 'ctrl') so Windows doesn't bake a
+              handed modifier into the hotkey string.
+        """
         try:
-            return key.char
+            c = key.char
+            return c if c else None
         except AttributeError:
             name = str(key).replace("Key.", "")
-            return name if name else None
+            for suffix in ("_l", "_r", "_gr"):
+                if name.endswith(suffix):
+                    name = name[: -len(suffix)]
+                    break
+            return f"<{name}>" if name else None
 
 
 class FirstRunWizard(tk.Toplevel):

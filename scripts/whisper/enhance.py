@@ -12,6 +12,12 @@ import time
 import anthropic
 from dataclasses import dataclass
 
+# Tight per-call budgets so the tray never gets stuck on a silent hang.
+# If the Sonnet rewrite takes longer than this the user is better served by a
+# fast visible error than a spinner that never resolves.
+CLEAN_TIMEOUT_SECONDS = 30.0
+REWRITE_TIMEOUT_SECONDS = 60.0
+
 from config import MODEL_CLEAN, MODEL_REWRITE
 from whisper.types import EnhanceResult, Hit
 from whisper.prompts import CLEAN_SYSTEM_PROMPT, REWRITE_SYSTEM_PROMPT
@@ -133,14 +139,20 @@ def enhance_clean(transcript: str) -> str:
         return transcript
 
     client = _get_client()
-    response = client.messages.create(
-        model=MODEL_CLEAN,
-        max_tokens=2048,
-        system=CLEAN_SYSTEM_PROMPT,
-        messages=[
-            {"role": "user", "content": transcript}
-        ],
-    )
+    try:
+        response = client.messages.create(
+            model=MODEL_CLEAN,
+            max_tokens=2048,
+            system=CLEAN_SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": transcript}
+            ],
+            timeout=CLEAN_TIMEOUT_SECONDS,
+        )
+    except anthropic.APITimeoutError as exc:
+        raise EnhanceError(f"clean LLM timed out after {CLEAN_TIMEOUT_SECONDS}s") from exc
+    except anthropic.APIError as exc:
+        raise EnhanceError(f"clean LLM call failed: {exc}") from exc
 
     # Extract cleaned text from response and strip whitespace
     cleaned_text = _extract_text(response)
@@ -237,12 +249,18 @@ def enhance_rewrite(
 
     client = _get_client()
     llm_start_ms = int(time.perf_counter() * 1000)
-    resp = client.messages.create(
-        model=MODEL_REWRITE,
-        max_tokens=2048,
-        system=REWRITE_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
-    )
+    try:
+        resp = client.messages.create(
+            model=MODEL_REWRITE,
+            max_tokens=2048,
+            system=REWRITE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_message}],
+            timeout=REWRITE_TIMEOUT_SECONDS,
+        )
+    except anthropic.APITimeoutError as exc:
+        raise EnhanceError(f"rewrite LLM timed out after {REWRITE_TIMEOUT_SECONDS}s") from exc
+    except anthropic.APIError as exc:
+        raise EnhanceError(f"rewrite LLM call failed: {exc}") from exc
     llm_end_ms = int(time.perf_counter() * 1000)
     llm_ms = llm_end_ms - llm_start_ms
 

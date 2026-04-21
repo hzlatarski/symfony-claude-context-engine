@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
@@ -63,8 +64,12 @@ def _run_enhance_task(
 
     _mode_map = {"raw": "verbatim", "context": "rewrite"}
     orchestrator_mode = _mode_map.get(mode, mode)
+    logger.info("enhance task starting: mode=%s bytes=%d lang=%s", orchestrator_mode, len(audio), language)
     try:
+        _t0 = time.monotonic()
         result = enhance_fn(audio=audio, mode=orchestrator_mode, language=language)
+        logger.info("enhance task done: %.1fs mode_out=%s transcript_len=%d prompt_len=%d",
+                    time.monotonic() - _t0, result.mode, len(result.transcript), len(result.enhanced_prompt))
         entry = HistoryEntry(
             transcript=result.transcript,
             enhanced_prompt=result.enhanced_prompt,
@@ -98,11 +103,16 @@ def main() -> None:
     _log_path = Path.home() / ".whisper_tray.log"
     _fh = logging.FileHandler(str(_log_path), encoding="utf-8")
     _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    _root_logger = logging.getLogger("whisper_tray")
-    _root_logger.setLevel(logging.DEBUG)
-    if not _root_logger.handlers:
-        _root_logger.addHandler(_fh)
-        _root_logger.addHandler(logging.StreamHandler())
+    # Hook the file + console handlers onto BOTH our own package AND the whisper
+    # orchestrator — otherwise per-step pipeline logs never land in the log file
+    # and silent hangs look identical to silent hangs.
+    _stream = logging.StreamHandler()
+    for _pkg in ("whisper_tray", "whisper"):
+        _pkg_logger = logging.getLogger(_pkg)
+        _pkg_logger.setLevel(logging.DEBUG)
+        if not _pkg_logger.handlers:
+            _pkg_logger.addHandler(_fh)
+            _pkg_logger.addHandler(_stream)
 
     root = tk.Tk()
     root.withdraw()  # hide root window — only the pill and dialogs are shown
@@ -136,11 +146,30 @@ def main() -> None:
 
     def on_settings() -> None:
         def apply_new_settings(new_settings: dict) -> None:
+            # Capture the currently-working hotkey BEFORE we overwrite state,
+            # so we have a known-good fallback if the new one fails to register.
+            prev_hotkey = listener._hotkey
+            prev_mode = listener._hotkey_mode
+
             state.settings.update(new_settings)
             listener.stop()
-            listener._hotkey = new_settings.get("hotkey", state.settings["hotkey"])
-            listener._hotkey_mode = new_settings.get("hotkey_mode", state.settings["hotkey_mode"])
-            listener.start()
+            listener._hotkey = new_settings.get("hotkey", prev_hotkey)
+            listener._hotkey_mode = new_settings.get("hotkey_mode", prev_mode)
+            try:
+                listener.start()
+            except Exception as exc:
+                logger.warning("new hotkey %r failed to register (%s); rolling back to %r",
+                               listener._hotkey, exc, prev_hotkey)
+                # Roll back to what was working a moment ago.
+                listener._hotkey = prev_hotkey
+                listener._hotkey_mode = prev_mode
+                state.settings["hotkey"] = prev_hotkey
+                state.settings["hotkey_mode"] = prev_mode
+                try:
+                    listener.start()
+                except Exception as exc2:
+                    logger.error("previous hotkey %r also failed (%s); hotkey disabled",
+                                 prev_hotkey, exc2)
             mic = new_settings.get("microphone", "auto")
             recorder._device = None if mic == "auto" else mic
 
@@ -178,6 +207,8 @@ def main() -> None:
             on_mode_change=on_mode_change,
             initial_mode=state.current_mode,
             mode_lock=state.settings.get("mode_lock_enabled", False),
+            level_queue=recorder.level_queue,
+            on_quit=on_quit,
         )
 
     def _run_enhance(audio: bytes) -> None:
@@ -225,7 +256,24 @@ def main() -> None:
 
     def start_app() -> None:
         tray.start()
-        listener.start()
+        try:
+            listener.start()
+        except Exception as exc:
+            # Bad hotkey in settings.json must never crash startup — log a
+            # single warning line (no traceback — this is handled) and fall
+            # back to the compiled-in default so the user can fix it through
+            # the settings window.
+            logger.warning("startup hotkey %r invalid (%s); falling back to %r",
+                           listener._hotkey, exc, DEFAULTS["hotkey"])
+            listener._hotkey = DEFAULTS["hotkey"]
+            listener._hotkey_mode = DEFAULTS["hotkey_mode"]
+            state.settings["hotkey"] = DEFAULTS["hotkey"]
+            state.settings["hotkey_mode"] = DEFAULTS["hotkey_mode"]
+            try:
+                listener.start()
+            except Exception as exc2:
+                logger.error("default hotkey %r also failed (%s); hotkey disabled",
+                             DEFAULTS["hotkey"], exc2)
         poll()
         if is_first_run():
             def on_wizard_done(new_settings: dict) -> None:

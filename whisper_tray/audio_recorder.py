@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import queue as _queue
 import struct
 import threading
 from typing import Any
@@ -37,14 +38,31 @@ class AudioRecorder:
         self._recording = False
         self._stream: Any = None
         self._lock = threading.Lock()
+        # Real-time RMS amplitude stream, drained by the pill's waveform animation.
+        # Bounded so a slow UI can't cause memory growth.
+        self.level_queue: _queue.Queue[float] = _queue.Queue(maxsize=150)
 
     def _callback(self, indata: np.ndarray, frames: int, time: Any, status: Any) -> None:
         if self._recording:
+            chunk = indata[:, 0].copy()
+            rms = float(np.sqrt(np.mean(chunk * chunk)))
+            try:
+                self.level_queue.put_nowait(rms)
+            except _queue.Full:
+                pass
             with self._lock:
-                self._chunks.append(indata[:, 0].copy())
+                self._chunks.append(chunk)
+
+    def _drain_levels(self) -> None:
+        try:
+            while True:
+                self.level_queue.get_nowait()
+        except _queue.Empty:
+            pass
 
     def start(self) -> None:
         self._chunks = []
+        self._drain_levels()
         self._recording = True
         self._stream = sd.InputStream(
             samplerate=SAMPLE_RATE,

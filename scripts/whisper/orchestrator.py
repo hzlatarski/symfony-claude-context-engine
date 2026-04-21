@@ -62,9 +62,11 @@ def enhance_from_audio(audio: bytes, mode: Mode, language: str = "auto") -> Enha
     t_start = time.monotonic()
     timings: dict[str, int] = {}
 
+    logger.info("step=transcribe start (%d bytes, lang=%s)", len(audio), language)
     t = time.monotonic()
     transcript = transcribe(audio, language=language)
     timings["transcribe"] = _ms_since(t)
+    logger.info("step=transcribe done in %dms (%d chars)", timings["transcribe"], len(transcript))
 
     if not transcript.strip():
         raise NoSpeechError("Whisper returned empty transcript")
@@ -145,6 +147,7 @@ def _enhance_common(
         )
 
     # verbatim + rewrite both need expand + retrieve.
+    logger.info("step=expand start")
     t = time.monotonic()
     try:
         expansion: Expansion = expand(transcript)
@@ -154,13 +157,18 @@ def _enhance_common(
         expansion = Expansion(queries=[transcript], intent="generic", scope=["articles"])
         warnings.append(f"Query expansion failed; using raw transcript as query: {exc}")
     timings["expand_query"] = _ms_since(t)
+    logger.info("step=expand done in %dms (queries=%d scope=%s)",
+                timings["expand_query"], len(expansion.queries), expansion.scope)
 
     scope = scope_override if scope_override is not None else expansion.scope
 
+    logger.info("step=retrieve start")
     t = time.monotonic()
     hits = retrieve(queries=expansion.queries, scope=scope)
     timings["retrieve"] = _ms_since(t)
+    logger.info("step=retrieve done in %dms (%d hits)", timings["retrieve"], len(hits))
 
+    logger.info("step=enhance start (hits=%d)", len(hits))
     t = time.monotonic()
     # Only rewrite reaches here (verbatim and clean short-circuit above).
     if not hits:
@@ -180,6 +188,8 @@ def _enhance_common(
             effective_mode = "verbatim"
     timings["enhance"] = _ms_since(t)
     timings["total"] = _ms_since(t_start)
+    logger.info("step=enhance done in %dms (mode=%s, total=%dms)",
+                timings["enhance"], effective_mode, timings["total"])
 
     return EnhanceResult(
         transcript=transcript,
