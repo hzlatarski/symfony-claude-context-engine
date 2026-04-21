@@ -263,7 +263,7 @@ def _search_codebase_impl(
 def _make_server():
     from mcp.server.fastmcp import FastMCP
 
-    server = FastMCP("knowledge")
+    server = FastMCP("knowledge-compiler")
 
     @server.tool()
     def search_knowledge(

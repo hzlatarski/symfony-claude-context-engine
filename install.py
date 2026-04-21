@@ -42,7 +42,7 @@ HOOKS: dict[str, list] = {
 # ── MCP server config ─────────────────────────────────────────────────────────
 # Uses cmd /c on Windows so the cd + uv chain works identically to the hooks.
 MCP_SERVERS: dict[str, dict] = {
-    "memory-compiler-intel": {
+    "symfony-code-intel": {
         "command": "cmd",
         "args": [
             "/c",
@@ -50,7 +50,7 @@ MCP_SERVERS: dict[str, dict] = {
         ],
         "env": {},
     },
-    "memory-compiler-knowledge": {
+    "knowledge-compiler": {
         "command": "cmd",
         "args": [
             "/c",
@@ -171,9 +171,9 @@ _CLAUDE_MD_SENTINEL_END   = "<!-- memory-compiler-mcp-end -->"
 
 _CLAUDE_MD_MCP_BLOCK = """\
 <!-- memory-compiler-mcp-start -->
-### Code Intelligence MCP (`memory-compiler-intel`)
+### Code Intelligence MCP (`symfony-code-intel`)
 
-Server name: `symfony-code-intel`. Exposes 6 tools for on-demand code structure queries — mtime-cached, never needs a rebuild:
+Exposes 6 tools for on-demand code structure queries — mtime-cached, never needs a rebuild. Tools appear in the session as `mcp__symfony-code-intel__<tool>`:
 
 | Tool | When to call it |
 |---|---|
@@ -186,9 +186,9 @@ Server name: `symfony-code-intel`. Exposes 6 tools for on-demand code structure 
 
 **Skip calling these** when you are making a trivial one-file change with no dependencies, or when the user has already confirmed the scope explicitly.
 
-### Knowledge Base MCP (`memory-compiler-knowledge`)
+### Knowledge Base MCP (`knowledge-compiler`)
 
-Server name: `knowledge`. Two-tier retrieval — **search first, fetch only what you need**:
+Two-tier retrieval — **search first, fetch only what you need**. Tools appear in the session as `mcp__knowledge-compiler__<tool>`:
 
 | Tool | When to call it |
 |---|---|
