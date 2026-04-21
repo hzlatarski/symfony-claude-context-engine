@@ -40,14 +40,23 @@ HOOKS: dict[str, list] = {
 }
 
 # ── MCP server config ─────────────────────────────────────────────────────────
+# Uses cmd /c on Windows so the cd + uv chain works identically to the hooks.
 MCP_SERVERS: dict[str, dict] = {
-    "symfony-code-intel": {
-        "command": "uv",
-        "args": ["run", "--directory", ".claude/memory-compiler", "python", "scripts/mcp_server.py"],
+    "memory-compiler-intel": {
+        "command": "cmd",
+        "args": [
+            "/c",
+            "cd /d .claude/memory-compiler && uv run python scripts/mcp_server.py",
+        ],
+        "env": {},
     },
-    "knowledge-compiler": {
-        "command": "uv",
-        "args": ["run", "--directory", ".claude/memory-compiler", "python", "scripts/knowledge_mcp_server.py"],
+    "memory-compiler-knowledge": {
+        "command": "cmd",
+        "args": [
+            "/c",
+            "cd /d .claude/memory-compiler && uv run python scripts/knowledge_mcp_server.py",
+        ],
+        "env": {},
     },
 }
 
@@ -129,7 +138,9 @@ def merge_settings_json() -> None:
 # ── Step 2: merge .mcp.json ───────────────────────────────────────────────────
 def merge_mcp_json() -> None:
     _h1("Merging MCP servers → .mcp.json")
-    path = PROJECT_ROOT / ".mcp.json"
+    # Claude Code looks for .mcp.json in the project root, *not* inside .claude/
+    candidates = [PROJECT_ROOT / ".mcp.json", CLAUDE_DIR / ".mcp.json"]
+    path = next((p for p in candidates if p.exists()), candidates[0])
 
     data: dict = {}
     if path.exists():
@@ -148,9 +159,122 @@ def merge_mcp_json() -> None:
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     if added:
-        _ok(f"Added {added} MCP server(s) to .mcp.json")
+        _ok(f"Added {added} MCP server(s) to {path}")
     else:
         _skip("MCP servers already present in .mcp.json")
+
+
+# ── Step 2b: patch CLAUDE.md ──────────────────────────────────────────────────
+# Sentinel tags used to bracket the managed block so re-running install is safe.
+_CLAUDE_MD_SENTINEL_START = "<!-- memory-compiler-mcp-start -->"
+_CLAUDE_MD_SENTINEL_END   = "<!-- memory-compiler-mcp-end -->"
+
+_CLAUDE_MD_MCP_BLOCK = """\
+<!-- memory-compiler-mcp-start -->
+### Code Intelligence MCP (`memory-compiler-intel`)
+
+Server name: `symfony-code-intel`. Exposes 6 tools for on-demand code structure queries — mtime-cached, never needs a rebuild:
+
+| Tool | When to call it |
+|---|---|
+| `get_codebase_overview()` | Start of any architecture discussion or when you need to orient in an unfamiliar area |
+| `get_file_deps(path)` | Before editing a PHP/Twig/JS file — reveals what depends on it and what it depends on |
+| `get_route_map(prefix)` | When tracing how a URL maps to a controller, or finding which routes touch a service |
+| `get_template_graph(template)` | Before changing a Twig file — shows inheritance chain, all includes, and Stimulus bindings |
+| `get_stimulus_map(controller)` | When adding or removing a Stimulus controller — finds every template that references it |
+| `get_hotspots(top_n)` | Before a refactor — surfaces high-churn files so you avoid merging into a hot area |
+
+**Skip calling these** when you are making a trivial one-file change with no dependencies, or when the user has already confirmed the scope explicitly.
+
+### Knowledge Base MCP (`memory-compiler-knowledge`)
+
+Server name: `knowledge`. Two-tier retrieval — **search first, fetch only what you need**:
+
+| Tool | When to call it |
+|---|---|
+| `search_knowledge(query, ...)` | **Always call this first** when you need context about a product decision, architecture choice, past finding, or behavioural scenario. Use `mode="hybrid"` (default). Use `mode="bm25"` for exact identifiers. |
+| `get_article(slug)` / `get_articles([slugs])` | After `search_knowledge` returns promising slim hits — fetch only the slugs worth reading in full |
+| `search_raw_daily(query, ...)` | When `search_knowledge` gives weak results and you need verbatim session material to verify a claim |
+| `search_codebase(query, file_type)` | When you need to find *where* a concept is implemented in code — returns chunked file excerpts with line ranges. Complements `get_file_deps`. |
+| `list_contradictions()` | When a knowledge article seems inconsistent — check if it is already quarantined before acting on it |
+
+**`search_knowledge` filter tips:**
+- `type_filter`: `fact` | `event` | `discovery` | `preference` | `advice` | `decision`
+- `zone_filter`: `observed` (low hallucination risk) | `synthesized` (compiler inferences — verify before trusting)
+- `min_confidence`: use `0.7` when you need firm answers; omit when exploring
+
+**Call `search_knowledge` before:**
+- Implementing a feature that touches product behaviour, grading logic, or AI prompts
+- Answering a question about why something was built a certain way
+- Writing copy or setting strategy — check `preference` and `decision` type articles first
+
+**Do NOT call it** for pure syntax questions, refactoring mechanical code, or anything the codebase itself answers unambiguously.
+
+The session-start hook injects a compact summary (file counts + top hotspots + available MCP tools) so you always know the codebase shape without burning tokens on full dumps.
+<!-- memory-compiler-mcp-end -->"""
+
+
+def patch_claude_md() -> None:
+    """Idempotently insert the MCP usage section into CLAUDE.md.
+
+    Strategy:
+    - If the sentinel block already exists, skip (idempotent).
+    - If a legacy "### Code Intelligence (MCP)" section heading exists
+      (older installs), replace that paragraph with the new sentinel block.
+    - Otherwise append the block at the end of the file.
+    """
+    _h1("Patching CLAUDE.md with MCP usage instructions")
+
+    # Try .claude/CLAUDE.md first, then project root CLAUDE.md
+    candidates = [CLAUDE_DIR / "CLAUDE.md", PROJECT_ROOT / "CLAUDE.md"]
+    path = next((p for p in candidates if p.exists()), None)
+
+    if path is None:
+        _warn("No CLAUDE.md found — creating .claude/CLAUDE.md with MCP block")
+        path = CLAUDE_DIR / "CLAUDE.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "# CLAUDE.md\n\nThis file provides guidance to Claude Code when working with code in this repository.\n\n"
+            + _CLAUDE_MD_MCP_BLOCK + "\n",
+            encoding="utf-8",
+        )
+        _ok(f"Created {path.relative_to(PROJECT_ROOT)}")
+        return
+
+    content = path.read_text(encoding="utf-8")
+
+    # Already patched — sentinel present
+    if _CLAUDE_MD_SENTINEL_START in content:
+        _skip(f"MCP block already present in {path.relative_to(PROJECT_ROOT)}")
+        return
+
+    # Replace legacy heading block if it exists
+    import re
+    legacy = re.compile(
+        r"### Code Intelligence \(MCP\)\n.*?(?=\n## |\n### |\Z)",
+        re.DOTALL,
+    )
+    if legacy.search(content):
+        new_content = legacy.sub(_CLAUDE_MD_MCP_BLOCK, content)
+        path.write_text(new_content, encoding="utf-8")
+        _ok(f"Replaced legacy MCP section in {path.relative_to(PROJECT_ROOT)}")
+        return
+
+    # Append before the first top-level `## Code Style` section if present,
+    # otherwise just append at end of file.
+    insert_marker = "\n## Code Style"
+    if insert_marker in content:
+        new_content = content.replace(
+            insert_marker,
+            "\n" + _CLAUDE_MD_MCP_BLOCK + "\n" + insert_marker,
+            1,
+        )
+    else:
+        separator = "\n" if content.endswith("\n") else "\n\n"
+        new_content = content + separator + _CLAUDE_MD_MCP_BLOCK + "\n"
+
+    path.write_text(new_content, encoding="utf-8")
+    _ok(f"Inserted MCP block into {path.relative_to(PROJECT_ROOT)}")
 
 
 # ── Step 3: sources.yaml ──────────────────────────────────────────────────────
@@ -301,6 +425,7 @@ def main() -> None:
 
     merge_settings_json()
     merge_mcp_json()
+    patch_claude_md()
     copy_sources_yaml()
     setup_api_key()
     setup_memory_symlink()
