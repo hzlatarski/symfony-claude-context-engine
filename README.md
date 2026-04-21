@@ -297,7 +297,7 @@ uv run python scripts/viewer.py
 | `/contradictions` | Current quarantine list |
 | `/stats` | Chroma collection sizes, recent 20 flush records with per-session costs |
 
-**Design notes.** Dark "tactical" theme matching the MHB project aesthetic. Memory-type tinting (`fact` blue, `event` amber, `discovery` purple, `preference` pink, `advice` teal, `decision` red) is driven by a single `type_colors` Jinja global so nav chips, badges, and card borders stay in sync — the type-tinted card border idea is borrowed from [thedotmack/claude-mem](https://github.com/thedotmack/claude-mem)'s React viewer. Read-only on principle: no mutation endpoints anywhere, and binding to `127.0.0.1` (not `0.0.0.0`) means it's never accessible from the LAN. Port `37778` is one above claude-mem's `37777` to avoid collision when both tools live on the same box.
+**Design notes.** Dark "tactical" theme — a single-accent tinted dark palette. Memory-type tinting (`fact` blue, `event` amber, `discovery` purple, `preference` pink, `advice` teal, `decision` red) is driven by a single `type_colors` Jinja global so nav chips, badges, and card borders stay in sync — the type-tinted card border idea is borrowed from [thedotmack/claude-mem](https://github.com/thedotmack/claude-mem)'s React viewer. Read-only on principle: no mutation endpoints anywhere, and binding to `127.0.0.1` (not `0.0.0.0`) means it's never accessible from the LAN. Port `37778` is one above claude-mem's `37777` to avoid collision when both tools live on the same box.
 
 ---
 

@@ -21,6 +21,13 @@ reports/
 knowledge/
 daily/
 
+# Vector database — NEVER commit embeddings; they contain raw indexed content
+# and grow fast. Binary SQLite + parquet files won't diff usefully anyway.
+chroma_db/
+chroma/
+*.chroma/
+**/chroma.sqlite3
+
 # But test fixtures named daily/* are checked in
 !tests/fixtures/daily/
 !tests/fixtures/daily/**
