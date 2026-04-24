@@ -11,7 +11,7 @@ Full one-liner clone + install:
 
 What it does:
     1. Merges Claude Code hooks  →  .claude/settings.json
-    2. Merges MCP server entries →  .mcp.json  (project root)
+    2. Registers MCP servers     →  ~/.claude.json  (User scope, per-project slug)
     3. Copies sources.yaml.example → sources.yaml  (if not already present)
     4. Asks for ANTHROPIC_API_KEY  →  writes to .env.local  (if missing)
     5. Asks about memory symlink   →  links .claude/memory/ to your Claude memory dir
@@ -22,8 +22,11 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # ── Path anchors ──────────────────────────────────────────────────────────────
@@ -40,24 +43,14 @@ HOOKS: dict[str, list] = {
 }
 
 # ── MCP server config ─────────────────────────────────────────────────────────
-# Uses cmd /c on Windows so the cd + uv chain works identically to the hooks.
-MCP_SERVERS: dict[str, dict] = {
-    "symfony-code-intel": {
-        "command": "cmd",
-        "args": [
-            "/c",
-            "cd /d .claude/memory-compiler && uv run python scripts/mcp_server.py",
-        ],
-        "env": {},
-    },
-    "knowledge-compiler": {
-        "command": "cmd",
-        "args": [
-            "/c",
-            "cd /d .claude/memory-compiler && uv run python scripts/knowledge_mcp_server.py",
-        ],
-        "env": {},
-    },
+# The VS Code Claude Code extension reads user-scope MCP servers from
+# ~/.claude.json (top-level "mcpServers" object) — NOT project-root .mcp.json,
+# which is a CLI-only convention. So the installer registers per-project
+# entries there using absolute paths + a project slug derived from the folder
+# name. Example keys: aitutor-code-intel, aitutor-knowledge.
+_MCP_SUFFIXES: dict[str, str] = {
+    "code-intel": "scripts/mcp_server.py",            # Symfony parser surface
+    "knowledge":  "scripts/knowledge_mcp_server.py",  # Knowledge retrieval surface
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -135,33 +128,111 @@ def merge_settings_json() -> None:
         _skip(f"Hooks already present in {path.relative_to(PROJECT_ROOT)}")
 
 
-# ── Step 2: merge .mcp.json ───────────────────────────────────────────────────
+# ── Step 2: register MCP servers at User scope ───────────────────────────────
 def merge_mcp_json() -> None:
-    _h1("Merging MCP servers → .mcp.json")
-    # Claude Code looks for .mcp.json in the project root, *not* inside .claude/
-    candidates = [PROJECT_ROOT / ".mcp.json", CLAUDE_DIR / ".mcp.json"]
-    path = next((p for p in candidates if p.exists()), candidates[0])
+    _h1("Registering MCP servers → ~/.claude.json (User scope)")
 
-    data: dict = {}
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            _warn(".mcp.json exists but is not valid JSON — starting fresh")
+    claude_json = Path.home() / ".claude.json"
+    if not claude_json.exists():
+        _fail(f"{claude_json} not found — open Claude Code once to initialize it, then re-run.")
+        return
+
+    slug = _project_slug(PROJECT_ROOT.name)
+    uv_exe = _find_uv()
+    if uv_exe is None:
+        _fail("Could not find `uv` on PATH — install uv (https://docs.astral.sh/uv/) and re-run.")
+        return
+
+    mc_abs = str(HERE).replace("\\", "/")   # absolute path to .claude/memory-compiler
+    entries: dict[str, dict] = {
+        f"{slug}-{suffix}": {
+            "command": uv_exe,
+            "args": ["run", "--directory", mc_abs, "python", script],
+        }
+        for suffix, script in _MCP_SUFFIXES.items()
+    }
+
+    # Parse + mutate + atomic write: protects a Claude Code session that may
+    # be reading this file while we write.
+    try:
+        data = json.loads(claude_json.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        _fail(f"{claude_json} is not valid JSON — aborting to avoid corrupting user config.")
+        return
+
+    # Timestamped backup so a bad edit can always be rolled back.
+    backup = claude_json.with_suffix(
+        f".json.bak-install-{_timestamp()}"
+    )
+    backup.write_text(claude_json.read_text(encoding="utf-8"), encoding="utf-8")
 
     servers = data.setdefault("mcpServers", {})
-    added = 0
-    for name, config in MCP_SERVERS.items():
-        if name not in servers:
-            servers[name] = config
+    added, updated = 0, 0
+    for key, config in entries.items():
+        if key in servers:
+            if servers[key] != config:
+                servers[key] = config
+                updated += 1
+        else:
+            servers[key] = config
             added += 1
 
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", delete=False, dir=claude_json.parent, suffix=".tmp",
+    )
+    json.dump(data, tmp, indent=2)
+    tmp.flush(); os.fsync(tmp.fileno()); tmp.close()
+    os.replace(tmp.name, claude_json)
 
-    if added:
-        _ok(f"Added {added} MCP server(s) to {path}")
+    noun = ", ".join(entries.keys())
+    if added and updated:
+        _ok(f"Added {added} + updated {updated} server(s) in ~/.claude.json ({noun})")
+    elif added:
+        _ok(f"Added {added} server(s) to ~/.claude.json ({noun})")
+    elif updated:
+        _ok(f"Updated {updated} server(s) in ~/.claude.json ({noun})")
     else:
-        _skip("MCP servers already present in .mcp.json")
+        _skip(f"Servers already registered in ~/.claude.json ({noun})")
+
+    _warn(f"Backup saved: {backup}")
+
+    # Warn about legacy configs that earlier installer versions wrote to.
+    for legacy in (PROJECT_ROOT / ".mcp.json", CLAUDE_DIR / ".mcp.json"):
+        if not legacy.exists():
+            continue
+        try:
+            legacy_data = json.loads(legacy.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        legacy_servers = legacy_data.get("mcpServers") or {}
+        ours_in_legacy = [k for k in legacy_servers if k.endswith("-code-intel") or k.endswith("-knowledge")
+                          or k in ("symfony-code-intel", "knowledge-compiler",
+                                   "memory-compiler-intel", "memory-compiler-knowledge")]
+        if ours_in_legacy:
+            _warn(
+                f"Legacy MCP entries found in {legacy} ({', '.join(ours_in_legacy)}) — "
+                "the VS Code extension ignores this file. Safe to remove these entries."
+            )
+
+
+def _project_slug(name: str) -> str:
+    """AiTutor → aitutor, My_Project → my-project, mixed123 → mixed123."""
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return slug or "project"
+
+
+def _find_uv() -> str | None:
+    """Resolve absolute path to uv/uv.exe; fall back to bare 'uv' if on PATH."""
+    for candidate in ("uv", "uv.exe"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return None
+
+
+def _timestamp() -> str:
+    from datetime import datetime
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 # ── Step 2b: patch CLAUDE.md ──────────────────────────────────────────────────
