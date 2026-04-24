@@ -29,6 +29,18 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Force UTF-8 on stdout/stderr so the Unicode box-drawing chars and ANSI
+# sequences below render on Windows consoles whose default codepage is cp1252
+# (default in cmd.exe/PowerShell). Without this the very first print() crashes
+# with UnicodeEncodeError before the user even sees an error message.
+for _stream in (sys.stdout, sys.stderr):
+    reconfigure = getattr(_stream, "reconfigure", None)
+    if reconfigure is not None:
+        try:
+            reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
 # ── Path anchors ──────────────────────────────────────────────────────────────
 HERE = Path(__file__).resolve().parent      # .claude/memory-compiler/
 CLAUDE_DIR = HERE.parent                    # .claude/
