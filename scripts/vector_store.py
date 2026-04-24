@@ -21,7 +21,7 @@ from config import (
 )
 
 _client: Any = None
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 
 def _get_client():

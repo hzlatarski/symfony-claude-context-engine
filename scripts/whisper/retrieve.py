@@ -100,6 +100,19 @@ def retrieve(queries: list[str], scope: list[str], top_n: int = TOP_N_DEFAULT) -
     if not channels:
         return []
 
+    # Warm up the Chroma clients in the calling thread BEFORE fan-out. Two
+    # worker threads calling chromadb.PersistentClient(path=same_dir) for the
+    # first time concurrently race inside Chroma's SharedSystemClient and
+    # surface as "Could not connect to tenant default_tenant" or
+    # "RustBindingsAPI object has no attribute 'bindings'". Initializing
+    # sequentially here makes the subsequent parallel queries safe.
+    import codebase_store
+    import vector_store
+    if "articles" in channels or "daily" in channels:
+        vector_store._get_client()
+    if "code" in channels:
+        codebase_store._get_client()
+
     # Fan out: (channel, query) → raw hits, in parallel via threadpool.
     # The search impls are sync and CPU/IO bound via Chroma; threads are fine.
     jobs: list[tuple[str, str]] = [(c, q) for c in channels for q in queries]

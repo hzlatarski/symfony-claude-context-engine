@@ -15,22 +15,29 @@ _client singletons pointing to the same db dir is safe.
 """
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from config import CHROMA_COLLECTION_CODEBASE
 
 _client: Any = None
+# RLock (not Lock) so callers that hold it across a _get_client() call do not
+# self-deadlock on the lazy init path. Mirrors vector_store.py.
+_lock = threading.RLock()
 
 
 def _get_client():
     global _client
     if _client is not None:
         return _client
-    import chromadb
-    import config
+    with _lock:
+        if _client is not None:
+            return _client
+        import chromadb
+        import config
 
-    config.CHROMA_DB_DIR.mkdir(parents=True, exist_ok=True)
-    _client = chromadb.PersistentClient(path=str(config.CHROMA_DB_DIR))
+        config.CHROMA_DB_DIR.mkdir(parents=True, exist_ok=True)
+        _client = chromadb.PersistentClient(path=str(config.CHROMA_DB_DIR))
     return _client
 
 

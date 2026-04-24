@@ -22,7 +22,7 @@ from whisper_tray.history import History, HistoryEntry
 from whisper_tray.hotkey_listener import HotkeyListener
 from whisper_tray.injector import inject
 from whisper_tray.pill import Pill
-from whisper_tray.settings import DEFAULTS, is_first_run, load_settings
+from whisper_tray.settings import DEFAULTS, is_first_run, load_settings, save_settings
 from whisper_tray.settings_window import FirstRunWizard, SettingsWindow
 from whisper_tray.tray import TrayIcon
 
@@ -143,6 +143,15 @@ def main() -> None:
 
     def on_mode_change(mode: str) -> None:
         state.current_mode = mode
+        # Persist so the next launch starts in the user's last-used mode.
+        # The pill toggles mode during recording; each click saves — on SSD
+        # this is sub-millisecond and not worth debouncing.
+        if state.settings.get("enhancement_mode") != mode:
+            state.settings["enhancement_mode"] = mode
+            try:
+                save_settings(state.settings)
+            except OSError as exc:
+                logger.warning("failed to persist enhancement_mode=%s: %s", mode, exc)
 
     def on_settings() -> None:
         def apply_new_settings(new_settings: dict) -> None:
