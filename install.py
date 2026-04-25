@@ -413,6 +413,46 @@ def setup_api_key() -> None:
 
 
 # ── Step 5: memory symlink ────────────────────────────────────────────────────
+def _claude_memory_slug(project_root: Path) -> str:
+    """Replicate Claude Code's per-project slug: lowercase the drive letter,
+    then replace every non-alphanumeric character (one-for-one, NOT collapsed)
+    with a dash. The one-for-one substitution is why ``C:\\foo`` becomes
+    ``c--foo`` (two dashes — one for ``:``, one for ``\\``).
+
+    Examples:
+        C:\\wamp64\\www\\AiTutor       → c--wamp64-www-AiTutor
+        C:\\wamp64\\www\\Sentinel AI   → c--wamp64-www-Sentinel-AI
+        /home/me/some proj             → -home-me-some-proj
+    """
+    posix = project_root.as_posix()
+    if len(posix) >= 2 and posix[1] == ":":
+        posix = posix[0].lower() + posix[1:]
+    return re.sub(r"[^a-zA-Z0-9]", "-", posix).strip("-")
+
+
+def _find_existing_memory_dir(project_root: Path) -> Path | None:
+    """Look in ~/.claude/projects/ for an existing dir matching this project.
+    Falls back to suffix-matching on the project's folder name in case the
+    slugging differs from our prediction.
+    """
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        return None
+
+    expected_slug = _claude_memory_slug(project_root)
+    direct = projects_dir / expected_slug
+    if direct.is_dir():
+        return direct / "memory"
+
+    name_suffix = re.sub(r"[^a-zA-Z0-9]+", "-", project_root.name).strip("-")
+    if not name_suffix:
+        return None
+    for candidate in projects_dir.iterdir():
+        if candidate.is_dir() and candidate.name.endswith(name_suffix):
+            return candidate / "memory"
+    return None
+
+
 def setup_memory_symlink() -> None:
     _h1("Claude persistent memory symlink")
 
@@ -426,22 +466,16 @@ def setup_memory_symlink() -> None:
     print("  This folder holds auto-memory Claude Code writes between sessions.")
     print()
 
-    # Compute the default path
-    home = Path.home()
-    # Claude Code stores project memory at ~/.claude/projects/<slug>/memory/
-    # Try to guess the slug from the project root path
-    slug = PROJECT_ROOT.as_posix().replace("/", "-").lstrip("-")
-    default_memory = home / ".claude" / "projects" / slug / "memory"
-
-    print(f"  Default location: {default_memory}")
-    if not default_memory.exists():
-        # Try just the directory name as slug
-        name_slug = PROJECT_ROOT.name
-        alt = home / ".claude" / "projects" / f"c--wamp64-www-{name_slug}" / "memory"
-        if alt.exists():
-            default_memory = alt
-        else:
-            print("  (Directory not found yet — Claude Code creates it on first session)")
+    existing = _find_existing_memory_dir(PROJECT_ROOT)
+    if existing is not None:
+        default_memory = existing
+        print(f"  Found existing Claude memory dir: {default_memory}")
+    else:
+        default_memory = (
+            Path.home() / ".claude" / "projects" / _claude_memory_slug(PROJECT_ROOT) / "memory"
+        )
+        print(f"  Predicted location: {default_memory}")
+        print("  (Directory not found yet — Claude Code creates it on first session)")
 
     if not _confirm("Create .claude/memory → your Claude memory folder?"):
         _warn("Skipped — captured-memory source will not load until the symlink is created")
@@ -461,18 +495,27 @@ def setup_memory_symlink() -> None:
 
     try:
         if platform.system() == "Windows":
-            # Use mklink /J (directory junction — works without admin on Windows 10+)
+            # mklink is a cmd.exe builtin; we MUST go through the shell. Use
+            # shell=True with a quoted command string so paths containing
+            # spaces (e.g. "C:\wamp64\www\Sentinel AI") survive cmd.exe's
+            # tokenizer. /J makes a directory junction — works without admin
+            # on Windows 10+.
             subprocess.run(
-                ["cmd", "/c", "mklink", "/J", str(memory_link), str(target)],
-                check=True, capture_output=True,
+                f'mklink /J "{memory_link}" "{target}"',
+                shell=True, check=True, capture_output=True, text=True,
             )
         else:
             memory_link.symlink_to(target)
         _ok(f"Linked .claude/memory → {target}")
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip() or (exc.stdout or "").strip() or str(exc)
+        _fail(f"Could not create symlink: {stderr}")
+        _warn(f'Create it manually:  mklink /J "{memory_link}" "{target}"  (Windows)')
+        _warn(f'or:  ln -s "{target}" .claude/memory  (Mac/Linux)')
     except Exception as exc:
         _fail(f"Could not create symlink: {exc}")
-        _warn(f"Create it manually:  mklink /J .claude\\memory \"{target}\"  (Windows)")
-        _warn(f"or:  ln -s \"{target}\" .claude/memory  (Mac/Linux)")
+        _warn(f'Create it manually:  mklink /J "{memory_link}" "{target}"  (Windows)')
+        _warn(f'or:  ln -s "{target}" .claude/memory  (Mac/Linux)')
 
 
 # ── Step 6: ingest + reindex ──────────────────────────────────────────────────
