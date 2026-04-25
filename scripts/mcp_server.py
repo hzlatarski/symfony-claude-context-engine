@@ -31,6 +31,7 @@ if str(_MEMORY_COMPILER_ROOT) not in sys.path:
     sys.path.insert(0, str(_MEMORY_COMPILER_ROOT))
 
 from scripts.parsers import PROJECT_ROOT, php_graph, route_map, twig_graph, stimulus_map, git_intel
+from scripts import parent_watchdog
 
 log = logging.getLogger("mcp_server")
 
@@ -439,6 +440,7 @@ def _make_server():
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    parent_watchdog.start()
     server = _make_server()
     server.run()
 

@@ -38,6 +38,7 @@ for path in (str(_MEMORY_COMPILER_ROOT), str(_HERE)):
 
 import bm25_store  # noqa: E402
 import hybrid_search  # noqa: E402
+import parent_watchdog  # noqa: E402
 import vector_store  # noqa: E402
 from compile_truth import parse_frontmatter  # noqa: E402
 from config import KNOWLEDGE_DIR, MEMORY_TYPES  # noqa: E402
@@ -455,6 +456,7 @@ def _make_server():
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    parent_watchdog.start()
     server = _make_server()
     server.run()
 

@@ -26,6 +26,15 @@ import re
 from pathlib import Path
 from typing import Any
 
+# rank_bm25 (and its numpy dep) import eagerly here, NOT inside _build_index().
+# FastMCP dispatches sync tool functions on an asyncio worker thread; deferring
+# this import to first-call meant the import ran from that worker, where it
+# could deadlock on Python's import lock against the main thread (which is
+# blocked inside FastMCP's event loop). Symptom was a >99s hang on the first
+# search_knowledge call. Eager import is cheap (~0.1s on Windows) and once
+# loaded the module is cached in sys.modules, so we never pay it twice.
+from rank_bm25 import BM25Okapi
+
 from config import KNOWLEDGE_DIR, STATE_FILE
 
 _index: Any = None                             # BM25Okapi | None
@@ -129,7 +138,6 @@ def _iter_article_zones() -> list[dict[str, Any]]:
 def _build_index() -> None:
     """Rebuild the BM25 corpus from the current knowledge tree."""
     global _index, _docs
-    from rank_bm25 import BM25Okapi
 
     _docs = _iter_article_zones()
     if not _docs:

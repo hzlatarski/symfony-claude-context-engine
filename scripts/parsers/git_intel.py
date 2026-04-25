@@ -65,6 +65,7 @@ def _git_log_numstat(project_root: Path) -> str:
         text=True,
         encoding="utf-8",
         errors="replace",
+        stdin=subprocess.DEVNULL,
     )
 
 
@@ -73,6 +74,7 @@ def _git_head(project_root: Path) -> str:
         ["git", "rev-parse", "HEAD"],
         cwd=str(project_root),
         text=True,
+        stdin=subprocess.DEVNULL,
     ).strip()[:12]
 
 

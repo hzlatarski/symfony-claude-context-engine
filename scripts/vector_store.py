@@ -15,6 +15,15 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+# chromadb (and the onnx + numpy chain it pulls in) is imported eagerly here,
+# NOT lazily inside _get_client(). FastMCP dispatches sync tool functions on
+# an asyncio worker thread; deferring this import to the first call meant the
+# import chain ran from that worker, where it deadlocks on Python's import
+# lock against the main thread (blocked in FastMCP's event loop). Symptom was
+# a >99s hang on the first search_knowledge call. Eager import costs ~1s of
+# startup but the module is then in sys.modules and threaded use is safe.
+import chromadb
+
 from config import (
     CHROMA_COLLECTION_ARTICLES,
     CHROMA_COLLECTION_DAILY,
@@ -31,7 +40,6 @@ def _get_client():
     with _lock:
         if _client is not None:
             return _client
-        import chromadb
         import config
 
         config.CHROMA_DB_DIR.mkdir(parents=True, exist_ok=True)
