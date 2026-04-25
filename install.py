@@ -15,7 +15,7 @@ What it does:
     3. Copies sources.yaml.example → sources.yaml  (if not already present)
     4. Asks for ANTHROPIC_API_KEY  →  writes to .env.local  (if missing)
     5. Asks about memory symlink   →  links .claude/memory/ to your Claude memory dir
-    6. Runs initial ingest + ChromaDB vector reindex
+    6. Runs initial ingest + ChromaDB vector reindex (articles + daily + codebase)
 """
 from __future__ import annotations
 
@@ -520,7 +520,7 @@ def setup_memory_symlink() -> None:
 
 # ── Step 6: ingest + reindex ──────────────────────────────────────────────────
 def run_ingest_and_reindex() -> None:
-    _h1("Running initial ingest + ChromaDB vector reindex")
+    _h1("Running initial ingest + ChromaDB vector reindex (articles, daily, codebase)")
     uv_prefix = ["uv", "run", "--directory", str(HERE)]
 
     print("  ingest.py …")
@@ -536,6 +536,96 @@ def run_ingest_and_reindex() -> None:
         _fail("reindex.py failed — check output above")
         sys.exit(1)
     _ok("reindex.py done (ChromaDB vector index built)")
+
+    _run_codebase_index_step(uv_prefix)
+
+
+# ── Codebase index helpers ────────────────────────────────────────────────────
+def _render_progress_bar(scanned: int, total: int, label: str, width: int = 28) -> str:
+    """Build a one-line progress bar string suitable for \\r overwrite.
+
+    Total width is fixed so successive frames overwrite cleanly without
+    leaving stale tail characters when paths shrink.
+    """
+    pct = (scanned / total) if total else 0.0
+    filled = int(pct * width)
+    bar = "█" * filled + "░" * (width - filled)
+    # Tail of long paths so the right edge stays informative on narrow terminals.
+    label = label[-50:]
+    return f"\r  [{bar}] {scanned}/{total} ({pct*100:5.1f}%)  {label:<52}"
+
+
+def _stream_codebase_index(uv_prefix: list[str]) -> int:
+    """Run index_codebase.py --all --progress, render a live progress bar.
+
+    Returns the subprocess exit code. Closing the terminal or Ctrl-C
+    sends SIGINT/CTRL_C_EVENT to the child via the inherited process
+    group — the user has already been warned in the prompt above.
+    """
+    cmd = [*uv_prefix, "python", "scripts/index_codebase.py", "--all", "--progress"]
+    proc = subprocess.Popen(
+        cmd, cwd=HERE,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+        bufsize=1,
+    )
+
+    blank = "\r" + " " * 100 + "\r"
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if line.startswith("PROGRESS\t"):
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) == 4:
+                    try:
+                        scanned = int(parts[1])
+                        total = int(parts[2])
+                    except ValueError:
+                        continue
+                    sys.stdout.write(_render_progress_bar(scanned, total, parts[3]))
+                    sys.stdout.flush()
+            else:
+                # "Scanning…", "Done:", warnings — print on a fresh line so
+                # they don't get clobbered by the bar.
+                sys.stdout.write(blank)
+                sys.stdout.write(line)
+                sys.stdout.flush()
+    except KeyboardInterrupt:
+        proc.terminate()
+        sys.stdout.write(blank)
+        sys.stdout.flush()
+        _warn("Indexing cancelled by user")
+        return 130
+
+    sys.stdout.write(blank)
+    sys.stdout.flush()
+    return proc.wait()
+
+
+def _run_codebase_index_step(uv_prefix: list[str]) -> None:
+    """Step 6c — prompt the user, then either build the codebase index or skip."""
+    _h1("Codebase ChromaDB index (semantic search over your source code)")
+    print("  This is the longest install step — typically 1–3 minutes for a")
+    print("  mid-size Symfony project. Uses the bundled local ONNX embedder")
+    print("  (no API key, no network).")
+    print()
+    print("  \033[33m!\033[0m Indexing runs in this terminal. Closing the window")
+    print("    or Ctrl-C cancels the build — partially-indexed files are kept,")
+    print("    you can resume later by re-running:")
+    print("      uv run --directory .claude/memory-compiler "
+          "python scripts/index_codebase.py --all")
+    print()
+
+    if not _confirm("Build the codebase index now?", default=True):
+        _warn("Skipped — codebase search will return 0 hits until you run "
+              "index_codebase.py --all")
+        return
+
+    rc = _stream_codebase_index(uv_prefix)
+    if rc != 0:
+        _fail(f"index_codebase.py exited with code {rc} — check output above")
+        sys.exit(1)
+    _ok("index_codebase.py done (codebase ChromaDB collection built)")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

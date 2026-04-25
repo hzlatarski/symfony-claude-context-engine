@@ -163,28 +163,40 @@ def list_source_files() -> list[tuple[str, Path]]:
     return results
 
 
-def reindex_all(force: bool = False) -> tuple[int, int]:
+def reindex_all(force: bool = False, progress_callback=None) -> tuple[int, int]:
     """Re-index changed (or all, if force) source files.
 
     Returns (indexed_count, skipped_count). Always persists state via
     try/finally so a mid-run error doesn't lose already-indexed hashes.
+
+    If ``progress_callback`` is supplied, it is invoked once per file
+    *scanned* (whether indexed or skipped) as ``cb(scanned, total, rel)``.
+    The default per-file print is suppressed in that case so a caller
+    rendering its own progress bar isn't fighting the script for stdout.
     """
     state = load_state()
     hashes: dict[str, str] = state.setdefault("codebase_hashes", {})
 
+    files = list_source_files()
+    total = len(files)
     indexed = 0
     skipped = 0
     try:
-        for _ftype, path in list_source_files():
+        for scanned, (_ftype, path) in enumerate(files, 1):
             rel = str(path.relative_to(config.PROJECT_ROOT)).replace("\\", "/")
             h = _file_hash(path)
             if not force and hashes.get(rel) == h:
                 skipped += 1
+                if progress_callback:
+                    progress_callback(scanned, total, rel)
                 continue
             n = index_file(path)
             hashes[rel] = h
             indexed += 1
-            print(f"  [{indexed}] {n} chunks  {rel}")
+            if progress_callback:
+                progress_callback(scanned, total, rel)
+            else:
+                print(f"  [{indexed}] {n} chunks  {rel}")
     finally:
         save_state(state)
 
@@ -232,6 +244,15 @@ def main() -> int:
         "--file", metavar="PATH",
         help="Index a single file (used by the PostToolUse auto-sync hook)",
     )
+    parser.add_argument(
+        "--progress", action="store_true",
+        help=(
+            "Emit machine-readable progress lines on stdout instead of the "
+            "default per-file human output. Each line is "
+            "'PROGRESS\\t<scanned>\\t<total>\\t<rel_path>'. Used by install.py "
+            "to render a progress bar without parsing free-form output."
+        ),
+    )
     args = parser.parse_args()
 
     if args.file:
@@ -239,8 +260,13 @@ def main() -> int:
         print(f"Done: {n} chunks written")
         return 0
 
-    print("Scanning source files…")
-    indexed, skipped = reindex_all(force=args.all)
+    if args.progress:
+        def _cb(scanned: int, total: int, rel: str) -> None:
+            print(f"PROGRESS\t{scanned}\t{total}\t{rel}", flush=True)
+        indexed, skipped = reindex_all(force=args.all, progress_callback=_cb)
+    else:
+        print("Scanning source files…")
+        indexed, skipped = reindex_all(force=args.all)
     print(f"\nDone: indexed {indexed} files, skipped {skipped} unchanged")
 
     from codebase_store import stats
