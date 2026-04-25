@@ -15,6 +15,7 @@ caches to knowledge/git-intel.json (HEAD-based invalidation).
 from __future__ import annotations
 
 import logging
+import subprocess
 import sys
 from pathlib import Path
 
@@ -30,7 +31,7 @@ _MEMORY_COMPILER_ROOT = _HERE.parent     # .../memory-compiler
 if str(_MEMORY_COMPILER_ROOT) not in sys.path:
     sys.path.insert(0, str(_MEMORY_COMPILER_ROOT))
 
-from scripts.parsers import PROJECT_ROOT, php_graph, route_map, twig_graph, stimulus_map, git_intel
+from scripts.parsers import PROJECT_ROOT, php_graph, route_map, twig_graph, stimulus_map, git_intel, call_graph
 from scripts import parent_watchdog
 
 log = logging.getLogger("mcp_server")
@@ -58,6 +59,8 @@ class ParseCache:
         self._twig_mtime: float = 0.0
         self._stim_cache: dict | None = None
         self._stim_mtime: float = 0.0
+        self._call_graph_cache: dict | None = None
+        self._call_graph_mtime: float = 0.0
 
     @staticmethod
     def _max_mtime(paths) -> float:
@@ -102,6 +105,22 @@ class ParseCache:
 
     def get_git_intel(self) -> dict:
         return git_intel.load_or_parse(PROJECT_ROOT)
+
+    def get_call_graph(self) -> dict:
+        # Both PHP and Stimulus JS files affect the graph — invalidate on either.
+        php_mtime = self._max_mtime((PROJECT_ROOT / "src").rglob("*.php"))
+        js_mtime = self._max_mtime((PROJECT_ROOT / "assets" / "controllers").rglob("*_controller.js"))
+        current = max(php_mtime, js_mtime)
+        if self._call_graph_cache is None or current != self._call_graph_mtime:
+            log.info("Rebuilding call graph cache")
+            graph = call_graph.parse(PROJECT_ROOT)
+            # Resolve JS fetch placeholders to PHP controller symbols using the
+            # current route map. Must run inside the cache so trace_route /
+            # impact_of_change consumers see crossed-boundary edges.
+            call_graph.resolve_fetch_edges(graph, self.get_route_map())
+            self._call_graph_cache = graph
+            self._call_graph_mtime = current
+        return self._call_graph_cache
 
 
 _cache = ParseCache()
@@ -374,6 +393,212 @@ def _build_stimulus_map(controller: str = "") -> str:
     return "\n".join(lines)
 
 
+def _build_trace_route(method: str, path: str, max_depth: int = 6) -> str:
+    """Trace the call graph from a route's controller action down through services + repos.
+
+    Returns markdown with the route header and an indented tree of resolved
+    callees. ``method`` is matched case-insensitively against the route's
+    declared methods (or any method when the route declares none).
+    """
+    routes = _cache.get_route_map()
+    route_entry = routes["routes"].get(path)
+    if route_entry is None:
+        return f"No route found at path: `{path}`"
+
+    method = method.upper()
+    if route_entry["methods"] and method not in route_entry["methods"]:
+        return (
+            f"Route `{path}` does not handle `{method}` "
+            f"(handles: {', '.join(route_entry['methods'])})"
+        )
+
+    from_id = f"{route_entry['controller']}::{route_entry['action']}"
+    graph = _cache.get_call_graph()
+    tree = call_graph.trace(graph, from_id, max_depth=max_depth)
+
+    lines = [
+        f"# Trace: `{method} {path}`",
+        f"- Controller: `{route_entry['controller']}`",
+        f"- Action: `{route_entry['action']}`",
+        f"- File: `{route_entry['file']}`",
+        f"- Max depth: {max_depth}",
+        "",
+        "## Call tree",
+    ]
+    if tree.get("missing"):
+        lines.append(
+            f"- `{from_id}` (no symbol — controller action not picked up by call graph)"
+        )
+    else:
+        _render_trace_node(tree, lines, indent=0, is_root=True)
+    return "\n".join(lines)
+
+
+def _render_trace_node(node: dict, lines: list[str], indent: int, is_root: bool) -> None:
+    """Append one indented line per node in the trace tree, depth-first.
+
+    A ``missing=True`` flag (target not in local symbol table — vendor or
+    inherited from a vendor base class) is conveyed by the FQCN itself, so
+    we don't add a noisy marker. ``truncated="cycle"`` IS marked because
+    the reader cannot otherwise tell why the subtree ends.
+    """
+    prefix = "  " * indent + "- "
+    if is_root:
+        lines.append(f"{prefix}**{node['symbol']}**")
+    else:
+        kind = node.get("kind", "call")
+        confidence = node.get("confidence")
+        evidence = node.get("evidence", "")
+        marker_text = " _(cycle)_" if node.get("truncated") == "cycle" else ""
+        conf_text = f" c={confidence}" if confidence is not None else ""
+        ev_text = f" :: `{evidence}`" if evidence else ""
+        kind_tag = f"[{kind}]"
+        lines.append(f"{prefix}{kind_tag} `{node['symbol']}`{conf_text}{ev_text}{marker_text}")
+    for child in node["children"]:
+        _render_trace_node(child, lines, indent + 1, is_root=False)
+
+
+def _run_git_diff(since_ref: str, file: str | None = None) -> str:
+    """Run ``git diff -U0 <since_ref> [-- <file>]`` against PROJECT_ROOT.
+
+    Returns raw stdout. Empty string if diff produces no output or git
+    fails — caller handles 'no changes' as an empty-string case.
+    """
+    cmd = ["git", "diff", "-U0", since_ref]
+    if file:
+        cmd += ["--", file]
+    try:
+        return subprocess.check_output(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace")
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return ""
+
+
+def _build_impact_of_change(
+    file: str | None = None,
+    since_ref: str = "HEAD",
+    max_depth: int = 6,
+) -> str:
+    """Show what's downstream-affected by code changes since ``since_ref``.
+
+    Pipeline:
+        1. ``git diff -U0`` to get changed line ranges per file.
+        2. Map ranges to changed symbols via ``call_graph.find_changed_symbols``.
+        3. For each changed symbol, walk reverse callers up to ``max_depth``.
+        4. Match upstream callers against the route map → affected routes.
+        5. Score each route by (changed-symbols-reached × hotspot-multiplier).
+    """
+    diff_text = _run_git_diff(since_ref, file)
+    if not diff_text.strip():
+        return f"# Impact of change\n\nNo changes between working tree and `{since_ref}`."
+
+    file_ranges = call_graph.parse_diff_hunks(diff_text)
+    if not file_ranges:
+        return f"# Impact of change\n\nNo PHP files changed in diff vs `{since_ref}`."
+
+    graph = _cache.get_call_graph()
+    changed = call_graph.find_changed_symbols(graph, file_ranges)
+    if not changed:
+        return (
+            f"# Impact of change\n\n"
+            f"PHP files changed but no method bodies overlapped: {sorted(file_ranges)}"
+        )
+
+    # Build hotspot lookup once for risk scoring
+    git = _cache.get_git_intel()
+    hotspot_score: dict[str, float] = {
+        h["file"]: h["score"] for h in git.get("hotspots", [])
+    }
+
+    # Index controller actions by symbol_id so reverse-walked callers can
+    # be matched back to their public route.
+    routes = _cache.get_route_map()
+    route_by_action_symbol: dict[str, list[tuple[str, dict]]] = {}
+    for path, route in routes["routes"].items():
+        action_symbol = f"{route['controller']}::{route['action']}"
+        route_by_action_symbol.setdefault(action_symbol, []).append((path, route))
+
+    # For each changed symbol, walk upstream. Two views of the result:
+    #   - HTTP route matches (controller action symbols matched against route map)
+    #   - Stimulus frontend matches (any caller with `js:` prefix)
+    affected: dict[str, dict] = {}  # path -> {route, reaches: [{symbol, depth}]}
+    js_reaches: dict[str, list[dict]] = {}  # js_symbol -> [{symbol, depth}]
+    for changed_symbol in changed:
+        callers = call_graph.reverse_callers(graph, changed_symbol, max_depth=max_depth)
+        for caller in callers:
+            for path, route in route_by_action_symbol.get(caller["symbol"], []):
+                entry = affected.setdefault(path, {"route": route, "reaches": []})
+                entry["reaches"].append({
+                    "symbol": changed_symbol,
+                    "depth": caller["depth"],
+                })
+            if caller["symbol"].startswith("js:"):
+                js_reaches.setdefault(caller["symbol"], []).append({
+                    "symbol": changed_symbol,
+                    "depth": caller["depth"],
+                })
+
+    # Risk score: sum over reaches of (1 / depth) × file's hotspot score (default 1).
+    for entry in affected.values():
+        risk = 0.0
+        for reach in entry["reaches"]:
+            sym = graph["symbols"].get(reach["symbol"], {})
+            multiplier = hotspot_score.get(sym.get("file", ""), 1.0)
+            risk += (1.0 / max(reach["depth"], 1)) * multiplier
+        entry["risk"] = round(risk, 2)
+
+    sorted_routes = sorted(affected.items(), key=lambda kv: kv[1]["risk"], reverse=True)
+
+    lines = [
+        f"# Impact of change vs `{since_ref}`",
+        f"- Files touched: {len(file_ranges)}",
+        f"- Changed methods: {len(changed)}",
+        f"- Affected routes: {len(affected)}",
+        "",
+        "## Changed methods",
+    ]
+    for sid in sorted(changed):
+        sym = graph["symbols"].get(sid, {})
+        lines.append(f"- `{sid}` :: `{sym.get('file', '?')}:{sym.get('line', '?')}`")
+
+    if sorted_routes:
+        lines.append("")
+        lines.append("## Affected routes (sorted by risk)")
+        for path, info in sorted_routes:
+            r = info["route"]
+            methods = ",".join(r["methods"])
+            ctrl_short = r["controller"].rsplit("\\", 1)[-1]
+            lines.append(
+                f"- **{methods} `{path}`** -> `{ctrl_short}::{r['action']}` "
+                f"(risk {info['risk']}, {len(info['reaches'])} reaches)"
+            )
+            for reach in sorted(info["reaches"], key=lambda x: x["depth"]):
+                lines.append(
+                    f"    - reaches `{reach['symbol']}` (depth {reach['depth']})"
+                )
+
+    if js_reaches:
+        lines.append("")
+        lines.append("## Affected Stimulus controllers (JS frontend)")
+        for js_symbol in sorted(js_reaches):
+            reaches = js_reaches[js_symbol]
+            min_depth = min(r["depth"] for r in reaches)
+            lines.append(
+                f"- `{js_symbol}` ({len(reaches)} reach"
+                f"{'es' if len(reaches) != 1 else ''}, min depth {min_depth})"
+            )
+            for reach in sorted(reaches, key=lambda x: x["depth"]):
+                lines.append(
+                    f"    - reaches `{reach['symbol']}` (depth {reach['depth']})"
+                )
+
+    return "\n".join(lines)
+
+
 def _build_hotspots(top_n: int = 10) -> str:
     git = _cache.get_git_intel()
     hotspots = git.get("hotspots", [])[:top_n]
@@ -434,6 +659,30 @@ def _make_server():
     def get_hotspots(top_n: int = 10) -> str:
         """Top N hot files ranked by git churn score, with co-change partners and ownership."""
         return _build_hotspots(top_n)
+
+    @server.tool()
+    def impact_of_change(
+        file: str | None = None,
+        since_ref: str = "HEAD",
+        max_depth: int = 6,
+    ) -> str:
+        """Reverse-walk the call graph from edited symbols to surface affected routes + risk score.
+
+        Pass ``file`` to scope the diff to a single path. ``since_ref`` defaults
+        to ``HEAD`` (working tree vs latest commit); use a branch name like
+        ``main`` to see what your branch impacts.
+        """
+        return _build_impact_of_change(file, since_ref, max_depth)
+
+    @server.tool()
+    def trace_route(method: str, path: str, max_depth: int = 6) -> str:
+        """Trace the call graph from a route's controller action down through services + repositories.
+
+        Resolves constructor-injected services, static calls, typed locals, and
+        Doctrine ``getRepository(X::class)`` chains. Templates rendered via
+        ``$this->render()`` appear as leaves marked ``[render]``.
+        """
+        return _build_trace_route(method, path, max_depth)
 
     return server
 

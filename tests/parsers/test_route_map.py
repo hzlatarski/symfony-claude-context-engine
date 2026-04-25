@@ -38,6 +38,21 @@ def test_class_prefix_is_combined_with_method_path():
     assert len(consent_routes) >= 1, f"Expected /api/consent routes, got {consent_routes}"
 
 
+def test_methods_list_is_extracted_from_array_argument():
+    """``methods: ['POST']`` must be parsed as ['POST'], not silently lost.
+
+    Regression: the original ATTR regex used ``[^\\]]*`` for ``rest``, which
+    stopped at the inner ``]`` of the methods array, causing the methods
+    list extractor to find nothing and fall back to the GET default.
+    """
+    result = route_map.parse(PROJECT_ROOT)
+    start = result["routes"].get("/api/session/start")
+    assert start is not None, "expected /api/session/start to be discovered"
+    assert "POST" in start["methods"], (
+        f"expected POST in methods, got {start['methods']}"
+    )
+
+
 def test_summary_returns_short_string():
     s = route_map.summary(PROJECT_ROOT)
     assert isinstance(s, str)

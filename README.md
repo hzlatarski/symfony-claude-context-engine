@@ -46,7 +46,7 @@ This engine takes a different bet. It **compiles** your sessions into structured
 
 ### 2. Symfony Code Intelligence (Dedicated MCP Server)
 
-Five pure-Python parsers expose your live codebase as structured data via the `symfony-code-intel` MCP server's six tools:
+Six pure-Python parsers plus a tree-sitter call graph expose your live codebase as structured data via the `symfony-code-intel` MCP server's eight tools:
 
 | Tool | What it returns |
 |---|---|
@@ -56,8 +56,26 @@ Five pure-Python parsers expose your live codebase as structured data via the `s
 | `get_template_graph(t)` | Twig inheritance, includes, Stimulus bindings |
 | `get_stimulus_map(c)` | Bidirectional JS ↔ Twig map with orphan detection |
 | `get_hotspots(top_n)` | Churn-ranked files with ownership and bus-factor scoring |
+| `trace_route(method, path)` | Full call chain a route triggers — controller action down through services, repositories, and rendered templates. Each hop carries a confidence score reflecting how the receiver type was resolved. |
+| `impact_of_change(file=None, since_ref="HEAD")` | Reverse-walks the call graph from edited lines (parsed from `git diff -U0`) to surface affected HTTP routes **and** Stimulus controllers, risk-scored by hotspot weight. Crosses the JS↔PHP boundary via resolved `fetch()` URLs. |
 
-Runs live, mtime-cached, under one second. Git intelligence caches to `knowledge/git-intel.json` and invalidates on HEAD change.
+Runs live, mtime-cached, under one second. Git intelligence caches to `knowledge/git-intel.json` (HEAD-based invalidation); the symbol-level call graph caches to `knowledge/call-graph.json` (mtime + HEAD invalidation).
+
+#### Confidence-scored call graph
+
+`trace_route` and `impact_of_change` are backed by a tree-sitter call-graph parser that walks `src/**/*.php` and `assets/controllers/**/*_controller.js`. PHP resolution rules:
+
+| Pattern | Confidence |
+|---|---|
+| Constructor-injected typed properties (promoted or classic) | 1.0 |
+| Static calls `Foo::bar()`, `self::`, `parent::` (with `extends`-clause walking) | 1.0 |
+| `$this->method()` resolving up the inheritance chain | 1.0 |
+| Doctrine `$em->getRepository(X::class)` chained or via local var | 1.0 |
+| `$this->render('x.html.twig')` → render edge to `template:...` | 1.0 |
+| Typed local var: parameter type or `new X()` assignment | 0.7 |
+| Untyped or dynamic dispatch | skipped |
+
+JS resolution rules emit `js:<stimulus-name>::<method>` symbols and resolve `fetch()` calls against the route map: literal URLs at confidence 1.0, template literals (`/api/x/${id}/y`) at 0.7 with `${...}` collapsed to `*` for wildcard matching against route placeholders.
 
 ### 3. Knowledge MCP Server (Semantic Retrieval)
 

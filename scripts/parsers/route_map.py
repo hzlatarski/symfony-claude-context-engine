@@ -10,10 +10,13 @@ import re
 from pathlib import Path
 
 # Matches: #[Route('/path', name: 'foo', methods: ['GET','POST'])]
-# Named arguments are optional and can appear in any order.
+# Named arguments are optional and can appear in any order. The ``rest``
+# group consumes both inner ``[...]`` arrays (e.g. ``methods: ['POST']``)
+# and any other non-``]`` content, so the closing ``]`` of the attribute
+# is not stolen by an inner array.
 _ROUTE_ATTR_RE = re.compile(
     r"#\[Route\s*\(\s*(['\"])(?P<path>[^'\"]*)\1"
-    r"(?P<rest>[^\]]*)"
+    r"(?P<rest>(?:\[[^\]]*\]|[^\]])*)"
     r"\]",
     re.DOTALL,
 )

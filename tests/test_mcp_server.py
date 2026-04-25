@@ -60,6 +60,61 @@ def test_build_hotspots_returns_ranked_list():
     assert "commits" in result.lower() or "score" in result.lower()
 
 
+def test_build_trace_route_for_known_post_route():
+    result = mcp_server._build_trace_route("POST", "/api/session/start")
+    assert isinstance(result, str)
+    assert "SessionApiController" in result
+    # Trace from controller action — should include the action name `start`
+    # somewhere and at least one downstream symbol
+    assert "::start" in result
+
+
+def test_build_trace_route_unknown_route_explains():
+    result = mcp_server._build_trace_route("GET", "/does/not/exist/12345")
+    assert isinstance(result, str)
+    assert "not found" in result.lower() or "no route" in result.lower()
+
+
+def test_build_trace_route_respects_max_depth():
+    deep = mcp_server._build_trace_route("POST", "/api/session/start", max_depth=4)
+    shallow = mcp_server._build_trace_route("POST", "/api/session/start", max_depth=1)
+    # Shallow output should be strictly shorter (fewer rendered lines)
+    assert len(shallow) < len(deep)
+
+
+def test_build_impact_of_change_no_changes_explains():
+    """When there's no diff vs the given ref, output must say so cleanly."""
+    # An empty diff comes back from comparing HEAD against itself.
+    result = mcp_server._build_impact_of_change(file=None, since_ref="HEAD..HEAD")
+    assert isinstance(result, str)
+    assert "no changes" in result.lower() or "nothing changed" in result.lower()
+
+
+def test_build_impact_of_change_with_synthetic_changes(monkeypatch):
+    """Verify the rendering pipeline end-to-end by injecting fake diff output."""
+    # Pick a method we know exists in the call graph and seed a fake diff
+    # whose line range falls inside that method.
+    graph = mcp_server._cache.get_call_graph()
+    target_id = "App\\Service\\Session\\AccessControlService::canAccess"
+    target = graph["symbols"].get(target_id)
+    assert target is not None, "expected canAccess to be in the call graph"
+
+    fake_diff = (
+        f"diff --git a/{target['file']} b/{target['file']}\n"
+        f"--- a/{target['file']}\n"
+        f"+++ b/{target['file']}\n"
+        f"@@ -{target['line']},0 +{target['line']},1 @@\n"
+        "+// dummy\n"
+    )
+    monkeypatch.setattr(mcp_server, "_run_git_diff", lambda *a, **kw: fake_diff)
+
+    result = mcp_server._build_impact_of_change(file=None, since_ref="HEAD")
+    assert "AccessControlService" in result
+    # SessionApiController::start calls canAccess — should appear as an
+    # upstream caller / affected route.
+    assert "SessionApiController" in result
+
+
 def test_parse_cache_uses_mtime_invalidation():
     """The ParseCache should return the same dict on two quick calls."""
     cache = mcp_server.ParseCache()

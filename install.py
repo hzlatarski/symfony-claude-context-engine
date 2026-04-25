@@ -256,7 +256,7 @@ _CLAUDE_MD_MCP_BLOCK = """\
 <!-- memory-compiler-mcp-start -->
 ### Code Intelligence MCP (`symfony-code-intel`)
 
-Exposes 6 tools for on-demand code structure queries — mtime-cached, never needs a rebuild. Tools appear in the session as `mcp__symfony-code-intel__<tool>`:
+Exposes 8 tools for on-demand code structure queries — mtime-cached, never needs a rebuild. Tools appear in the session as `mcp__symfony-code-intel__<tool>`:
 
 | Tool | When to call it |
 |---|---|
@@ -266,6 +266,8 @@ Exposes 6 tools for on-demand code structure queries — mtime-cached, never nee
 | `get_template_graph(template)` | Before changing a Twig file — shows inheritance chain, all includes, and Stimulus bindings |
 | `get_stimulus_map(controller)` | When adding or removing a Stimulus controller — finds every template that references it |
 | `get_hotspots(top_n)` | Before a refactor — surfaces high-churn files so you avoid merging into a hot area |
+| `trace_route(method, path)` | When you need the full call chain a route triggers — controller action down through services, repositories, and rendered templates with confidence per hop |
+| `impact_of_change(file=None, since_ref="HEAD")` | Before merging or after editing — reverse-walks the call graph from changed lines to surface affected HTTP routes and Stimulus controllers, risk-scored by hotspot weight. Pass a branch name to see what your branch impacts. |
 
 **Skip calling these** when you are making a trivial one-file change with no dependencies, or when the user has already confirmed the scope explicitly.
 
@@ -326,9 +328,24 @@ def patch_claude_md() -> None:
 
     content = path.read_text(encoding="utf-8")
 
-    # Already patched — sentinel present
-    if _CLAUDE_MD_SENTINEL_START in content:
-        _skip(f"MCP block already present in {path.relative_to(PROJECT_ROOT)}")
+    # Sentinel present — replace the bracketed region only if its content
+    # has drifted from the current expected block. Re-runnable across engine
+    # upgrades, so users get new tools listed without manual edits.
+    if _CLAUDE_MD_SENTINEL_START in content and _CLAUDE_MD_SENTINEL_END in content:
+        import re
+        sentinel_pattern = re.compile(
+            re.escape(_CLAUDE_MD_SENTINEL_START)
+            + r".*?"
+            + re.escape(_CLAUDE_MD_SENTINEL_END),
+            re.DOTALL,
+        )
+        existing_match = sentinel_pattern.search(content)
+        if existing_match and existing_match.group(0) == _CLAUDE_MD_MCP_BLOCK:
+            _skip(f"MCP block already up to date in {path.relative_to(PROJECT_ROOT)}")
+            return
+        new_content = sentinel_pattern.sub(_CLAUDE_MD_MCP_BLOCK, content)
+        path.write_text(new_content, encoding="utf-8")
+        _ok(f"Updated MCP block in {path.relative_to(PROJECT_ROOT)}")
         return
 
     # Replace legacy heading block if it exists
