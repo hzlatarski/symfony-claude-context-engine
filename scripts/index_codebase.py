@@ -11,7 +11,10 @@ Source patterns (relative to config.PROJECT_ROOT):
     templates/**/*.twig
     config/**/*.yaml
 
-Chunking: 150-line windows with 30-line overlap.
+Chunking: PHP and JS use tree-sitter AST chunking — one chunk per
+class/method/function so retrieval lands on whole units instead of
+mid-method line slices. Twig and YAML (and PHP/JS files where AST
+parsing fails) fall back to 150-line windows with 30-line overlap.
 PHP additionally extracts class/interface/trait/function names into
 the 'symbols' metadata field for more precise BM25-style matching.
 
@@ -73,12 +76,30 @@ def _extract_symbols(text: str, file_type: str) -> str:
     return ",".join(n for n in names if n)
 
 
-def chunk_file(text: str) -> list[tuple[int, int, str]]:
+def chunk_file(text: str, file_type: str = "") -> list[tuple[int, int, str]]:
     """Split text into (start_line, end_line, chunk_text) tuples.
 
-    Uses 150-line windows with 30-line overlap. Line numbers are 1-based.
-    Returns an empty list for empty input.
+    For PHP and JS, attempts tree-sitter AST chunking — chunks fall on
+    class / method / function boundaries instead of arbitrary line offsets.
+    Falls through to 150-line windows with 30-line overlap when the file
+    type is unsupported, when tree-sitter isn't installed, or when the AST
+    walk produces no top-level declarations (e.g. PHP config files that
+    are bare ``return [...];`` arrays).
+
+    Line numbers are 1-based. Returns an empty list for empty input.
+    The ``file_type`` argument is optional for backward compatibility.
     """
+    if file_type:
+        from ast_chunker import chunk_ast, is_supported
+        if is_supported(file_type):
+            ast_chunks = chunk_ast(text, file_type)
+            if ast_chunks is not None:
+                return ast_chunks
+    return _chunk_lines(text)
+
+
+def _chunk_lines(text: str) -> list[tuple[int, int, str]]:
+    """Naive line-window chunker — fallback when AST chunking can't apply."""
     lines = text.splitlines(keepends=True)
     if not lines:
         return []
@@ -116,7 +137,7 @@ def index_file(path: Path) -> int:
     symbols = _extract_symbols(text, file_type)
     delete_chunks_for_file(rel)
 
-    chunks = chunk_file(text)
+    chunks = chunk_file(text, file_type)
     for idx, (start, end, chunk_text) in enumerate(chunks):
         chunk_id = f"{rel}::{idx}"
         metadata: dict = {

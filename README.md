@@ -20,6 +20,7 @@ A long-term memory system for Claude Code, purpose-built for Symfony projects. S
 - 🔍 **Hybrid BM25 + vector search** — Two dedicated MCP servers: `knowledge-compiler` for semantic+lexical retrieval, `symfony-code-intel` for live codebase structure. Fused via Reciprocal Rank Fusion.
 - ⚡ **Token-efficient retrieval** — `search_knowledge` returns slim ~220-char snippets; `get_articles([slugs])` batch-fetches full bodies only for the winners. ~10× context savings on multi-hit queries.
 - 🛠 **Symfony code intelligence** — Six live-parsing MCP tools: `get_codebase_overview`, `get_file_deps`, `get_route_map`, `get_template_graph`, `get_stimulus_map`, `get_hotspots`. Mtime-cached, sub-second.
+- 🌳 **AST-aware code chunking** — PHP and JS files chunk on class/method/function boundaries via tree-sitter, so `search_codebase` hits land on whole units instead of mid-method line slices. Twig and YAML fall back to 150-line windows.
 - 📚 **Structured tool drawer** — `PostToolUse` hook writes a JSONL log of every tool call to `knowledge/daily/*.tools.jsonl`. `flush.py` reads it as ground-truth input for Haiku summaries — so daily logs cite real file paths and commands, not reconstructions.
 - 🧪 **Anti-drift hardening** — Source anchors, confidence decay (90-day half-life), contradiction quarantine, canary questions, skeptical compile prompt, observed-vs-synthesized zones.
 - 📉 **O(1) prompt cost** — Priority-scored `compiled-truth.md` keeps session-start context constant from 50 articles to 5,000. Upstream compiler scales linearly.
@@ -66,6 +67,7 @@ A **second** MCP server (`knowledge-compiler`) — separate from the code-intel 
 |---|---|
 | `search_knowledge(query, ...)` | Semantic search over curated articles with filters for memory `type`, `min_confidence`, `zone`, quarantine state. Returns **slim snippets** (~220 chars), not full bodies. |
 | `search_raw_daily(query, date_from, date_to)` | Semantic search over verbatim drawer chunks (daily logs, never summarized). Slim snippets. |
+| `search_codebase(query, file_type)` | Hybrid BM25 + vector search over indexed source files. PHP and JS are chunked at class/method/function boundaries via tree-sitter (see below); Twig and YAML use 150-line windows. Returns chunked file excerpts with line ranges. |
 | `get_article(slug)` | Full markdown + parsed frontmatter for one article |
 | `get_articles([slugs])` | Batch-fetch full bodies for multiple slugs in one round trip. Missing slugs return `{slug, error: "not_found"}` so one bad slug doesn't abort the batch. |
 | `list_contradictions()` | Current contradiction-quarantine list |
@@ -73,6 +75,8 @@ A **second** MCP server (`knowledge-compiler`) — separate from the code-intel 
 Backed by **ChromaDB** with the bundled `all-MiniLM-L6-v2` ONNX embedder — fully local, zero API cost, ~90 MB one-time model download on first use.
 
 **Token-efficient two-step retrieval** — inspired by claude-mem's `search → get_observations` split, `search_knowledge` returns just `{slug, title, snippet, distance, metadata}` (~50–100 tokens per hit) so the agent can scan cheaply and then fetch full bodies only for the winners via `get_article(s)`. Saves ~10× context on multi-hit queries where most matches turn out to be irrelevant.
+
+**AST-based code chunking.** `index_codebase.py` chunks PHP and JS source via tree-sitter so each chunk is a complete `class`, `interface`, `trait`, `enum`, `function`, or `method` — not an arbitrary line window that cuts mid-method. Classes larger than 400 lines split into a header chunk plus one chunk per method; methods larger than 400 lines fall back to 150-line windows so no single chunk grows unbounded. Twig, YAML, and any file where the tree-sitter parser fails or finds no top-level declarations transparently fall through to the line-window chunker. The win: `search_codebase` hits return whole, semantically-coherent units the LLM can reason about, instead of half a method's tail spliced to half another method's head. Idea borrowed from [zilliztech/claude-context](https://github.com/zilliztech/claude-context); their AST-splitter pattern is the only piece of that project that wasn't already covered here.
 
 ### 4. Anti-Drift Hardening (Six Defenses)
 
