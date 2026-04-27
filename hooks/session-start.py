@@ -18,6 +18,7 @@ Configure in .claude/settings.json:
 
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -208,6 +209,65 @@ def get_cost_summary() -> str | None:
     return "\n".join(parts)
 
 
+def get_update_notice() -> str | None:
+    """Probe for a pending upgrade and return a markdown notice, or None.
+
+    Runs ``scripts/check_update.py`` as a subprocess with a short timeout.
+    The probe itself caches for 6h, so this runs at most a few times per
+    day; the timeout guarantees we never stall the session if the network
+    is slow.
+
+    The notice tells the agent the user can run ``/memory-compiler-upgrade``
+    to handle the prompt — that skill owns the AskUserQuestion flow,
+    snooze logic, and the actual upgrade execution.
+    """
+    check_script = ROOT / "scripts" / "check_update.py"
+    if not check_script.exists():
+        return None
+    try:
+        # ``uv run python`` is the canonical invocation; the hook runs
+        # from ``.claude/memory-compiler/`` so a relative path works.
+        proc = subprocess.run(
+            ["uv", "run", "python", str(check_script)],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    line = (proc.stdout or "").strip()
+    if not line:
+        return None
+    parts = line.split()
+    if len(parts) != 3:
+        return None
+    tag, old, new = parts
+    if tag == "UPGRADE_AVAILABLE":
+        return (
+            f"## Memory Compiler Update Available\n\n"
+            f"A new memory-compiler release is available: **v{old} → v{new}**.\n\n"
+            f"Tell the user that an update is available and run "
+            f"`/memory-compiler-upgrade` to handle the upgrade prompt. "
+            f"The skill walks the user through the choice "
+            f"(upgrade now / always / not now / never ask again) and "
+            f"performs the upgrade safely if accepted."
+        )
+    if tag == "JUST_UPGRADED":
+        return (
+            f"## Memory Compiler Just Upgraded\n\n"
+            f"The memory compiler was just upgraded from **v{old}** to **v{new}**. "
+            f"After replying, summarize what's new by reading "
+            f"`.claude/memory-compiler/CHANGELOG.md` (entries between {old} and {new}) "
+            f"in 5–7 bullets, then continue with the user's original request. "
+            f"Once you've shown the summary, delete "
+            f"`~/.memory-compiler/just-upgraded-from` so it doesn't repeat."
+        )
+    return None
+
+
 def build_context() -> str:
     """Assemble the context to inject into the conversation."""
     parts = []
@@ -215,6 +275,12 @@ def build_context() -> str:
     # Today's date
     today = datetime.now(timezone.utc).astimezone()
     parts.append(f"## Today\n{today.strftime('%A, %B %d, %Y')}")
+
+    # Update notice — first thing after the date so the user (and the
+    # agent) sees the upgrade prompt before diving into KB context.
+    update_notice = get_update_notice()
+    if update_notice:
+        parts.append(update_notice)
 
     # Autocompact threshold check
     autocompact = os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")

@@ -647,6 +647,63 @@ It's a foreground process — `Ctrl-C` shuts down the observer cleanly. Failure 
 
 ---
 
+## Self-Upgrade
+
+Inspired by [gstack](https://github.com/garrytan/gstack)'s upgrade flow. The engine ships with a periodic version check that surfaces a one-line notice at session start when a new release lands, and a dedicated skill (`/memory-compiler-upgrade`) that handles the prompt + execution.
+
+### How it works
+
+1. **`VERSION` file** at the repo root is the source of truth for the installed release.
+2. **`scripts/check_update.py`** is invoked by the SessionStart hook. It probes `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` (cached for 6h, snooze-aware) and emits one of:
+   - `UPGRADE_AVAILABLE <old> <new>` — remote ahead of local
+   - `JUST_UPGRADED <old> <new>` — surfaced once after a successful upgrade so the agent can render "what's new" from `CHANGELOG.md`
+   - silence (offline / up-to-date / snoozed / disabled)
+3. **`hooks/session-start.py`** injects the notice as `## Memory Compiler Update Available` into the session context. The agent reads it and runs `/memory-compiler-upgrade`.
+4. **`/memory-compiler-upgrade` skill** (installed at `~/.claude/skills/memory-compiler-upgrade/SKILL.md`) prompts via `AskUserQuestion` with four options:
+   - **Yes, upgrade now** — runs `scripts/upgrade.py` (stash + `git fetch` + `reset --hard origin/main` + migrations + `uv sync`)
+   - **Always keep me up to date** — sets `auto_upgrade: true` in `~/.memory-compiler/config.json`, then upgrades
+   - **Not now** — snoozes with escalating backoff (24h → 48h → 1 week)
+   - **Never ask again** — sets `update_check: false`; re-enable with `MEMORY_COMPILER_UPDATE_CHECK=1`
+5. **After the upgrade**, the next session-start surfaces `JUST_UPGRADED` and the agent renders 5–7 bullets summarising the diff between the old and new `## [version]` blocks in `CHANGELOG.md`.
+
+### State directory
+
+```
+~/.memory-compiler/
+├── config.json            # {auto_upgrade, update_check}
+├── last-update-check      # touch file — 6h cache TTL
+├── update-snoozed         # "<version> <level> <epoch>"
+└── just-upgraded-from     # written by upgrade.py — consumed once by the skill
+```
+
+### Manual usage
+
+```bash
+# Check (bypassing cache + snooze) and prompt if anything is available
+/memory-compiler-upgrade
+
+# Direct probe — prints UPGRADE_AVAILABLE / JUST_UPGRADED / nothing
+uv run python scripts/check_update.py --force
+
+# Force a non-interactive upgrade (skips the AskUserQuestion prompt)
+uv run python scripts/upgrade.py
+```
+
+### Env overrides
+
+| Variable | Effect |
+|---|---|
+| `MEMORY_COMPILER_AUTO_UPGRADE=1` | Skip the prompt and upgrade silently when an update is detected |
+| `MEMORY_COMPILER_UPDATE_CHECK=0` | Disable update checks entirely (the SessionStart probe stays silent) |
+| `MEMORY_COMPILER_REMOTE_VERSION_URL` | Alternate raw `VERSION` URL for testing or self-hosted forks |
+| `MEMORY_COMPILER_STATE_DIR` | Alternate state dir (defaults to `~/.memory-compiler/`) |
+
+### Migrations
+
+Place per-version migration scripts under `scripts/migrations/v<X>.<Y>.<Z>.{sh,py}`. The upgrader runs every script whose version is strictly greater than the old `VERSION` and ≤ the new one, in semver order. Scripts must be idempotent — failures are non-fatal so a botched migration doesn't strand the user mid-upgrade.
+
+---
+
 ## Cross-process Safety
 
 Concurrent writers — the watcher, a `SessionEnd` flush, a manual `ingest.py`, a `reindex.py --all` — coordinate via per-collection file locks under `knowledge/chroma/.locks/`. Implementation: the [`filelock`](https://py-filelock.readthedocs.io/) library, one lock per Chroma collection (`articles`, `daily_chunks`, `codebase`), held only for the duration of the upsert/delete call. Read paths (queries, counts) are unlocked because Chroma handles concurrent reads safely.
