@@ -20,6 +20,9 @@ import asyncio
 import sys
 from pathlib import Path
 
+import time
+
+import ingest_state
 from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, KNOWLEDGE_DIR, MODEL_INGEST, now_iso
 from source_handlers import get_handler
 from utils import (
@@ -319,12 +322,56 @@ def main():
     CONCEPTS_DIR.mkdir(parents=True, exist_ok=True)
     CONNECTIONS_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Clear any prior stop signal — a fresh run shouldn't honor a stale flag.
+    ingest_state.clear_stop()
+    started = time.time()
+    total = len(to_ingest)
+    ingest_state.write_status(
+        phase="starting", processed=0, total=total, started_at=started,
+    )
+
     total_cost = 0.0
+    stopped = False
     for i, (group, fpath) in enumerate(to_ingest, 1):
-        print(f"\n[{i}/{len(to_ingest)}] Ingesting [{group.id}] {fpath.name}...")
+        if ingest_state.should_stop():
+            print(f"\nStop requested — halting after {i - 1}/{total} files.")
+            ingest_state.clear_stop()
+            stopped = True
+            break
+
+        print(f"\n[{i}/{total}] Ingesting [{group.id}] {fpath.name}...")
+        ingest_state.write_status(
+            phase="running",
+            current_file=f"{group.id}/{fpath.name}",
+            processed=i - 1,
+            total=total,
+            total_cost=total_cost,
+            started_at=started,
+        )
         cost = asyncio.run(ingest_source_file(group, fpath, state))
         total_cost += cost
+        ingest_state.write_status(
+            phase="running",
+            current_file=f"{group.id}/{fpath.name}",
+            processed=i,
+            total=total,
+            total_cost=total_cost,
+            started_at=started,
+        )
         print(f"  Done.")
+
+    final_phase = "stopped" if stopped else "finished"
+    # When stopped at iteration i, files 1..i-1 actually completed; iteration
+    # i was aborted before its Sonnet call. When finished cleanly, all
+    # `total` files completed.
+    processed_count = (i - 1) if stopped else total
+    ingest_state.write_status(
+        phase=final_phase,
+        processed=processed_count,
+        total=total,
+        total_cost=total_cost,
+        started_at=started,
+    )
 
     articles = list_wiki_articles()
 

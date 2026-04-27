@@ -32,7 +32,7 @@ if str(_MEMORY_COMPILER_ROOT) not in sys.path:
     sys.path.insert(0, str(_MEMORY_COMPILER_ROOT))
 
 from scripts.parsers import PROJECT_ROOT, php_graph, route_map, twig_graph, stimulus_map, git_intel, call_graph
-from scripts import parent_watchdog
+from scripts import parent_watchdog, mermaid_render
 
 log = logging.getLogger("mcp_server")
 
@@ -393,12 +393,21 @@ def _build_stimulus_map(controller: str = "") -> str:
     return "\n".join(lines)
 
 
-def _build_trace_route(method: str, path: str, max_depth: int = 6) -> str:
+def _build_trace_route(
+    method: str,
+    path: str,
+    max_depth: int = 6,
+    output_format: str = "text",
+) -> str:
     """Trace the call graph from a route's controller action down through services + repos.
 
     Returns markdown with the route header and an indented tree of resolved
     callees. ``method`` is matched case-insensitively against the route's
     declared methods (or any method when the route declares none).
+
+    ``output_format='mermaid'`` returns the call tree as a ``flowchart TD``
+    fenced block instead of an indented bullet list — easier to read once
+    branching exceeds 2-3 levels.
     """
     routes = _cache.get_route_map()
     route_entry = routes["routes"].get(path)
@@ -415,6 +424,19 @@ def _build_trace_route(method: str, path: str, max_depth: int = 6) -> str:
     from_id = f"{route_entry['controller']}::{route_entry['action']}"
     graph = _cache.get_call_graph()
     tree = call_graph.trace(graph, from_id, max_depth=max_depth)
+
+    if output_format == "mermaid":
+        if tree.get("missing"):
+            return (
+                f"# Trace: `{method} {path}`\n\n"
+                f"Controller action `{from_id}` not in call graph — "
+                f"nothing to render."
+            )
+        body = mermaid_render.render_trace_tree(tree, root_label=f"**{from_id}**")
+        return (
+            f"# Trace: `{method} {path}`\n\n"
+            f"```mermaid\n{body}\n```"
+        )
 
     lines = [
         f"# Trace: `{method} {path}`",
@@ -482,6 +504,7 @@ def _build_impact_of_change(
     file: str | None = None,
     since_ref: str = "HEAD",
     max_depth: int = 6,
+    output_format: str = "text",
 ) -> str:
     """Show what's downstream-affected by code changes since ``since_ref``.
 
@@ -553,6 +576,20 @@ def _build_impact_of_change(
 
     sorted_routes = sorted(affected.items(), key=lambda kv: kv[1]["risk"], reverse=True)
 
+    if output_format == "mermaid":
+        body = mermaid_render.render_impact_graph(
+            changed_symbols=sorted(changed),
+            affected_routes=sorted_routes,
+            js_reaches=js_reaches,
+        )
+        return (
+            f"# Impact of change vs `{since_ref}`\n\n"
+            f"- Files touched: {len(file_ranges)}\n"
+            f"- Changed methods: {len(changed)}\n"
+            f"- Affected routes: {len(affected)}\n\n"
+            f"```mermaid\n{body}\n```"
+        )
+
     lines = [
         f"# Impact of change vs `{since_ref}`",
         f"- Files touched: {len(file_ranges)}",
@@ -596,6 +633,141 @@ def _build_impact_of_change(
                     f"    - reaches `{reach['symbol']}` (depth {reach['depth']})"
                 )
 
+    return "\n".join(lines)
+
+
+def _build_circular_dependencies(scope: str = "all", output_format: str = "text") -> str:
+    """Detect strongly-connected components in the call graph (Tarjan's SCC).
+
+    A cycle is any SCC of size > 1. Singleton SCCs that contain a self-edge
+    are also reported (rare but real — a method that calls itself directly).
+
+    ``scope`` filters the symbol set:
+        ``all``    every symbol (PHP + JS)
+        ``php``    only ``App\\...`` PHP symbols
+        ``js``     only ``js:...`` Stimulus symbols
+        ``vendor-excluded``  PHP minus vendor namespaces (Symfony, Doctrine, etc.)
+    """
+    graph = _cache.get_call_graph()
+    edges = graph.get("edges", []) or []
+    symbols = graph.get("symbols", {}) or {}
+
+    def _accept(sym_id: str) -> bool:
+        if scope == "all":
+            return True
+        if scope == "php":
+            return not sym_id.startswith("js:")
+        if scope == "js":
+            return sym_id.startswith("js:")
+        if scope == "vendor-excluded":
+            if sym_id.startswith("js:"):
+                return False
+            # Heuristic: a symbol is "vendor" if it's referenced in edges but
+            # has no entry in the symbol table (we only parse src/), OR if
+            # its file path lives outside src/.
+            sym = symbols.get(sym_id)
+            if sym is None:
+                return False
+            f = sym.get("file") or ""
+            return f.startswith("src/")
+        return True
+
+    # Build adjacency only for accepted nodes — Tarjan on the full graph
+    # would surface dozens of vendor-internal cycles that are noise.
+    adj: dict[str, list[str]] = {}
+    for edge in edges:
+        a, b = edge.get("from"), edge.get("to")
+        if not a or not b:
+            continue
+        if not _accept(a) or not _accept(b):
+            continue
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, [])  # ensure target is a node even if it has no out-edges
+
+    # Iterative Tarjan to avoid recursion limit on large graphs.
+    index_counter = [0]
+    indices: dict[str, int] = {}
+    lowlinks: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    sccs: list[list[str]] = []
+
+    def _strongconnect(start: str) -> None:
+        # Iterative DFS using an explicit work stack of (node, child_iterator).
+        work: list[tuple[str, "iter"]] = []
+        indices[start] = index_counter[0]
+        lowlinks[start] = index_counter[0]
+        index_counter[0] += 1
+        stack.append(start)
+        on_stack.add(start)
+        work.append((start, iter(adj.get(start, []))))
+
+        while work:
+            node, it = work[-1]
+            advanced = False
+            for w in it:
+                if w not in indices:
+                    indices[w] = index_counter[0]
+                    lowlinks[w] = index_counter[0]
+                    index_counter[0] += 1
+                    stack.append(w)
+                    on_stack.add(w)
+                    work.append((w, iter(adj.get(w, []))))
+                    advanced = True
+                    break
+                elif w in on_stack:
+                    lowlinks[node] = min(lowlinks[node], indices[w])
+            if not advanced:
+                if lowlinks[node] == indices[node]:
+                    component: list[str] = []
+                    while True:
+                        v = stack.pop()
+                        on_stack.discard(v)
+                        component.append(v)
+                        if v == node:
+                            break
+                    sccs.append(component)
+                work.pop()
+                if work:
+                    parent_node = work[-1][0]
+                    lowlinks[parent_node] = min(lowlinks[parent_node], lowlinks[node])
+
+    for node in list(adj.keys()):
+        if node not in indices:
+            _strongconnect(node)
+
+    self_loops = {edge["from"] for edge in edges if edge.get("from") == edge.get("to")}
+    cycles: list[list[str]] = []
+    for comp in sccs:
+        if len(comp) > 1:
+            cycles.append(sorted(comp))
+        elif len(comp) == 1 and comp[0] in self_loops and _accept(comp[0]):
+            cycles.append(comp)
+
+    cycles.sort(key=lambda c: (-len(c), c[0]))
+
+    if output_format == "mermaid":
+        return (
+            f"# Circular dependencies (scope={scope})\n\n"
+            f"Found {len(cycles)} cycle(s).\n\n"
+            f"```mermaid\n{mermaid_render.render_cycles(cycles)}\n```"
+        )
+
+    lines = [f"# Circular dependencies (scope={scope})", ""]
+    if not cycles:
+        lines.append("No cycles detected.")
+        return "\n".join(lines)
+    lines.append(f"Found **{len(cycles)}** cycle(s).")
+    lines.append("")
+    for idx, cycle in enumerate(cycles, 1):
+        lines.append(f"## Cycle {idx} ({len(cycle)} symbols)")
+        for sym in cycle:
+            sym_meta = symbols.get(sym, {})
+            location = ""
+            if sym_meta:
+                location = f" :: `{sym_meta.get('file', '?')}:{sym_meta.get('line', '?')}`"
+            lines.append(f"- `{sym}`{location}")
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -665,24 +837,65 @@ def _make_server():
         file: str | None = None,
         since_ref: str = "HEAD",
         max_depth: int = 6,
+        output_format: str = "text",
     ) -> str:
         """Reverse-walk the call graph from edited symbols to surface affected routes + risk score.
 
         Pass ``file`` to scope the diff to a single path. ``since_ref`` defaults
         to ``HEAD`` (working tree vs latest commit); use a branch name like
         ``main`` to see what your branch impacts.
+
+        Set ``output_format='mermaid'`` for a flowchart rendering of the
+        affected-route graph — easier to read at a glance than the default
+        risk-sorted bullet list once more than 4-5 routes are affected.
         """
-        return _build_impact_of_change(file, since_ref, max_depth)
+        return _build_impact_of_change(file, since_ref, max_depth, output_format)
 
     @server.tool()
-    def trace_route(method: str, path: str, max_depth: int = 6) -> str:
+    def trace_route(
+        method: str,
+        path: str,
+        max_depth: int = 6,
+        output_format: str = "text",
+    ) -> str:
         """Trace the call graph from a route's controller action down through services + repositories.
 
         Resolves constructor-injected services, static calls, typed locals, and
         Doctrine ``getRepository(X::class)`` chains. Templates rendered via
         ``$this->render()`` appear as leaves marked ``[render]``.
+
+        Set ``output_format='mermaid'`` to receive a ``flowchart TD`` block
+        instead of an indented bullet tree — the diagram form scales much
+        better past depth 3.
         """
-        return _build_trace_route(method, path, max_depth)
+        return _build_trace_route(method, path, max_depth, output_format)
+
+    @server.tool()
+    def get_circular_dependencies(
+        scope: str = "vendor-excluded",
+        output_format: str = "text",
+    ) -> str:
+        """Detect strongly-connected components (cycles) in the call graph.
+
+        Tarjan's algorithm over the resolved call graph. Useful before a
+        refactor to find self-reinforcing dependencies that will trip
+        Symfony's container compile pass — or to verify that a refactor
+        actually broke a cycle you intended to break.
+
+        Args:
+            scope: ``all`` | ``php`` | ``js`` | ``vendor-excluded`` (default).
+                ``vendor-excluded`` is the recommended scope: keeps only
+                ``src/...`` PHP symbols so vendor-internal cycles
+                (Symfony, Doctrine) don't drown out your own.
+            output_format: ``text`` (default) — markdown listing per cycle
+                with file:line per symbol — or ``mermaid`` — one
+                ``flowchart LR`` per cycle.
+
+        Returns:
+            Markdown report. Cycles are sorted by size (largest first),
+            then by leading symbol name.
+        """
+        return _build_circular_dependencies(scope, output_format)
 
     return server
 

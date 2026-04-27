@@ -19,7 +19,12 @@ A long-term memory system for Claude Code, purpose-built for Symfony projects. S
 - 🏷 **Memory type taxonomy** — Every article is a `fact`, `event`, `discovery`, `preference`, `advice`, or `decision`. First-class filter in `search_knowledge` so "only preferences about testing" is one call.
 - 🔍 **Hybrid BM25 + vector search** — Two dedicated MCP servers: `knowledge-compiler` for semantic+lexical retrieval, `symfony-code-intel` for live codebase structure. Fused via Reciprocal Rank Fusion.
 - ⚡ **Token-efficient retrieval** — `search_knowledge` returns slim ~220-char snippets; `get_articles([slugs])` batch-fetches full bodies only for the winners. ~10× context savings on multi-hit queries.
-- 🛠 **Symfony code intelligence** — Six live-parsing MCP tools: `get_codebase_overview`, `get_file_deps`, `get_route_map`, `get_template_graph`, `get_stimulus_map`, `get_hotspots`. Mtime-cached, sub-second.
+- 🛠 **Symfony code intelligence** — Live-parsing MCP tools: `get_codebase_overview`, `get_file_deps`, `get_route_map`, `get_template_graph`, `get_stimulus_map`, `get_hotspots`, `trace_route`, `impact_of_change`, `get_circular_dependencies`. Mtime-cached, sub-second. `trace_route` and `impact_of_change` accept `output_format="mermaid"` for flowchart rendering.
+- 👀 **Live file watcher** — `scripts/watch.py` runs alongside the viewer, debounces filesystem events, and incrementally reindexes both knowledge articles and codebase chunks within ~2s of any save. No more "I edited the article and `search_knowledge` still returns the old version" gap.
+- 🔗 **Cross-project linked search** — Set `MEMORY_COMPILER_LINKED_PROJECTS=/path/a,/path/b` and pass `include_linked=true` to `search_knowledge` to fan out a single query across multiple project knowledge bases. Results are RRF-merged and tagged with the originating project name.
+- 🛡 **Cross-process locking** — Concurrent writers (the file watcher, a `SessionEnd` flush, a manual `ingest.py`) coordinate via `filelock` against per-collection lock files under `knowledge/chroma/.locks/`. No more SQLite "database is locked" surprises.
+- ⏸ **Resumable, interruptible ingest** — Per-file content-hash checkpointing makes `ingest.py` crash-safe — re-running skips files whose hash matches the last successful run. Live progress is written to `knowledge/.ingest-status.json` and exposed via the `ingest_status` MCP tool. `ingest_stop` raises a cooperative-cancel flag the next file boundary honors.
+- 🩺 **`kb_health` MCP tool** — One-shot diagnostic: collection sizes, articles by memory type, broken `[src:]` anchors, quarantine count, last ingest timestamp. Replaces six manual scripts when you need to know "is the KB healthy?".
 - 🌳 **AST-aware code chunking** — PHP and JS files chunk on class/method/function boundaries via tree-sitter, so `search_codebase` hits land on whole units instead of mid-method line slices. Twig and YAML fall back to 150-line windows.
 - 📚 **Structured tool drawer** — `PostToolUse` hook writes a JSONL log of every tool call to `knowledge/daily/*.tools.jsonl`. `flush.py` reads it as ground-truth input for Haiku summaries — so daily logs cite real file paths and commands, not reconstructions.
 - 🧪 **Anti-drift hardening** — Source anchors, confidence decay (90-day half-life), contradiction quarantine, canary questions, skeptical compile prompt, observed-vs-synthesized zones.
@@ -46,7 +51,7 @@ This engine takes a different bet. It **compiles** your sessions into structured
 
 ### 2. Symfony Code Intelligence (Dedicated MCP Server)
 
-Six pure-Python parsers plus a tree-sitter call graph expose your live codebase as structured data via the `symfony-code-intel` MCP server's eight tools:
+Six pure-Python parsers plus a tree-sitter call graph expose your live codebase as structured data via the `symfony-code-intel` MCP server's nine tools:
 
 | Tool | What it returns |
 |---|---|
@@ -56,8 +61,9 @@ Six pure-Python parsers plus a tree-sitter call graph expose your live codebase 
 | `get_template_graph(t)` | Twig inheritance, includes, Stimulus bindings |
 | `get_stimulus_map(c)` | Bidirectional JS ↔ Twig map with orphan detection |
 | `get_hotspots(top_n)` | Churn-ranked files with ownership and bus-factor scoring |
-| `trace_route(method, path)` | Full call chain a route triggers — controller action down through services, repositories, and rendered templates. Each hop carries a confidence score reflecting how the receiver type was resolved. |
-| `impact_of_change(file=None, since_ref="HEAD")` | Reverse-walks the call graph from edited lines (parsed from `git diff -U0`) to surface affected HTTP routes **and** Stimulus controllers, risk-scored by hotspot weight. Crosses the JS↔PHP boundary via resolved `fetch()` URLs. |
+| `trace_route(method, path, output_format="text")` | Full call chain a route triggers — controller action down through services, repositories, and rendered templates. Each hop carries a confidence score reflecting how the receiver type was resolved. Set `output_format="mermaid"` for a `flowchart TD` rendering. |
+| `impact_of_change(file=None, since_ref="HEAD", output_format="text")` | Reverse-walks the call graph from edited lines (parsed from `git diff -U0`) to surface affected HTTP routes **and** Stimulus controllers, risk-scored by hotspot weight. Crosses the JS↔PHP boundary via resolved `fetch()` URLs. Mermaid output mode renders affected routes + reached methods as a two-tier flowchart. |
+| `get_circular_dependencies(scope="vendor-excluded", output_format="text")` | Tarjan's SCC over the resolved call graph. Reports cycles (SCCs of size > 1 plus self-loops) sorted by size. `scope` filters to `php`, `js`, `all`, or `vendor-excluded` (default — keeps only `src/...` symbols). |
 
 Runs live, mtime-cached, under one second. Git intelligence caches to `knowledge/git-intel.json` (HEAD-based invalidation); the symbol-level call graph caches to `knowledge/call-graph.json` (mtime + HEAD invalidation).
 
@@ -83,12 +89,16 @@ A **second** MCP server (`knowledge-compiler`) — separate from the code-intel 
 
 | Tool | What it returns |
 |---|---|
-| `search_knowledge(query, ...)` | Semantic search over curated articles with filters for memory `type`, `min_confidence`, `zone`, quarantine state. Returns **slim snippets** (~220 chars), not full bodies. |
+| `search_knowledge(query, ..., include_linked=False)` | Semantic search over curated articles with filters for memory `type`, `min_confidence`, `zone`, quarantine state. Returns **slim snippets** (~220 chars), not full bodies. Set `include_linked=True` to also search every project listed in `MEMORY_COMPILER_LINKED_PROJECTS` — hits get a `project` tag. |
 | `search_raw_daily(query, date_from, date_to)` | Semantic search over verbatim drawer chunks (daily logs, never summarized). Slim snippets. |
-| `search_codebase(query, file_type)` | Hybrid BM25 + vector search over indexed source files. PHP and JS are chunked at class/method/function boundaries via tree-sitter (see below); Twig and YAML use 150-line windows. Returns chunked file excerpts with line ranges. |
+| `search_codebase(query, file_type)` | Hybrid BM25 + vector search over indexed source files. PHP and JS are chunked at class/method/function boundaries via tree-sitter (see below); Twig and YAML use 150-line windows. Returns chunked file excerpts with line ranges, plus the source group's `source_description` so the agent learns *when* to consult that file group. |
 | `get_article(slug)` | Full markdown + parsed frontmatter for one article |
 | `get_articles([slugs])` | Batch-fetch full bodies for multiple slugs in one round trip. Missing slugs return `{slug, error: "not_found"}` so one bad slug doesn't abort the batch. |
 | `list_contradictions()` | Current contradiction-quarantine list |
+| `list_sources()` | Source-group catalog: `{file_type, patterns, description, chunk_count}` per group. Use **before** `search_codebase` when you don't know which `file_type` fits — descriptions tell you when to consult each group. Doubles as a freshness check (`chunk_count: 0` for an expected group means the index is stale). |
+| `kb_health()` | One-shot diagnostic. Returns `{vector_store, codebase_store, articles{total,by_type}, anchors{broken,articles_missing_anchors}, quarantine, freshness, ingest}`. Use as a CI gate or before answering critical KB questions. |
+| `ingest_status()` | Live progress snapshot for the most recent / active `ingest.py` run. Reads `knowledge/.ingest-status.json`. Phases: `idle`, `starting`, `running`, `finished`, `stopped`, `error`. Compare `updated_at` against current time — a stale snapshot during `running` likely means the process crashed silently. |
+| `ingest_stop()` | Cooperative halt for a running ingest. The current Sonnet call (if any) finishes and is checkpointed before the run exits — re-running `ingest.py` resumes from the next unprocessed file via the existing hash-based skip logic. |
 
 Backed by **ChromaDB** with the bundled `all-MiniLM-L6-v2` ONNX embedder — fully local, zero API cost, ~90 MB one-time model download on first use.
 
@@ -462,6 +472,7 @@ uv run pytest tests/whisper_tray/ -v
 # Knowledge pipeline
 uv run python scripts/compile.py               # compile daily logs → articles
 uv run python scripts/ingest.py                # compile source files → articles
+uv run python scripts/ingest.py --all          # force re-ingest (per-file hash checkpoint still saves rerun cost)
 uv run python scripts/compile_truth.py         # regenerate compiled-truth.md (pure Python)
 uv run python scripts/query.py "question"      # ask the KB (uses Sonnet)
 
@@ -470,6 +481,10 @@ uv run python scripts/reindex.py               # incremental (hash-based)
 uv run python scripts/reindex.py --all         # force full rebuild
 uv run python scripts/reindex.py --articles-only
 uv run python scripts/reindex.py --daily-only
+
+# Live watcher (run alongside viewer.py — auto-reindexes on file change, ~2s debounce)
+uv run python scripts/watch.py                 # foreground; Ctrl-C to stop
+uv run python scripts/watch.py --quiet         # WARNING-level logging
 
 # Drift detection & quality
 uv run python scripts/lint.py                  # full lint (structural + contradictions)
@@ -494,6 +509,8 @@ uv run python scripts/canary.py --dry-run      # list canaries without running
 | `MEMORY_COMPILER_MODEL_QUERY` | `claude-sonnet-4-6` | Model for interactive queries |
 | `MEMORY_COMPILER_MODEL_CANARY` | `claude-haiku-4-5-20251001` | Model for drift canary checks |
 | `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | `95` | Set to `50` to compact earlier in long sessions |
+| `MEMORY_COMPILER_LINKED_PROJECTS` | _(unset)_ | Comma-separated absolute paths to other Symfony project roots whose `knowledge/chroma/` collections should be searchable via `search_knowledge(..., include_linked=True)`. Non-existent paths are silently skipped at search time. |
+| `MEMORY_COMPILER_EXTRA_EXTENSIONS` | _(unset)_ | Comma-separated file extensions (each with leading dot — e.g. `.dist,.neon`) that the codebase indexer should also pick up. Each extension becomes its own `file_type`; globs are scoped to `src/`, `assets/`, `templates/`, `config/` so vendor trees aren't walked. Files are indexed as plaintext (no AST chunking). |
 
 ### `sources.yaml`
 
@@ -585,6 +602,56 @@ Neither approach is "right" — they're different tradeoffs. This engine is the 
 ## Obsidian Integration
 
 The knowledge base is pure markdown with `[[wikilinks]]`. Point an Obsidian vault at `knowledge/` for graph view, backlinks, and search alongside the MCP tools.
+
+---
+
+## Cross-Project Linked Search
+
+If you maintain multiple Symfony projects with their own knowledge bases, point them at each other so a single query can answer "have we hit this before *anywhere*?":
+
+```bash
+export MEMORY_COMPILER_LINKED_PROJECTS=/c/wamp64/www/ManilvaHandyMan,/c/wamp64/www/eintollesfest
+```
+
+Then call `search_knowledge` with `include_linked=true`:
+
+```jsonc
+// agent → knowledge-compiler MCP
+search_knowledge {
+  "query": "Tailwind v4 rebuild after CSS changes",
+  "include_linked": true,
+  "limit": 5
+}
+```
+
+Each linked project is searched in parallel (vector-only — cross-process BM25 isn't exposed) and merged into the local results via Reciprocal Rank Fusion. Hits are tagged with a `project` field — `"<local>"` for the current project, otherwise the linked project's directory name. Non-existent paths are silently skipped at search time, so a stale `LINKED_PROJECTS` won't break the call.
+
+**Constraints.** All linked projects must use the default Chroma embedder (this engine's bundled ONNX MiniLM). Cross-process BM25 indexes are intentionally not exposed: vector recall is good enough for the "have we seen this elsewhere?" use case, and a shared BM25 corpus would require either a remote service or a tighter coupling between projects than the env-var contract justifies.
+
+---
+
+## Live File Watcher
+
+Run `scripts/watch.py` alongside `viewer.py` to keep the article and codebase indexes live as you edit:
+
+```bash
+uv run python scripts/watch.py
+# 2026-04-26 14:32:11 watch INFO Watching /c/wamp64/www/AiTutor/knowledge
+# 2026-04-26 14:32:11 watch INFO Watching /c/wamp64/www/AiTutor/src
+# 2026-04-26 14:32:11 watch INFO Watcher up. Ctrl-C to stop.
+```
+
+The watcher classifies each filesystem event into `article` (markdown under `knowledge/concepts/`), `daily` (markdown under `knowledge/daily/`), or `codebase` (any supported extension under `src/`, `assets/`, `templates/`, `config/`). Events are debounced for **2 seconds** of quiet, then dispatched to `reindex_articles()`, `reindex_daily()`, or `index_codebase.reindex_single()` as appropriate. Cross-process locking (see [Cross-process Safety](#cross-process-safety)) means the watcher and a manual `ingest.py` can run simultaneously without corrupting the SQLite-backed Chroma store.
+
+It's a foreground process — `Ctrl-C` shuts down the observer cleanly. Failure of any single reindex is logged but never crashes the watcher loop.
+
+---
+
+## Cross-process Safety
+
+Concurrent writers — the watcher, a `SessionEnd` flush, a manual `ingest.py`, a `reindex.py --all` — coordinate via per-collection file locks under `knowledge/chroma/.locks/`. Implementation: the [`filelock`](https://py-filelock.readthedocs.io/) library, one lock per Chroma collection (`articles`, `daily_chunks`, `codebase`), held only for the duration of the upsert/delete call. Read paths (queries, counts) are unlocked because Chroma handles concurrent reads safely.
+
+Default acquisition timeout is 60s (configurable via `CHROMA_LOCK_TIMEOUT_SECONDS`). If a process crashes mid-write, the OS releases the lock file handle and the next acquirer reclaims it automatically — no manual cleanup required.
 
 ---
 

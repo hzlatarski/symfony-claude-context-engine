@@ -39,6 +39,20 @@ CHROMA_COLLECTION_ARTICLES = "articles"
 CHROMA_COLLECTION_DAILY = "daily_chunks"
 CHROMA_COLLECTION_CODEBASE = "codebase"
 
+# Cross-process file locks for Chroma writes. One lock file per collection
+# under knowledge/chroma/.locks/. The directory is created on first use.
+CHROMA_LOCKS_DIR = CHROMA_DB_DIR / ".locks"
+CHROMA_LOCK_TIMEOUT_SECONDS = 60.0  # Wait this long for a busy lock before failing.
+
+# ── Ingest pipeline state ────────────────────────────────────────────
+# Per-file checkpoints make ingest.py crash-safe: on rerun, files whose
+# content hash matches the checkpoint are skipped without re-billing
+# Sonnet. Status / stop coordinate live progress reporting and cooperative
+# cancellation from MCP tools.
+INGEST_CHECKPOINT_FILE = KNOWLEDGE_DIR / ".ingest-checkpoint.json"
+INGEST_STATUS_FILE = KNOWLEDGE_DIR / ".ingest-status.json"
+INGEST_STOP_FILE = KNOWLEDGE_DIR / ".ingest-stop"
+
 # Memory type taxonomy (Phase 3). Centralized here so vector_store,
 # lint, and the knowledge MCP server share one source of truth.
 MEMORY_TYPES = {
@@ -70,6 +84,51 @@ MODEL_CLEAN = os.environ.get("MEMORY_COMPILER_MODEL_CLEAN", "claude-haiku-4-5-20
 # ── Whisper (voice transcription) ─────────────────────────────────────
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base")
 WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
+
+# ── Cross-project linked search ───────────────────────────────────────
+# Comma-separated absolute paths to other Symfony project roots whose
+# `.claude/memory-compiler/` directories should be searchable from this
+# project. Used by hybrid_search.search_articles_linked() to fan out a
+# single search_knowledge call across multiple project knowledge bases.
+# Non-existent paths are silently skipped at search time.
+def _parse_linked_projects() -> list[Path]:
+    raw = os.environ.get("MEMORY_COMPILER_LINKED_PROJECTS", "").strip()
+    if not raw:
+        return []
+    out: list[Path] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.append(Path(part).expanduser().resolve())
+    return out
+
+
+LINKED_PROJECTS: list[Path] = _parse_linked_projects()
+
+
+# ── Custom file extensions ────────────────────────────────────────────
+# Comma-separated list of additional file extensions to scan during
+# codebase indexing. Useful for projects with non-standard extensions
+# (e.g. `.dist`, `.neon`, `.tpl`). Each extension must include the
+# leading dot. Files indexed via this hook fall through to line-based
+# chunking — AST chunking is reserved for known languages.
+def _parse_extra_extensions() -> tuple[str, ...]:
+    raw = os.environ.get("MEMORY_COMPILER_EXTRA_EXTENSIONS", "").strip()
+    if not raw:
+        return ()
+    out: list[str] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.startswith("."):
+            part = "." + part
+        out.append(part.lower())
+    return tuple(out)
+
+
+EXTRA_EXTENSIONS: tuple[str, ...] = _parse_extra_extensions()
 
 
 def now_iso() -> str:

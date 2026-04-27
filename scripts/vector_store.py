@@ -24,6 +24,7 @@ from typing import Any
 # startup but the module is then in sys.modules and threaded use is safe.
 import chromadb
 
+from chroma_lock import chroma_write_lock
 from config import (
     CHROMA_COLLECTION_ARTICLES,
     CHROMA_COLLECTION_DAILY,
@@ -136,11 +137,12 @@ def upsert_article(
     flat = _flatten_metadata(metadata)
     flat.update({"slug": slug, "title": title, "zone": zone})
 
-    _articles_collection().upsert(
-        ids=[_composite_id(slug, zone)],
-        documents=[text],
-        metadatas=[flat],
-    )
+    with chroma_write_lock(CHROMA_COLLECTION_ARTICLES):
+        _articles_collection().upsert(
+            ids=[_composite_id(slug, zone)],
+            documents=[text],
+            metadatas=[flat],
+        )
 
 
 def upsert_chunk(
@@ -164,18 +166,22 @@ def upsert_chunk(
     if date_int is not None:
         flat["date_int"] = date_int
 
-    _daily_collection().upsert(ids=[chunk_id], documents=[text], metadatas=[flat])
+    with chroma_write_lock(CHROMA_COLLECTION_DAILY):
+        _daily_collection().upsert(ids=[chunk_id], documents=[text], metadatas=[flat])
 
 
 def delete_article(slug: str) -> None:
     """Remove both zones of an article, if present."""
-    coll = _articles_collection()
-    coll.delete(ids=[_composite_id(slug, "observed"), _composite_id(slug, "synthesized")])
+    with chroma_write_lock(CHROMA_COLLECTION_ARTICLES):
+        _articles_collection().delete(
+            ids=[_composite_id(slug, "observed"), _composite_id(slug, "synthesized")],
+        )
 
 
 def delete_chunks_for_daily(source_file: str) -> None:
     """Remove all chunks belonging to a daily file before re-chunking it."""
-    _daily_collection().delete(where={"source_file": {"$eq": source_file}})
+    with chroma_write_lock(CHROMA_COLLECTION_DAILY):
+        _daily_collection().delete(where={"source_file": {"$eq": source_file}})
 
 
 def search_articles(

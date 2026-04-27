@@ -18,6 +18,7 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+from chroma_lock import chroma_write_lock
 from config import CHROMA_COLLECTION_CODEBASE
 
 _client: Any = None
@@ -62,12 +63,14 @@ def upsert_chunk(
         if isinstance(v, (str, int, float, bool)) or v is None
     }
     flat["rel_path"] = rel_path
-    _codebase_collection().upsert(ids=[chunk_id], documents=[text], metadatas=[flat])
+    with chroma_write_lock(CHROMA_COLLECTION_CODEBASE):
+        _codebase_collection().upsert(ids=[chunk_id], documents=[text], metadatas=[flat])
 
 
 def delete_chunks_for_file(rel_path: str) -> None:
     """Remove all chunks for a file before re-chunking it."""
-    _codebase_collection().delete(where={"rel_path": {"$eq": rel_path}})
+    with chroma_write_lock(CHROMA_COLLECTION_CODEBASE):
+        _codebase_collection().delete(where={"rel_path": {"$eq": rel_path}})
 
 
 def search_codebase(

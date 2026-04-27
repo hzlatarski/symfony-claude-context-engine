@@ -42,12 +42,69 @@ from utils import load_state, save_state  # noqa: E402
 CHUNK_SIZE = 150
 CHUNK_OVERLAP = 30
 
-SOURCE_PATTERNS: list[tuple[str, list[str]]] = [
-    ("php",  ["src/**/*.php"]),
-    ("js",   ["assets/controllers/**/*.js"]),
-    ("twig", ["templates/**/*.twig"]),
-    ("yaml", ["config/**/*.yaml"]),
+# SOURCE_PATTERNS drives both the codebase walk and the per-chunk
+# "description" metadata. Descriptions are LLM-facing — they answer
+# "when should the agent reach for this source group?". Surfaced via
+# `search_codebase` results and the `list_sources` MCP tool.
+#
+# Format: (file_type, [glob_patterns], description). Globs are evaluated
+# from PROJECT_ROOT.
+SOURCE_PATTERNS: list[tuple[str, list[str], str]] = [
+    (
+        "php",
+        ["src/**/*.php"],
+        "Symfony application code — controllers, services, entities, "
+        "repositories, commands. Check before writing new business logic "
+        "to match existing service-layer and DI conventions.",
+    ),
+    (
+        "js",
+        ["assets/controllers/**/*.js"],
+        "Stimulus controllers — JS event handlers bound to Twig templates. "
+        "Check before adding interactive UI to find an existing controller "
+        "you can extend instead of duplicating behaviour.",
+    ),
+    (
+        "twig",
+        ["templates/**/*.twig"],
+        "Twig templates — layouts, partials, page bodies. Check before "
+        "adding new pages to find the right base layout and existing "
+        "partials to reuse.",
+    ),
+    (
+        "yaml",
+        ["config/**/*.yaml"],
+        "Symfony configuration — services, routes, security, framework "
+        "bundles. Check before adding new services or routes.",
+    ),
 ]
+
+
+def _expand_extra_patterns() -> list[tuple[str, list[str], str]]:
+    """Materialise SOURCE_PATTERNS entries for MEMORY_COMPILER_EXTRA_EXTENSIONS.
+
+    Each extra extension (e.g. ``.neon``) becomes its own file_type whose
+    globs are scoped to the same top-level dirs the built-in patterns
+    walk (``src/``, ``assets/``, ``templates/``, ``config/``). Restricting
+    to those known dirs avoids walking ``vendor/`` / ``node_modules/`` for
+    one-off custom extensions. The description is generic — users who
+    want a precise description should edit SOURCE_PATTERNS directly.
+    """
+    if not config.EXTRA_EXTENSIONS:
+        return []
+    scoped_dirs = ("src", "assets", "templates", "config")
+    out: list[tuple[str, list[str], str]] = []
+    for ext in config.EXTRA_EXTENSIONS:
+        ftype = ext.lstrip(".")
+        globs = [f"{d}/**/*{ext}" for d in scoped_dirs]
+        out.append((
+            ftype,
+            globs,
+            f"Custom extension {ext!r} declared via "
+            f"MEMORY_COMPILER_EXTRA_EXTENSIONS — content treated as plaintext.",
+        ))
+    return out
+
 
 _EXCLUDE_DIRS = {"vendor", "var", "node_modules", "public"}
 
@@ -137,6 +194,8 @@ def index_file(path: Path) -> int:
     symbols = _extract_symbols(text, file_type)
     delete_chunks_for_file(rel)
 
+    description = _description_for_file_type(file_type)
+
     chunks = chunk_file(text, file_type)
     for idx, (start, end, chunk_text) in enumerate(chunks):
         chunk_id = f"{rel}::{idx}"
@@ -147,20 +206,79 @@ def index_file(path: Path) -> int:
         }
         if symbols:
             metadata["symbols"] = symbols
+        if description:
+            # source_description tells the agent *when* to consult this file
+            # group. SocratiCode's context-artifact pattern: "check this
+            # before writing migrations" beats undirected file reading.
+            metadata["source_description"] = description
         upsert_chunk(chunk_id, rel, chunk_text, metadata)
 
     return len(chunks)
 
 
+def _all_source_groups() -> list[tuple[str, list[str], str]]:
+    """SOURCE_PATTERNS plus EXTRA_EXTENSIONS, deduped on file_type."""
+    seen: set[str] = set()
+    out: list[tuple[str, list[str], str]] = []
+    for entry in (*SOURCE_PATTERNS, *_expand_extra_patterns()):
+        ftype = entry[0]
+        if ftype in seen:
+            continue
+        seen.add(ftype)
+        out.append(entry)
+    return out
+
+
+def _description_for_file_type(file_type: str) -> str:
+    for ftype, _globs, desc in _all_source_groups():
+        if ftype == file_type:
+            return desc
+    return ""
+
+
+def _supported_extensions() -> set[str]:
+    """Set of dot-prefixed extensions accepted by reindex_single."""
+    base = {".php", ".js", ".twig", ".yaml"}
+    base.update(config.EXTRA_EXTENSIONS)
+    return base
+
+
 def list_source_files() -> list[tuple[str, Path]]:
     """Return all indexed source files as (file_type, Path) pairs."""
     results: list[tuple[str, Path]] = []
-    for file_type, patterns in SOURCE_PATTERNS:
+    for file_type, patterns, _desc in _all_source_groups():
         for pattern in patterns:
             for match in config.PROJECT_ROOT.glob(pattern):
                 if match.is_file() and not _is_excluded(match):
                     results.append((file_type, match))
     return results
+
+
+def list_source_groups() -> list[dict]:
+    """Return the full source-group catalog for the list_sources MCP tool.
+
+    Each entry: ``{file_type, patterns, description, chunk_count}``. The
+    chunk count is read live from the codebase Chroma collection so the
+    LLM can tell at a glance which groups are populated and which are
+    empty (suggesting an out-of-date index).
+    """
+    from codebase_store import _codebase_collection  # local import — reuse client
+
+    coll = _codebase_collection()
+    out: list[dict] = []
+    for ftype, patterns, desc in _all_source_groups():
+        try:
+            res = coll.get(where={"file_type": {"$eq": ftype}}, include=[])
+            count = len(res.get("ids") or [])
+        except Exception:
+            count = 0
+        out.append({
+            "file_type": ftype,
+            "patterns": list(patterns),
+            "description": desc,
+            "chunk_count": count,
+        })
+    return out
 
 
 def reindex_all(force: bool = False, progress_callback=None) -> tuple[int, int]:
@@ -214,7 +332,7 @@ def reindex_single(path_str: str) -> int:
         print(f"  skip (not found): {path_str}", file=sys.stderr)
         return 0
 
-    if path.suffix.lower() not in {".php", ".js", ".twig", ".yaml"}:
+    if path.suffix.lower() not in _supported_extensions():
         return 0
 
     state = load_state()
