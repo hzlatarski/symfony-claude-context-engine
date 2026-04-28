@@ -559,7 +559,7 @@ See [AGENTS.md](AGENTS.md) for the complete schema and schema rules.
 
 ## Cost
 
-All LLM costs use your existing Claude subscription (Max / Team / Enterprise) — no separate API key needed.
+> **Subscription-only billing.** All LLM operations in this engine run through your Claude Code subscription (Pro / Max / Team / Enterprise). No `ANTHROPIC_API_KEY` is required, and no API credits are ever charged. Even if an API key is present in your shell environment (e.g., exported from another project's `.env.local`), every LLM subprocess call actively strips it before execution — subscription routing is guaranteed by the code, not by accident.
 
 | Operation | Model | Cost | When |
 |---|---|---|---|

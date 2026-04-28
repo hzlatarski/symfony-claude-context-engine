@@ -6,10 +6,10 @@ enhance_clean which uses Haiku to grammar-clean transcripts.
 """
 from __future__ import annotations
 
-import functools
+import os
 import re
+import subprocess
 import time
-import anthropic
 from dataclasses import dataclass
 
 # Tight per-call budgets so the tray never gets stuck on a silent hang.
@@ -40,28 +40,47 @@ class RewriteOutput:
     warnings: list[str]
 
 
-@functools.lru_cache(maxsize=1)
-def _get_client() -> anthropic.Anthropic:
-    """Get or create a cached Anthropic client."""
-    return anthropic.Anthropic()
+def _run_claude(
+    user_message: str,
+    system_prompt: str,
+    model: str,
+    timeout: float,
+    error_prefix: str,
+) -> str:
+    """Invoke `claude -p` with a system prompt, return the text response.
 
-
-def _extract_text(resp) -> str:
-    """Extract text from response content.
-
-    Args:
-        resp: Response object with content list.
-
-    Returns:
-        The text content from all text blocks joined together.
-
-    Raises:
-        EnhanceError: If no text blocks are found in response.
+    Strips ANTHROPIC_API_KEY from the subprocess environment so billing
+    routes through the Claude Code subscription, not paid API credits.
     """
-    texts = [block.text for block in resp.content if getattr(block, "type", None) == "text"]
-    if not texts:
-        raise EnhanceError("No text blocks found in LLM response")
-    return "".join(texts).strip()
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    cmd = [
+        "claude", "-p",
+        "--model", model,
+        "--system-prompt", system_prompt,
+        "--no-session-persistence",
+        "--tools", "",
+        "--output-format", "text",
+        "--max-turns", "2",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            input=user_message,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise EnhanceError(f"{error_prefix} timed out after {timeout}s") from exc
+    except Exception as exc:
+        raise EnhanceError(f"{error_prefix} call failed: {exc}") from exc
+    if result.returncode != 0 and not result.stdout.strip():
+        raise EnhanceError(
+            f"{error_prefix} exited {result.returncode}: {result.stderr[:200]}"
+        )
+    return result.stdout.strip()
 
 
 def enhance_verbatim(
@@ -133,30 +152,18 @@ def enhance_clean(transcript: str) -> str:
         Cleaned transcript string with stripped whitespace.
 
     Raises:
-        EnhanceError: If response contains no text blocks.
+        EnhanceError: If the claude CLI call fails.
     """
     if not transcript.strip():
         return transcript
 
-    client = _get_client()
-    try:
-        response = client.messages.create(
-            model=MODEL_CLEAN,
-            max_tokens=2048,
-            system=CLEAN_SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": transcript}
-            ],
-            timeout=CLEAN_TIMEOUT_SECONDS,
-        )
-    except anthropic.APITimeoutError as exc:
-        raise EnhanceError(f"clean LLM timed out after {CLEAN_TIMEOUT_SECONDS}s") from exc
-    except anthropic.APIError as exc:
-        raise EnhanceError(f"clean LLM call failed: {exc}") from exc
-
-    # Extract cleaned text from response and strip whitespace
-    cleaned_text = _extract_text(response)
-    return cleaned_text.strip()
+    return _run_claude(
+        user_message=transcript,
+        system_prompt=CLEAN_SYSTEM_PROMPT,
+        model=MODEL_CLEAN,
+        timeout=CLEAN_TIMEOUT_SECONDS,
+        error_prefix="clean LLM",
+    )
 
 
 _ANCHOR_RE = re.compile(r"\[src:([^\]]+)\]")
@@ -247,24 +254,17 @@ def enhance_rewrite(
     context_block = _build_context_block(hits)
     user_message = f"<transcript>\n{transcript}\n</transcript>\n\n{context_block}"
 
-    client = _get_client()
     llm_start_ms = int(time.perf_counter() * 1000)
-    try:
-        resp = client.messages.create(
-            model=MODEL_REWRITE,
-            max_tokens=2048,
-            system=REWRITE_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
-            timeout=REWRITE_TIMEOUT_SECONDS,
-        )
-    except anthropic.APITimeoutError as exc:
-        raise EnhanceError(f"rewrite LLM timed out after {REWRITE_TIMEOUT_SECONDS}s") from exc
-    except anthropic.APIError as exc:
-        raise EnhanceError(f"rewrite LLM call failed: {exc}") from exc
+    raw = _run_claude(
+        user_message=user_message,
+        system_prompt=REWRITE_SYSTEM_PROMPT,
+        model=MODEL_REWRITE,
+        timeout=REWRITE_TIMEOUT_SECONDS,
+        error_prefix="rewrite LLM",
+    )
     llm_end_ms = int(time.perf_counter() * 1000)
     llm_ms = llm_end_ms - llm_start_ms
 
-    raw = _extract_text(resp)
     cleaned, anchor_warnings = verify_anchors(raw, hits)
 
     scope_used_list = scope_used if scope_used is not None else []

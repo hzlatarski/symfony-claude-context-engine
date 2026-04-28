@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -139,6 +140,7 @@ async def run_canary(canary: Canary) -> CanaryResult:
     answer = ""
     cost = 0.0
 
+    os.environ.pop("ANTHROPIC_API_KEY", None)
     try:
         async for message in query(
             prompt=prompt,

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import re
 from pathlib import Path
 
@@ -397,6 +398,7 @@ Do NOT output anything else - no preamble, no explanation, just the formatted li
 Always include the folder prefix in slugs. Bare filenames without a prefix will be ignored."""
 
     response = ""
+    os.environ.pop("ANTHROPIC_API_KEY", None)
     try:
         async for message in query(
             prompt=prompt,

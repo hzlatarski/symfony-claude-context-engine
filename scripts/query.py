@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 from pathlib import Path
 
 from config import KNOWLEDGE_DIR, MODEL_QUERY, QA_DIR, now_iso
@@ -156,6 +157,7 @@ Slugs: {selected_slugs}
     answer = ""
     cost = 0.0
 
+    os.environ.pop("ANTHROPIC_API_KEY", None)
     try:
         async for message in query(
             prompt=prompt,

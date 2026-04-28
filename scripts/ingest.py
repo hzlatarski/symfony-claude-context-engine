@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -92,14 +94,6 @@ async def ingest_source_file(
 
     Returns the API cost of the ingestion.
     """
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ResultMessage,
-        TextBlock,
-        query,
-    )
-
     handler = get_handler(group.type)
     doc = handler(file_path)
 
@@ -235,44 +229,55 @@ architectural patterns.
 - Append log at: {KNOWLEDGE_DIR / 'log.md'}
 """
 
-    cost = 0.0
-
     from config import PROJECT_ROOT
 
+    # Strip ANTHROPIC_API_KEY so claude uses subscription auth, not API credits
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+
+    cmd = [
+        "claude", "-p",
+        "--model", MODEL_INGEST,
+        "--no-session-persistence",
+        "--output-format", "text",
+        "--max-turns", "30",
+        "--dangerously-skip-permissions",
+    ]
+
+    def _run() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            cmd,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=600,
+            cwd=str(PROJECT_ROOT),
+            env=env,
+        )
+
     try:
-        async for message in query(
-            prompt=prompt,
-            options=ClaudeAgentOptions(
-                cwd=str(PROJECT_ROOT),
-                model=MODEL_INGEST,
-                system_prompt={"type": "preset", "preset": "claude_code"},
-                allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
-                permission_mode="bypassPermissions",
-                max_turns=30,
-            ),
-        ):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        pass
-            elif isinstance(message, ResultMessage):
-                cost = message.total_cost_usd or 0.0
-                print(f"  Cost: ${cost:.4f}")
+        result = await asyncio.to_thread(_run)
+    except subprocess.TimeoutExpired:
+        print(f"  Error: claude CLI timed out after 600s")
+        return 0.0
     except Exception as e:
         print(f"  Error: {e}")
+        return 0.0
+
+    if result.returncode != 0 and not result.stdout.strip():
+        print(f"  Error: claude CLI exited {result.returncode} — {result.stderr[:200]}")
         return 0.0
 
     key = source_state_key(group, file_path)
     state["ingested_sources"][key] = {
         "hash": file_hash(file_path),
         "ingested_at": now_iso(),
-        "cost_usd": cost,
+        "cost_usd": 0.0,
         "source_id": group.id,
     }
-    state["total_cost"] = state.get("total_cost", 0.0) + cost
     save_state(state)
 
-    return cost
+    return 0.0
 
 
 def main():

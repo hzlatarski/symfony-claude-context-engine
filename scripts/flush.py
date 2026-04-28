@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -298,14 +299,6 @@ async def run_flush(context: str, tool_events_text: str = "") -> tuple[str, floa
 
     Returns (response_text, cost_usd).
     """
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ResultMessage,
-        TextBlock,
-        query,
-    )
-
     tool_events_section = (
         f"\n## Tool Activity (ground truth)\n\n"
         f"The following structured log comes from the PostToolUse hook — "
@@ -358,9 +351,6 @@ respond with exactly: FLUSH_OK
 
 {context}"""
 
-    response = ""
-    cost = 0.0
-
     # Use Haiku for flush — simple extraction, cheapest model (~60% savings)
     try:
         from config import MODEL_FLUSH
@@ -368,28 +358,45 @@ respond with exactly: FLUSH_OK
     except ImportError:
         model = "claude-haiku-4-5-20251001"
 
+    # Strip ANTHROPIC_API_KEY so claude uses subscription auth, not API credits
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+
+    cmd = [
+        "claude", "-p",
+        "--model", model,
+        "--no-session-persistence",
+        "--tools", "",
+        "--output-format", "text",
+        "--max-turns", "2",
+    ]
+
+    def _run() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            cmd,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=120,
+            cwd=str(ROOT),
+            env=env,
+        )
+
     try:
-        async for message in query(
-            prompt=prompt,
-            options=ClaudeAgentOptions(
-                cwd=str(ROOT),
-                model=model,
-                allowed_tools=[],
-                max_turns=2,
-            ),
-        ):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        response += block.text
-            elif isinstance(message, ResultMessage):
-                cost = message.total_cost_usd or 0.0
+        result = await asyncio.to_thread(_run)
+    except subprocess.TimeoutExpired:
+        logging.error("claude CLI timed out after 120s")
+        return "FLUSH_ERROR: TimeoutExpired", 0.0
     except Exception as e:
         import traceback
-        logging.error("Agent SDK error: %s\n%s", e, traceback.format_exc())
-        response = f"FLUSH_ERROR: {type(e).__name__}: {e}"
+        logging.error("claude CLI error: %s\n%s", e, traceback.format_exc())
+        return f"FLUSH_ERROR: {type(e).__name__}: {e}", 0.0
 
-    return response, cost
+    if result.returncode != 0 and not result.stdout.strip():
+        logging.error("claude CLI exited %d — stderr: %s", result.returncode, result.stderr[:500])
+        return f"FLUSH_ERROR: claude CLI exited {result.returncode}", 0.0
+
+    return result.stdout.strip(), 0.0
 
 
 COMPILE_AFTER_HOUR = 18  # 6 PM local time

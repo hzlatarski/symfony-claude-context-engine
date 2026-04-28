@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -40,14 +42,6 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
 
     Returns the API cost of the compilation.
     """
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ResultMessage,
-        TextBlock,
-        query,
-    )
-
     log_content = log_path.read_text(encoding="utf-8")
     schema = AGENTS_FILE.read_text(encoding="utf-8")
     wiki_index = read_wiki_index()
@@ -168,41 +162,54 @@ Read the daily log above and compile it into wiki articles following the schema 
 - Sources section should cite the daily log with specific claims extracted
 """
 
-    cost = 0.0
+    project_root = str(Path(__file__).resolve().parent.parent.parent.parent)
+
+    # Strip ANTHROPIC_API_KEY so claude uses subscription auth, not API credits
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+
+    cmd = [
+        "claude", "-p",
+        "--model", MODEL_COMPILE,
+        "--no-session-persistence",
+        "--output-format", "text",
+        "--max-turns", "30",
+        "--dangerously-skip-permissions",
+    ]
+
+    def _run() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            cmd,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=600,
+            cwd=project_root,
+            env=env,
+        )
 
     try:
-        async for message in query(
-            prompt=prompt,
-            options=ClaudeAgentOptions(
-                cwd=str(Path(__file__).resolve().parent.parent.parent.parent),  # project root, outside .claude/
-                model=MODEL_COMPILE,
-                system_prompt={"type": "preset", "preset": "claude_code"},
-                allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
-                permission_mode="bypassPermissions",
-                max_turns=30,
-            ),
-        ):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        pass  # compilation output - LLM writes files directly
-            elif isinstance(message, ResultMessage):
-                cost = message.total_cost_usd or 0.0
-                print(f"  Cost: ${cost:.4f}")
+        result = await asyncio.to_thread(_run)
+    except subprocess.TimeoutExpired:
+        print(f"  Error: claude CLI timed out after 600s")
+        return 0.0
     except Exception as e:
         print(f"  Error: {e}")
         return 0.0
 
-    # Update state
+    if result.returncode != 0 and not result.stdout.strip():
+        print(f"  Error: claude CLI exited {result.returncode} — {result.stderr[:200]}")
+        return 0.0
+
+    # Update state (cost is 0.0 — subscription billing, not API credits)
     rel_path = log_path.name
     state.setdefault("ingested_daily", {})[rel_path] = {
         "hash": file_hash(log_path),
         "compiled_at": now_iso(),
-        "cost_usd": cost,
+        "cost_usd": 0.0,
     }
-    state["total_cost"] = state.get("total_cost", 0.0) + cost
 
-    return cost
+    return 0.0
 
 
 def main():

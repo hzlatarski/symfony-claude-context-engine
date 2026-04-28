@@ -7,9 +7,10 @@ the retrieval fan-out and the rewrite prompt's metadata.
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
 import config
@@ -30,7 +31,7 @@ EXPAND_TIMEOUT_SECONDS = 15.0   # tight budget for voice UX; Haiku is normally s
 
 
 class ExpansionError(Exception):
-    """Raised when the Haiku call or its output is unusable."""
+    """Raised when the claude CLI call or its output is unusable."""
 
 
 @dataclass
@@ -40,18 +41,11 @@ class Expansion:
     scope: list[str]
 
 
-@lru_cache(maxsize=1)
-def _get_client():
-    """Lazy Anthropic client, reused across calls within one process."""
-    from anthropic import Anthropic
-    return Anthropic()
-
-
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.MULTILINE)
 
 
 def _strip_fences(text: str) -> str:
-    """Remove markdown code fences that some Haiku outputs wrap JSON in."""
+    """Remove markdown code fences that some model outputs wrap JSON in."""
     return _FENCE_RE.sub("", text).strip()
 
 
@@ -60,7 +54,7 @@ def _parse_json(text: str) -> dict[str, Any]:
     try:
         return json.loads(stripped)
     except json.JSONDecodeError as e:
-        raise ExpansionError(f"Haiku returned non-JSON output: {e}") from e
+        raise ExpansionError(f"model returned non-JSON output: {e}") from e
 
 
 def _validate_intent(raw: Any) -> str:
@@ -86,35 +80,51 @@ def expand(transcript: str) -> Expansion:
         An Expansion with validated fields.
 
     Raises:
-        ExpansionError: if Haiku returns non-JSON or no queries.
+        ExpansionError: if the claude CLI returns non-JSON or no queries.
     """
-    client = _get_client()
-    resp = client.messages.create(
-        model=config.MODEL_EXPAND,
-        max_tokens=512,
-        system=QUERY_EXPANSION_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": transcript}],
-        timeout=EXPAND_TIMEOUT_SECONDS,
-    )
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    cmd = [
+        "claude", "-p",
+        "--model", config.MODEL_EXPAND,
+        "--system-prompt", QUERY_EXPANSION_SYSTEM_PROMPT,
+        "--no-session-persistence",
+        "--tools", "",
+        "--output-format", "text",
+        "--max-turns", "2",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            input=transcript,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=EXPAND_TIMEOUT_SECONDS,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ExpansionError(f"claude CLI timed out after {EXPAND_TIMEOUT_SECONDS}s") from exc
+    except Exception as exc:
+        raise ExpansionError(f"claude CLI call failed: {exc}") from exc
 
-    # Anthropic Messages API returns content as a list of blocks
-    text_blocks = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
-    if not text_blocks:
-        raise ExpansionError("Haiku returned no text blocks")
-    raw = "\n".join(text_blocks)
+    if result.returncode != 0 and not result.stdout.strip():
+        raise ExpansionError(
+            f"claude CLI exited {result.returncode}: {result.stderr[:200]}"
+        )
 
+    raw = result.stdout.strip()
     data = _parse_json(raw)
 
     queries = data.get("queries")
     if not isinstance(queries, list) or not queries:
-        raise ExpansionError("Haiku response missing 'queries' list")
+        raise ExpansionError("model response missing 'queries' list")
     queries = [
         q.strip()[:MAX_QUERY_LENGTH]
         for q in queries
         if isinstance(q, str) and q.strip()
     ]
     if not queries:
-        raise ExpansionError("Haiku response 'queries' contained no valid strings")
+        raise ExpansionError("model response 'queries' contained no valid strings")
     queries = queries[:MAX_QUERIES]
 
     return Expansion(
