@@ -20,6 +20,7 @@ from pathlib import Path
 from config import KNOWLEDGE_DIR, REPORTS_DIR, now_iso, today_iso
 from utils import (
     count_inbound_links,
+    extract_typed_wikilinks,
     extract_wikilinks,
     file_hash,
     get_article_word_count,
@@ -217,6 +218,37 @@ def check_source_anchors() -> list[dict]:
                     "broken_anchor": anchor,
                 })
 
+    return issues
+
+
+def check_wikilink_relations() -> list[dict]:
+    """Validate trailing ``{relation}`` annotations on typed wikilinks.
+
+    Untyped ``[[target]]`` links are unaffected. Typed ``[[target]]{relation}``
+    links must use a relation listed in ``config.WIKILINK_RELATIONS``.
+    Unknown relations are an error because they break the graph-querying
+    contract — a typo silently demotes the link to "no relation" in any
+    consumer that filters on relation type.
+    """
+    from config import WIKILINK_RELATIONS
+
+    issues = []
+    for article in list_wiki_articles():
+        content = article.read_text(encoding="utf-8")
+        rel = article.relative_to(KNOWLEDGE_DIR)
+        for target, relation in extract_typed_wikilinks(content):
+            if relation is None:
+                continue
+            if relation not in WIKILINK_RELATIONS:
+                issues.append({
+                    "severity": "error",
+                    "check": "invalid_wikilink_relation",
+                    "file": str(rel),
+                    "detail": (
+                        f"[[{target}]]{{{relation}}} uses unknown relation "
+                        f"{relation!r}. Allowed: {sorted(WIKILINK_RELATIONS)}"
+                    ),
+                })
     return issues
 
 
@@ -534,6 +566,7 @@ def main():
         ("Low priority articles", check_low_priority_articles),
         ("Source anchors", check_source_anchors),
         ("Memory types", check_memory_types),
+        ("Wikilink relations", check_wikilink_relations),
     ]
 
     for name, check_fn in checks:

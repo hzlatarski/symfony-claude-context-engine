@@ -396,6 +396,8 @@ def create_app(knowledge_dir: Path | None = None) -> FastAPI:
         "preference": "#f472b6",
         "advice": "#34d399",
         "decision": "#ef4444",
+        "tension": "#fb923c",       # orange — unresolved, demands attention
+        "hypothesis": "#22d3ee",    # cyan — provisional, awaiting evidence
     }
     templates.env.globals["type_colors"] = type_colors
     templates.env.globals["memory_types"] = sorted(config.MEMORY_TYPES)

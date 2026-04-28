@@ -62,6 +62,26 @@ MEMORY_TYPES = {
     "preference",    # user preference ("don't mock the DB in tests")
     "advice",        # actionable guidance ("always run Tailwind rebuild after CSS")
     "decision",      # locked-in architectural choice
+    # Borrowed from DreamGraph's graph node lifecycle. Tracks unresolved
+    # state explicitly so we can search/filter for "what's still open?"
+    # without conflating it with the auto-detected contradiction quarantine.
+    "tension",       # known unresolved architectural conflict actively being worked through
+    "hypothesis",    # unvalidated theory awaiting corroboration (promote to discovery/fact when confirmed)
+}
+
+# Allowed relations on typed wikilinks. Opt-in syntax: ``[[target]]{relation}``.
+# Untyped ``[[target]]`` links remain valid and unrestricted. The trailing-brace
+# notation was picked because Obsidian's ``|`` is reserved for display aliases;
+# braces don't conflict and degrade visibly in any markdown renderer.
+WIKILINK_RELATIONS = {
+    "depends_on",     # A requires B to function
+    "implements",     # A is a concrete realization of B
+    "conflicts_with", # A and B are in tension (pair with type=tension)
+    "supersedes",     # A replaces an earlier B (decision lifecycle)
+    "related_to",     # generic association, default fallback
+    "blocks",         # A prevents progress on B until resolved
+    "corroborates",   # A provides evidence supporting B (typically a hypothesis)
+    "refutes",        # A provides evidence against B (typically a hypothesis)
 }
 
 # ── Timezone ───────────────────────────────────────────────────────────

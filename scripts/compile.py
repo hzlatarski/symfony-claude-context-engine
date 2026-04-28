@@ -101,13 +101,19 @@ Read the daily log above and compile it into wiki articles following the schema 
      * 0.6-0.8: Patterns observed multiple times, strong consensus
      * 0.4-0.6: Single observation, reasonable but unverified
      * 0.2-0.4: Speculation, tentative plans, may change
-   - Include `type:` in frontmatter — exactly one of the six canonical values:
+   - Include `type:` in frontmatter — exactly one of the eight canonical values:
      * `fact` — static knowledge not bound to a moment ("Stimulus uses kebab-case")
      * `event` — something that happened on a date ("launched onboarding v2")
      * `discovery` — finding from debugging/investigation ("root cause: missing index on sessions.user_id")
      * `preference` — user preference or stylistic rule ("don't mock the database in tests")
      * `advice` — actionable guidance for future sessions ("run Tailwind rebuild after editing app.css")
      * `decision` — locked-in architectural choice ("using framework X, not framework Y")
+     * `tension` — known unresolved architectural conflict actively being worked through
+       (e.g. "should we keep both Stripe and PayPal or consolidate?"). Distinct from
+       contradictions, which are accidentally inconsistent claims auto-detected by lint.
+     * `hypothesis` — unvalidated theory awaiting corroboration ("we suspect the slow
+       query comes from missing index on user_id"). Promote to `discovery` or `fact`
+       in a later compile when corroborated.
      Pick the MOST specific type that fits. When genuinely uncertain, default to `fact`.
      An unknown value here fails lint — use exactly one of the six above.
    - Write Truth in encyclopedia style — dense, factual, no "we discovered"

@@ -126,7 +126,7 @@ One article per atomic piece of knowledge. Articles are split into two zones:
 ```markdown
 ---
 title: "Concept Name"
-type: fact              # fact|event|discovery|preference|advice|decision
+type: fact              # fact|event|discovery|preference|advice|decision|tension|hypothesis
 aliases: [alternate-name, abbreviation]
 tags: [domain, topic]
 sources:
@@ -195,14 +195,30 @@ NOT direct quotes — they are inferences. Use sparingly. Also anchor where poss
   half-life to the `confidence:` value. Articles that are updated (or
   re-corroborated from multiple sources) reset their decay clock via the
   `updated:` field.
-- **Memory type (`type:`):** one of six canonical values defined in
+- **Memory type (`type:`):** one of eight canonical values defined in
   `scripts/config.py:MEMORY_TYPES` — `fact`, `event`, `discovery`,
-  `preference`, `advice`, `decision`. Used as a first-class filter in
-  `knowledge_mcp_server.search_knowledge` so the agent can narrow
-  retrieval to e.g. "preferences only" or "decisions only". Unknown
-  values fail `lint.check_memory_types` with severity `error`. Missing
-  values get severity `suggestion` so legacy articles keep working
-  while they migrate organically.
+  `preference`, `advice`, `decision`, `tension`, `hypothesis`. Used as a
+  first-class filter in `knowledge_mcp_server.search_knowledge` so the
+  agent can narrow retrieval to e.g. "preferences only", "open tensions",
+  or "unvalidated hypotheses". Unknown values fail
+  `lint.check_memory_types` with severity `error`. Missing values get
+  severity `suggestion` so legacy articles keep working while they
+  migrate organically.
+  - `tension` and `hypothesis` track unresolved state explicitly and were
+    borrowed from DreamGraph's graph-node lifecycle. A `tension` is a
+    *known* architectural conflict you're working through (distinct from
+    accidental contradictions auto-detected by `check_contradictions`).
+    A `hypothesis` is an unvalidated theory; promote to `discovery` or
+    `fact` in a later compile when corroborated.
+- **Typed wikilinks (`[[target]]{relation}`):** opt-in annotation that
+  attaches a relation type to a wikilink. Untyped `[[target]]` links remain
+  valid and unrestricted. The relation must be one of the values in
+  `scripts/config.py:WIKILINK_RELATIONS` — `depends_on`, `implements`,
+  `conflicts_with`, `supersedes`, `related_to`, `blocks`, `corroborates`,
+  `refutes`. Unknown relations fail `lint.check_wikilink_relations` with
+  severity `error`. Brace syntax was chosen because Obsidian reserves `|`
+  for display aliases; trailing braces don't conflict and degrade visibly
+  in any markdown renderer.
 
 ### Connection Articles (`knowledge/connections/`)
 

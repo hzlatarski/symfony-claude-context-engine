@@ -256,9 +256,34 @@ def extract_wikilinks(content: str) -> list[str]:
     fallback to deactivate a link without losing the original text).
     Counting them as live links would re-flag previously-fixed errors
     on every subsequent lint run.
+
+    Strips any trailing ``{relation}`` annotation so callers see the bare
+    target (e.g. ``concepts/foo``) regardless of whether the source wrote
+    ``[[concepts/foo]]`` or ``[[concepts/foo]]{depends_on}``. The relation
+    metadata is exposed separately via ``extract_typed_wikilinks``.
     """
     stripped = _HTML_COMMENT_RE.sub("", content)
     return re.findall(r"\[\[([^\]]+)\]\]", stripped)
+
+
+# Pattern captures (target, optional_relation). The relation is the
+# trailing ``{...}`` token immediately following the closing ``]]``,
+# limited to lowercase letters, digits, and underscores.
+_TYPED_WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\](?:\{([a-z0-9_]+)\})?")
+
+
+def extract_typed_wikilinks(content: str) -> list[tuple[str, str | None]]:
+    """Extract wikilinks with their optional ``{relation}`` annotation.
+
+    Returns a list of ``(target, relation)`` tuples where ``relation`` is
+    ``None`` for plain ``[[target]]`` and a string for ``[[target]]{relation}``.
+    HTML comments are skipped, matching ``extract_wikilinks``. Used by
+    ``lint.check_wikilink_relations`` to validate against the
+    ``config.WIKILINK_RELATIONS`` allowed set without disturbing the
+    untyped retrieval path.
+    """
+    stripped = _HTML_COMMENT_RE.sub("", content)
+    return [(m.group(1), m.group(2)) for m in _TYPED_WIKILINK_RE.finditer(stripped)]
 
 
 def wiki_article_exists(link: str) -> bool:
