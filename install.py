@@ -13,9 +13,8 @@ What it does:
     1. Merges Claude Code hooks  →  .claude/settings.json
     2. Registers MCP servers     →  ~/.claude.json  (User scope, per-project slug)
     3. Copies sources.yaml.example → sources.yaml  (if not already present)
-    4. Asks for ANTHROPIC_API_KEY  →  writes to .env.local  (if missing)
-    5. Asks about memory symlink   →  links .claude/memory/ to your Claude memory dir
-    6. Runs initial ingest + ChromaDB vector reindex (articles + daily + codebase)
+    4. Asks about memory symlink   →  links .claude/memory/ to your Claude memory dir
+    5. Runs initial ingest + ChromaDB vector reindex (articles + daily + codebase)
 """
 from __future__ import annotations
 
@@ -396,40 +395,7 @@ def copy_sources_yaml() -> None:
     _warn("Edit sources.yaml to point at your project's docs and specs")
 
 
-# ── Step 4: Anthropic API key ─────────────────────────────────────────────────
-def setup_api_key() -> None:
-    _h1("Anthropic API key")
-
-    # Already in the environment (e.g. set system-wide)
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        _skip("ANTHROPIC_API_KEY already set in environment")
-        return
-
-    env_local = PROJECT_ROOT / ".env.local"
-
-    # Already in .env.local
-    if env_local.exists():
-        content = env_local.read_text(encoding="utf-8")
-        if "ANTHROPIC_API_KEY" in content:
-            _skip("ANTHROPIC_API_KEY already present in .env.local")
-            return
-
-    print("  The compile and flush pipelines require an Anthropic API key.")
-    print("  Get one at https://console.anthropic.com/settings/keys")
-    key = _ask("Paste your ANTHROPIC_API_KEY (leave blank to skip)")
-
-    if not key:
-        _warn("Skipped — you will need to set ANTHROPIC_API_KEY manually before running compile.py")
-        return
-
-    # Append to .env.local (or create it)
-    existing = env_local.read_text(encoding="utf-8") if env_local.exists() else ""
-    separator = "\n" if existing and not existing.endswith("\n") else ""
-    env_local.write_text(existing + separator + f"ANTHROPIC_API_KEY={key}\n", encoding="utf-8")
-    _ok(f"Written to {env_local.relative_to(PROJECT_ROOT)}")
-
-
-# ── Step 5: memory symlink ────────────────────────────────────────────────────
+# ── Step 4: memory symlink ────────────────────────────────────────────────────
 def _claude_memory_slug(project_root: Path) -> str:
     """Replicate Claude Code's per-project slug: lowercase the drive letter,
     then replace every non-alphanumeric character (one-for-one, NOT collapsed)
@@ -535,7 +501,7 @@ def setup_memory_symlink() -> None:
         _warn(f'or:  ln -s "{target}" .claude/memory  (Mac/Linux)')
 
 
-# ── Step 6: ingest + reindex ──────────────────────────────────────────────────
+# ── Step 5: ingest + reindex ──────────────────────────────────────────────────
 def run_ingest_and_reindex() -> None:
     _h1("Running initial ingest + ChromaDB vector reindex (articles, daily, codebase)")
     uv_prefix = ["uv", "run", "--directory", str(HERE)]
@@ -660,7 +626,6 @@ def main() -> None:
     merge_mcp_json()
     patch_claude_md()
     copy_sources_yaml()
-    setup_api_key()
     setup_memory_symlink()
     run_ingest_and_reindex()
 
