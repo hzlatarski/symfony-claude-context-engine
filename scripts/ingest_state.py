@@ -56,7 +56,20 @@ def write_status(
     INGEST_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = INGEST_STATUS_FILE.with_suffix(INGEST_STATUS_FILE.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(tmp, INGEST_STATUS_FILE)
+    # Windows: os.replace can fail with ERROR_ACCESS_DENIED if a reader
+    # (MCP server polling ingest_status, AV scanner, indexer) briefly holds
+    # the destination open. Retry with backoff before giving up.
+    last_err: OSError | None = None
+    for attempt in range(8):
+        try:
+            os.replace(tmp, INGEST_STATUS_FILE)
+            return
+        except PermissionError as err:
+            last_err = err
+            if attempt < 7:
+                time.sleep(0.05 * (attempt + 1))
+    if last_err is not None:
+        raise last_err
 
 
 def read_status() -> dict[str, Any] | None:
