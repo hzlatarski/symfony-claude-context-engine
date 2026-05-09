@@ -18,10 +18,17 @@ Configure in .claude/settings.json:
 
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+
+def _project_slug(name: str) -> str:
+    """Mirror install.py's slug logic: AiTutor → aitutor, My_Project → my-project."""
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return slug or "project"
 
 # Hook disable mechanism: set MEMORY_COMPILER_DISABLED_HOOKS to skip hooks.
 # Values: "all" (disable everything), or comma-separated names like "session-start,session-end"
@@ -32,21 +39,23 @@ if "all" in _disabled or "session-start" in _disabled:
 
 # Paths relative to project root
 ROOT = Path(__file__).resolve().parent.parent
-KNOWLEDGE_DIR = ROOT / "knowledge"
-DAILY_DIR = ROOT / "daily"
-INDEX_FILE = KNOWLEDGE_DIR / "index.md"
 WIP_FILE = ROOT / "wip.md"
 
 MAX_CONTEXT_CHARS = 60_000
 MAX_LOG_LINES = 30
 MAX_WIP_CHARS = 2_000
-# compiled-truth.md lives in the PROJECT root's knowledge/ dir (written by config.py's
-# KNOWLEDGE_DIR = PROJECT_ROOT / "knowledge"), which is two levels up from the
-# memory-compiler root. session-start.py's KNOWLEDGE_DIR points to the memory-compiler's
-# own knowledge/ dir, which is a different path.
+# Knowledge artifacts live in the PROJECT root's knowledge/ dir (written by
+# config.py's KNOWLEDGE_DIR = PROJECT_ROOT / "knowledge"), which is two levels
+# up from the memory-compiler root. The hook used to point INDEX_FILE/DAILY_DIR
+# at memory-compiler's own knowledge/ and daily/ subdirs, which were stale —
+# that is why every session said "empty - no articles compiled yet" even though
+# index.md had 250+ articles.
 PROJECT_KNOWLEDGE_DIR = ROOT.parent.parent / "knowledge"
+INDEX_FILE = PROJECT_KNOWLEDGE_DIR / "index.md"
+DAILY_DIR = PROJECT_KNOWLEDGE_DIR / "daily"
 COMPILED_TRUTH_FILE = PROJECT_KNOWLEDGE_DIR / "compiled-truth.md"
 MAX_COMPILED_TRUTH_CHARS = 10_000
+MAX_INDEX_CHARS = 20_000
 STATE_FILE = ROOT / "scripts" / "state.json"
 FLUSH_STATE_FILE = ROOT / "scripts" / "last-flush.json"
 
@@ -276,6 +285,33 @@ def build_context() -> str:
     today = datetime.now(timezone.utc).astimezone()
     parts.append(f"## Today\n{today.strftime('%A, %B %d, %Y')}")
 
+    # KB-first directive — the strongest, earliest nudge. Without this, Claude
+    # routinely skips the knowledge base because the MCP tools are deferred
+    # (their schemas aren't loaded by default — they require ToolSearch first).
+    # Spelling the unlock command out removes the friction. The project slug
+    # mirrors install.py's logic so the MCP tool names are correct for whichever
+    # project this hook runs in.
+    slug = _project_slug(ROOT.parent.parent.name)
+    kb_prefix = f"mcp__{slug}-knowledge__"
+    parts.append(
+        "## Use the Knowledge Base FIRST\n\n"
+        "Before answering any product, architecture, grading-logic, prompt, or "
+        "**why-was-this-built-this-way** question, you MUST query the KB. The "
+        "compiled-truth + index below are a summary, not the whole KB — when in "
+        "doubt, search.\n\n"
+        "**The KB tools are deferred.** To unlock them, call ToolSearch ONCE "
+        "with this query (one call loads all four):\n\n"
+        "```\n"
+        f"ToolSearch(query=\"select:{kb_prefix}search_knowledge,"
+        f"{kb_prefix}get_article,{kb_prefix}search_codebase,"
+        f"{kb_prefix}search_raw_daily\", max_results=4)\n"
+        "```\n\n"
+        "Then call `search_knowledge(query=...)` (mode=\"hybrid\" by default). "
+        "Fetch full articles with `get_article(slug)` only when a slim hit looks "
+        "promising. Skip this whole flow only for trivial syntax questions, "
+        "mechanical refactors, or when the codebase itself unambiguously answers."
+    )
+
     # Update notice — first thing after the date so the user (and the
     # agent) sees the upgrade prompt before diving into KB context.
     update_notice = get_update_notice()
@@ -307,9 +343,21 @@ def build_context() -> str:
     if wip:
         parts.append(f"## Work In Progress (resume here)\n\n{wip}")
 
-    # Knowledge base index (the core retrieval mechanism)
+    # Knowledge base index (the core retrieval mechanism). Cap separately so a
+    # huge index never crowds out compiled-truth + daily log under MAX_CONTEXT_CHARS.
     if INDEX_FILE.exists():
         index_content = INDEX_FILE.read_text(encoding="utf-8")
+        article_count = index_content.count("[[")
+        if len(index_content) > MAX_INDEX_CHARS:
+            truncated = index_content[:MAX_INDEX_CHARS]
+            last_row = truncated.rfind("\n|")
+            if last_row > 0:
+                truncated = truncated[:last_row]
+            index_content = (
+                truncated
+                + f"\n\n_…(index truncated — {article_count} articles total; use "
+                "`search_knowledge` to query the full set)_"
+            )
         parts.append(f"## Knowledge Base Index\n\n{index_content}")
     else:
         parts.append("## Knowledge Base Index\n\n(empty - no articles compiled yet)")
