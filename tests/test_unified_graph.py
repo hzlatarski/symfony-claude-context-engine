@@ -13,3 +13,41 @@ def test_build_with_empty_inputs_returns_empty_graph(tmp_path):
     call_graph = {"symbols": {}, "edges": [], "classes": {}}
     result = unified_graph.build(call_graph=call_graph, knowledge_root=tmp_path)
     assert result == {"nodes": {}, "edges": []}
+
+
+def test_articles_in_concepts_become_article_nodes(tmp_path):
+    concepts = tmp_path / "concepts"
+    concepts.mkdir()
+    (concepts / "foo.md").write_text("---\ntitle: Foo Article\ntype: fact\nconfidence: 0.8\n---\nbody", encoding="utf-8")
+    (concepts / "bar.md").write_text("# Bar\n\nNo frontmatter.", encoding="utf-8")
+
+    call_graph = {"symbols": {}, "edges": [], "classes": {}}
+    result = unified_graph.build(call_graph=call_graph, knowledge_root=tmp_path)
+
+    assert "article:concepts/foo" in result["nodes"]
+    assert "article:concepts/bar" in result["nodes"]
+    foo = result["nodes"]["article:concepts/foo"]
+    assert foo["kind"] == "article"
+    assert foo["label"] == "Foo Article"
+    assert foo["type"] == "fact"
+    assert foo["confidence"] == 0.8
+
+
+def test_articles_in_other_subdirs_are_indexed(tmp_path):
+    (tmp_path / "connections").mkdir()
+    (tmp_path / "connections" / "link.md").write_text("# Link", encoding="utf-8")
+    (tmp_path / "qa").mkdir()
+    (tmp_path / "qa" / "q1.md").write_text("# Q1", encoding="utf-8")
+
+    call_graph = {"symbols": {}, "edges": [], "classes": {}}
+    result = unified_graph.build(call_graph=call_graph, knowledge_root=tmp_path)
+
+    assert "article:connections/link" in result["nodes"]
+    assert "article:qa/q1" in result["nodes"]
+
+
+def test_article_without_title_falls_back_to_slug(tmp_path):
+    (tmp_path / "concepts").mkdir()
+    (tmp_path / "concepts" / "no-title.md").write_text("just text", encoding="utf-8")
+    result = unified_graph.build(call_graph={"symbols": {}, "edges": [], "classes": {}}, knowledge_root=tmp_path)
+    assert result["nodes"]["article:concepts/no-title"]["label"] == "no-title"

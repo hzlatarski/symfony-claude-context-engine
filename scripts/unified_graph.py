@@ -45,4 +45,50 @@ def build(call_graph: dict, knowledge_root: Path) -> dict:
     Returns:
         ``{"nodes": {id: {label, kind, ...}}, "edges": [{from, to, kind, ...}]}``
     """
-    return {"nodes": {}, "edges": []}
+    nodes: dict[str, dict] = {}
+    edges: list[dict] = []
+
+    for subdir in ("concepts", "connections", "qa"):
+        root = knowledge_root / subdir
+        if not root.exists():
+            continue
+        for md in sorted(root.glob("*.md")):
+            slug = f"{subdir}/{md.stem}"
+            node_id = f"article:{slug}"
+            content = md.read_text(encoding="utf-8")
+            meta = _parse_article_frontmatter(content)
+            nodes[node_id] = {
+                "kind": "article",
+                "label": meta.get("title") or md.stem,
+                "type": meta.get("type", "unknown"),
+                "confidence": meta.get("confidence"),
+            }
+
+    return {"nodes": nodes, "edges": edges}
+
+
+def _parse_article_frontmatter(content: str) -> dict:
+    """Minimal YAML frontmatter parser — reuses compile_truth's conventions."""
+    if not content.startswith("---"):
+        return {}
+    end = content.find("---", 3)
+    if end == -1:
+        return {}
+    result: dict = {}
+    for line in content[3:end].split("\n"):
+        line = line.strip()
+        if ":" not in line or line.startswith("-") or line.startswith("#"):
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key == "title":
+            result["title"] = value
+        elif key == "type":
+            result["type"] = value
+        elif key == "confidence":
+            try:
+                result["confidence"] = float(value)
+            except ValueError:
+                pass
+    return result
