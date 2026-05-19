@@ -54,6 +54,48 @@ def build(call_graph: dict, knowledge_root: Path) -> dict:
     edges: list[dict] = []
     article_contents: dict[str, str] = {}
 
+    # Pass 0: materialize call-graph nodes + structural edges.
+    for class_fqcn, class_info in call_graph.get("classes", {}).items():
+        class_id = f"class:{class_fqcn}"
+        file_path = class_info.get("file", "")
+        nodes[class_id] = {"kind": "class", "label": class_fqcn.rsplit("\\", 1)[-1]}
+        if file_path:
+            file_id = f"file:{file_path}"
+            if file_id not in nodes:
+                nodes[file_id] = {"kind": "file", "label": file_path}
+            edges.append({"from": file_id, "to": class_id, "kind": "contains"})
+
+    for symbol_id_raw, sym_info in call_graph.get("symbols", {}).items():
+        symbol_id = f"symbol:{symbol_id_raw}"
+        nodes[symbol_id] = {
+            "kind": "symbol",
+            "label": symbol_id_raw.rsplit("::", 1)[-1] if "::" in symbol_id_raw else symbol_id_raw,
+        }
+        cls = sym_info.get("class", "")
+        if cls:
+            class_id = f"class:{cls}"
+            if class_id in nodes:
+                edges.append({"from": class_id, "to": symbol_id, "kind": "defines"})
+
+    for edge in call_graph.get("edges", []):
+        src = f"symbol:{edge['from']}"
+        dst = edge["to"]
+        if dst.startswith("template:"):
+            dst_id = dst  # already prefixed
+            if dst_id not in nodes:
+                nodes[dst_id] = {"kind": "template", "label": dst.split(":", 1)[1]}
+        else:
+            dst_id = f"symbol:{dst}"
+            if dst_id not in nodes:
+                # Vendor / unresolved — emit a stub so the edge has a target.
+                nodes[dst_id] = {"kind": "symbol", "label": dst.rsplit("::", 1)[-1], "missing": True}
+        new_edge = {"from": src, "to": dst_id, "kind": edge.get("kind", "call")}
+        if "confidence" in edge:
+            new_edge["confidence"] = edge["confidence"]
+        if "evidence" in edge:
+            new_edge["evidence"] = edge["evidence"]
+        edges.append(new_edge)
+
     for subdir in ("concepts", "connections", "qa"):
         root = knowledge_root / subdir
         if not root.exists():

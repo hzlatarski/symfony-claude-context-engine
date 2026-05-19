@@ -103,3 +103,32 @@ def test_duplicate_src_anchors_dedupe_edges(tmp_path):
     result = unified_graph.build(call_graph={"symbols": {}, "edges": [], "classes": {}}, knowledge_root=tmp_path)
     cites = [e for e in result["edges"] if e["kind"] == "cites"]
     assert len(cites) == 1
+
+
+def test_call_graph_symbols_and_classes_become_nodes(tmp_path):
+    call_graph = {
+        "symbols": {
+            "App\\Service\\Foo::bar": {"file": "src/Service/Foo.php", "line": 10, "class": "App\\Service\\Foo"},
+            "App\\Service\\Baz::qux": {"file": "src/Service/Baz.php", "line": 5, "class": "App\\Service\\Baz"},
+        },
+        "edges": [
+            {"from": "App\\Service\\Foo::bar", "to": "App\\Service\\Baz::qux", "kind": "call", "confidence": 1.0, "evidence": "$this->baz->qux()"},
+            {"from": "App\\Service\\Foo::bar", "to": "template:foo/index.html.twig", "kind": "render", "confidence": 1.0, "evidence": "$this->render('foo/index.html.twig')"},
+        ],
+        "classes": {
+            "App\\Service\\Foo": {"file": "src/Service/Foo.php", "extends": ""},
+            "App\\Service\\Baz": {"file": "src/Service/Baz.php", "extends": ""},
+        },
+    }
+    result = unified_graph.build(call_graph=call_graph, knowledge_root=tmp_path)
+
+    assert result["nodes"]["class:App\\Service\\Foo"]["kind"] == "class"
+    assert result["nodes"]["symbol:App\\Service\\Foo::bar"]["kind"] == "symbol"
+    assert result["nodes"]["file:src/Service/Foo.php"]["kind"] == "file"
+    assert result["nodes"]["template:foo/index.html.twig"]["kind"] == "template"
+
+    kinds = {(e["from"], e["to"]): e["kind"] for e in result["edges"]}
+    assert kinds[("file:src/Service/Foo.php", "class:App\\Service\\Foo")] == "contains"
+    assert kinds[("class:App\\Service\\Foo", "symbol:App\\Service\\Foo::bar")] == "defines"
+    assert kinds[("symbol:App\\Service\\Foo::bar", "symbol:App\\Service\\Baz::qux")] == "call"
+    assert kinds[("symbol:App\\Service\\Foo::bar", "template:foo/index.html.twig")] == "render"
