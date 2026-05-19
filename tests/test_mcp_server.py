@@ -15,6 +15,13 @@ def test_build_codebase_overview_returns_markdown():
     assert "Stimulus" in result or "controllers" in result.lower()
 
 
+def test_codebase_overview_mentions_unified_graph():
+    result = mcp_server._build_codebase_overview()
+    assert "Unified Graph" in result
+    assert "Articles:" in result
+    assert "Orphan articles" in result
+
+
 def test_build_file_deps_for_real_controller():
     result = mcp_server._build_file_deps("src/Entity/User.php")
     assert isinstance(result, str)

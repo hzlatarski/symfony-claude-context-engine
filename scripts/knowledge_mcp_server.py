@@ -395,6 +395,22 @@ def _kb_health_impl() -> dict[str, Any]:
 
     live_status = ingest_state.read_status() or {"phase": "idle"}
 
+    # Unified-graph stats — guarded so a build failure doesn't break the diagnostic.
+    try:
+        from scripts import unified_graph as _ug
+        from scripts.parsers import call_graph as _cg, PROJECT_ROOT
+        _graph = _ug.build(call_graph=_cg.parse(PROJECT_ROOT), knowledge_root=KNOWLEDGE_DIR)
+        _article_nodes = [n for n in _graph["nodes"] if n.startswith("article:")]
+        _referenced = {e["from"] for e in _graph["edges"]} | {e["to"] for e in _graph["edges"]}
+        graph_stats: dict[str, Any] = {
+            "articles": len(_article_nodes),
+            "files": sum(1 for n in _graph["nodes"] if n.startswith("file:")),
+            "edges": len(_graph["edges"]),
+            "orphan_articles": sum(1 for n in _article_nodes if n not in _referenced),
+        }
+    except Exception as exc:  # noqa: BLE001 — kb_health must never raise
+        graph_stats = {"error": str(exc)}
+
     return {
         "vector_store": vector_stats,
         "codebase_store": codebase_stats,
@@ -420,6 +436,7 @@ def _kb_health_impl() -> dict[str, Any]:
             "processed": live_status.get("processed"),
             "total": live_status.get("total"),
         },
+        "graph": graph_stats,
     }
 
 

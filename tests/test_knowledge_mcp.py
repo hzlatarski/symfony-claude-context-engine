@@ -526,3 +526,13 @@ class TestSearchCodebaseImpl:
         from knowledge_mcp_server import _search_codebase_impl
         with pytest.raises(ValueError, match="file_type"):
             _search_codebase_impl("auth", file_type="ruby")
+
+
+def test_kb_health_includes_graph_section():
+    from scripts import knowledge_mcp_server
+    payload = knowledge_mcp_server._kb_health_impl()
+    assert "graph" in payload
+    # graph payload either has stats (success path) or an "error" key (failure path)
+    g = payload["graph"]
+    assert isinstance(g, dict)
+    assert "articles" in g or "error" in g

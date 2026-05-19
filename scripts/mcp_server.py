@@ -197,6 +197,24 @@ def _build_codebase_overview() -> str:
             f"- {h['file']}: score={h['score']} "
             f"commits={h['commits_total']} owner={h['primary_owner']}"
         )
+
+    unified = _cache.get_unified_graph()
+    article_nodes = [n for n in unified["nodes"] if n.startswith("article:")]
+    file_nodes = [n for n in unified["nodes"] if n.startswith("file:")]
+    wikilink_edges = [e for e in unified["edges"] if e["kind"] == "wikilink"]
+    cites_edges = [e for e in unified["edges"] if e["kind"] == "cites"]
+    referenced = {e["from"] for e in unified["edges"]} | {e["to"] for e in unified["edges"]}
+    orphan_articles = [n for n in article_nodes if n not in referenced]
+
+    lines.extend([
+        "",
+        "## Unified Graph",
+        f"- Articles: {len(article_nodes)}",
+        f"- Files: {len(file_nodes)}",
+        f"- Wikilink edges: {len(wikilink_edges)}",
+        f"- Cites edges: {len(cites_edges)}",
+        f"- Orphan articles (no in/out edges): {len(orphan_articles)}",
+    ])
     return "\n".join(lines)
 
 
