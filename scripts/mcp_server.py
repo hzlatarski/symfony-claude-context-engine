@@ -32,6 +32,7 @@ if str(_MEMORY_COMPILER_ROOT) not in sys.path:
     sys.path.insert(0, str(_MEMORY_COMPILER_ROOT))
 
 from scripts.parsers import PROJECT_ROOT, php_graph, route_map, twig_graph, stimulus_map, git_intel, call_graph
+from scripts import unified_graph
 from scripts import parent_watchdog, mermaid_render
 
 log = logging.getLogger("mcp_server")
@@ -61,6 +62,8 @@ class ParseCache:
         self._stim_mtime: float = 0.0
         self._call_graph_cache: dict | None = None
         self._call_graph_mtime: float = 0.0
+        self._unified_graph_cache: dict | None = None
+        self._unified_graph_signature: tuple = ()
 
     @staticmethod
     def _max_mtime(paths) -> float:
@@ -121,6 +124,34 @@ class ParseCache:
             self._call_graph_cache = graph
             self._call_graph_mtime = current
         return self._call_graph_cache
+
+    def get_unified_graph(self) -> dict:
+        """Cache the unified knowledge graph.
+
+        Invalidates when either the call graph or any article markdown file
+        in ``knowledge/{concepts,connections,qa}/`` changes. Signature is
+        ``(call_graph_mtime, articles_mtime)`` — recomputing the unified
+        graph is cheap (single linear pass over articles + dict copy of the
+        call graph) so we don't need a finer-grained dirty-set protocol.
+        """
+        from config import KNOWLEDGE_DIR
+
+        call_graph = self.get_call_graph()  # ensures cache + freshness
+        article_mtime = 0.0
+        for sub in ("concepts", "connections", "qa"):
+            root = KNOWLEDGE_DIR / sub
+            if root.exists():
+                article_mtime = max(article_mtime, self._max_mtime(root.glob("*.md")))
+
+        signature = (self._call_graph_mtime, article_mtime)
+        if self._unified_graph_cache is None or signature != self._unified_graph_signature:
+            log.info("Rebuilding unified knowledge graph cache")
+            self._unified_graph_cache = unified_graph.build(
+                call_graph=call_graph,
+                knowledge_root=KNOWLEDGE_DIR,
+            )
+            self._unified_graph_signature = signature
+        return self._unified_graph_cache
 
 
 _cache = ParseCache()

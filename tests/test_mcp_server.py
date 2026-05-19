@@ -178,3 +178,21 @@ def test_mcp_server_launches_without_import_error(tmp_path):
     assert "No module named 'scripts" not in result.stderr, (
         f"Direct script execution failed with import error:\n{result.stderr}"
     )
+
+
+def test_unified_graph_cache_returns_nodes_and_edges():
+    graph = mcp_server._cache.get_unified_graph()
+    assert isinstance(graph, dict)
+    assert "nodes" in graph
+    assert "edges" in graph
+    # Live project has both articles and code, so neither should be empty.
+    article_nodes = [n for n in graph["nodes"] if n.startswith("article:")]
+    file_nodes = [n for n in graph["nodes"] if n.startswith("file:")]
+    assert len(article_nodes) > 0, "no article nodes in unified graph — knowledge_root path likely wrong"
+    assert len(file_nodes) > 0, "no file nodes in unified graph — call graph likely empty"
+
+
+def test_unified_graph_cache_is_memoized():
+    g1 = mcp_server._cache.get_unified_graph()
+    g2 = mcp_server._cache.get_unified_graph()
+    assert g1 is g2  # second call returns the same dict object (cache hit)
