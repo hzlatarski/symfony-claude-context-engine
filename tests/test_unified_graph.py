@@ -76,3 +76,30 @@ def test_wikilink_to_missing_article_is_skipped(tmp_path):
     result = unified_graph.build(call_graph={"symbols": {}, "edges": [], "classes": {}}, knowledge_root=tmp_path)
     wikilink_edges = [e for e in result["edges"] if e["kind"] == "wikilink"]
     assert wikilink_edges == []
+
+
+def test_src_anchors_become_article_to_file_edges(tmp_path):
+    (tmp_path / "concepts").mkdir()
+    (tmp_path / "concepts" / "a.md").write_text(
+        "Refs [src:src/Foo/Bar.php] and [src:src/Other.php] in body.",
+        encoding="utf-8",
+    )
+
+    result = unified_graph.build(call_graph={"symbols": {}, "edges": [], "classes": {}}, knowledge_root=tmp_path)
+
+    assert "file:src/Foo/Bar.php" in result["nodes"]
+    assert result["nodes"]["file:src/Foo/Bar.php"]["kind"] == "file"
+    pairs = [(e["from"], e["to"]) for e in result["edges"] if e["kind"] == "cites"]
+    assert ("article:concepts/a", "file:src/Foo/Bar.php") in pairs
+    assert ("article:concepts/a", "file:src/Other.php") in pairs
+
+
+def test_duplicate_src_anchors_dedupe_edges(tmp_path):
+    (tmp_path / "concepts").mkdir()
+    (tmp_path / "concepts" / "a.md").write_text(
+        "[src:src/Foo.php] mentioned twice [src:src/Foo.php].",
+        encoding="utf-8",
+    )
+    result = unified_graph.build(call_graph={"symbols": {}, "edges": [], "classes": {}}, knowledge_root=tmp_path)
+    cites = [e for e in result["edges"] if e["kind"] == "cites"]
+    assert len(cites) == 1

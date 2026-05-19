@@ -33,6 +33,7 @@ import re
 
 _TYPED_WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\](?:\{([a-z0-9_]+)\})?")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_SRC_ANCHOR_RE = re.compile(r"\[src:([^\]]+)\]")
 
 
 def build(call_graph: dict, knowledge_root: Path) -> dict:
@@ -73,14 +74,25 @@ def build(call_graph: dict, knowledge_root: Path) -> dict:
     # Pass 2: emit edges that reference other nodes.
     for src_id, content in article_contents.items():
         stripped = _HTML_COMMENT_RE.sub("", content)
+
         for target, relation in [(m.group(1), m.group(2)) for m in _TYPED_WIKILINK_RE.finditer(stripped)]:
             target_id = f"article:{target}"
             if target_id not in nodes:
-                continue  # wikilink to nonexistent article — silently skip
+                continue
             edge: dict = {"from": src_id, "to": target_id, "kind": "wikilink"}
             if relation is not None:
                 edge["relation"] = relation
             edges.append(edge)
+
+        seen_anchors: set[str] = set()
+        for anchor in _SRC_ANCHOR_RE.findall(stripped):
+            if anchor in seen_anchors:
+                continue
+            seen_anchors.add(anchor)
+            file_id = f"file:{anchor}"
+            if file_id not in nodes:
+                nodes[file_id] = {"kind": "file", "label": anchor}
+            edges.append({"from": src_id, "to": file_id, "kind": "cites"})
 
     return {"nodes": nodes, "edges": edges}
 
