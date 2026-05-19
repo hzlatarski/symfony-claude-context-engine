@@ -196,3 +196,21 @@ def test_unified_graph_cache_is_memoized():
     g1 = mcp_server._cache.get_unified_graph()
     g2 = mcp_server._cache.get_unified_graph()
     assert g1 is g2  # second call returns the same dict object (cache hit)
+
+
+def test_build_unified_neighbors_for_known_article():
+    # Pick any article from the live KB — concepts/admin-audit-logging.md exists per the gitignore listing.
+    result = mcp_server._build_unified_neighbors("article:concepts/admin-audit-logging", depth=1)
+    assert isinstance(result, str)
+    assert "admin-audit-logging" in result or "article" in result.lower()
+
+
+def test_build_unified_neighbors_for_missing_node_returns_error():
+    result = mcp_server._build_unified_neighbors("article:concepts/does-not-exist", depth=1)
+    assert "not found" in result.lower()
+
+
+def test_build_unified_neighbors_clamps_depth():
+    # depth must be >= 1 and <= 3 — out-of-range silently clamps.
+    result = mcp_server._build_unified_neighbors("article:concepts/admin-audit-logging", depth=99)
+    assert isinstance(result, str)

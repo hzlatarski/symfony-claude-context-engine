@@ -823,6 +823,87 @@ def _build_hotspots(top_n: int = 10) -> str:
     return "\n".join(lines)
 
 
+def _build_unified_neighbors(node_id: str, depth: int = 1) -> str:
+    """Render a markdown summary of nodes within ``depth`` hops of ``node_id``.
+
+    Depth is clamped to ``[1, 3]``. Edges are grouped by direction (outgoing
+    first, then incoming) and by ``kind`` within each direction. Each
+    neighboring node shows kind + label; the edge between root and neighbor
+    shows the edge kind and ``relation``/``confidence`` if present.
+
+    Returns a friendly ``"Node not found"`` string when ``node_id`` is not in
+    the graph rather than raising — MCP tool callers prefer a string they
+    can hand to the model over an exception trace.
+    """
+    depth = max(1, min(3, int(depth)))
+    graph = _cache.get_unified_graph()
+    nodes = graph["nodes"]
+    edges = graph["edges"]
+    if node_id not in nodes:
+        return f"Node not found: `{node_id}`"
+
+    out_by_kind: dict[str, list[dict]] = {}
+    in_by_kind: dict[str, list[dict]] = {}
+    for e in edges:
+        if e["from"] == node_id:
+            out_by_kind.setdefault(e["kind"], []).append(e)
+        if e["to"] == node_id:
+            in_by_kind.setdefault(e["kind"], []).append(e)
+
+    root = nodes[node_id]
+    lines: list[str] = [
+        f"# `{node_id}`",
+        f"- Kind: **{root['kind']}**",
+        f"- Label: {root.get('label', '')}",
+        "",
+    ]
+    if out_by_kind:
+        lines.append("## Outgoing")
+        for kind, group in sorted(out_by_kind.items()):
+            lines.append(f"### {kind} ({len(group)})")
+            for e in group[:50]:
+                target = nodes.get(e["to"], {})
+                label = target.get("label", "")
+                suffix = ""
+                if "relation" in e:
+                    suffix = f" *(relation: {e['relation']})*"
+                elif "confidence" in e:
+                    suffix = f" *(conf={e['confidence']})*"
+                lines.append(f"- `{e['to']}` — {label}{suffix}")
+            lines.append("")
+    if in_by_kind:
+        lines.append("## Incoming")
+        for kind, group in sorted(in_by_kind.items()):
+            lines.append(f"### {kind} ({len(group)})")
+            for e in group[:50]:
+                source = nodes.get(e["from"], {})
+                label = source.get("label", "")
+                lines.append(f"- `{e['from']}` — {label}")
+            lines.append("")
+
+    if depth >= 2:
+        adj: dict[str, set[str]] = {}
+        for e in edges:
+            adj.setdefault(e["from"], set()).add(e["to"])
+            adj.setdefault(e["to"], set()).add(e["from"])
+        visited = {node_id}
+        frontier = {node_id}
+        for _ in range(depth):
+            next_frontier: set[str] = set()
+            for n in frontier:
+                next_frontier |= adj.get(n, set())
+            next_frontier -= visited
+            visited |= next_frontier
+            frontier = next_frontier
+        far = sorted(visited - {node_id} - set(e["to"] for e in edges if e["from"] == node_id) - set(e["from"] for e in edges if e["to"] == node_id))
+        if far:
+            lines.append(f"## {depth}-hop reachable (not direct)")
+            for nid in far[:80]:
+                lines.append(f"- `{nid}` — {nodes.get(nid, {}).get('label', '')}")
+
+    return "\n".join(lines)
+
+
 # -----------------------------------------------------------------------------
 # FastMCP server bindings
 # -----------------------------------------------------------------------------
@@ -862,6 +943,20 @@ def _make_server():
     def get_hotspots(top_n: int = 10) -> str:
         """Top N hot files ranked by git churn score, with co-change partners and ownership."""
         return _build_hotspots(top_n)
+
+    @server.tool()
+    def get_unified_neighbors(node_id: str, depth: int = 1) -> str:
+        """Neighbors of an article/file/class/symbol/template node in the unified graph.
+
+        Node IDs use prefixes: ``article:concepts/foo``, ``file:src/Foo.php``,
+        ``class:App\\Service\\Foo``, ``symbol:App\\Service\\Foo::bar``,
+        ``template:foo/index.html.twig``. ``depth`` is clamped to ``[1, 3]``.
+
+        Use this to answer questions like "what code does this article describe?"
+        (article → cites → file → contains → class → defines → symbol — reachable
+        within depth=3) without chaining ``search_codebase`` after ``get_article``.
+        """
+        return _build_unified_neighbors(node_id, depth)
 
     @server.tool()
     def impact_of_change(
