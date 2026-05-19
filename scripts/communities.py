@@ -91,3 +91,58 @@ def label_for(node_labels: list[str]) -> str:
         return "unlabeled"
     cleaned.sort(key=len)
     return " / ".join(cleaned[:3])
+
+
+import hashlib
+import json
+from pathlib import Path
+
+
+def _signature(graph: dict, seed: int) -> str:
+    """Stable hash over the graph's node IDs and edge endpoints.
+
+    Edge kinds/relations/confidences don't affect Leiden output so we
+    exclude them from the signature — the cache survives metadata-only
+    edits, e.g. a wikilink relation tweak.
+    """
+    h = hashlib.sha1()
+    h.update(f"seed={seed}\n".encode())
+    for nid in sorted(graph["nodes"]):
+        h.update(f"n:{nid}\n".encode())
+    edge_keys = sorted(
+        (e["from"], e["to"]) for e in graph["edges"]
+    )
+    for a, b in edge_keys:
+        h.update(f"e:{a}->{b}\n".encode())
+    return h.hexdigest()
+
+
+def load_or_compute(graph: dict, *, cache_path: Path, seed: int = 42, min_size: int = 2) -> list[dict]:
+    """Return communities for ``graph``, loading from ``cache_path`` when the
+    graph signature matches.
+
+    Cache file shape:
+        ``{"signature": "<sha1>", "seed": 42, "min_size": 2,
+           "communities": [<community records>]}``
+    """
+    cache_path = Path(cache_path)
+    sig = _signature(graph, seed)
+
+    if cache_path.exists():
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            if data.get("signature") == sig and data.get("min_size") == min_size:
+                return data["communities"]
+        except (json.JSONDecodeError, KeyError):
+            pass  # corrupt cache — recompute
+
+    result = detect(graph, seed=seed, min_size=min_size)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(
+            {"signature": sig, "seed": seed, "min_size": min_size, "communities": result},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return result

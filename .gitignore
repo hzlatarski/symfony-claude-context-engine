@@ -52,3 +52,6 @@ Thumbs.db
 
 .obsidian/
 .worktrees/
+
+# Leiden community detection cache (rebuilt on demand)
+knowledge/communities.json
