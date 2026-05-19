@@ -29,6 +29,10 @@ Node ID prefixes are non-overlapping (``article:``, ``file:``, ``class:``,
 from __future__ import annotations
 
 from pathlib import Path
+import re
+
+_TYPED_WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\](?:\{([a-z0-9_]+)\})?")
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
 def build(call_graph: dict, knowledge_root: Path) -> dict:
@@ -47,6 +51,7 @@ def build(call_graph: dict, knowledge_root: Path) -> dict:
     """
     nodes: dict[str, dict] = {}
     edges: list[dict] = []
+    article_contents: dict[str, str] = {}
 
     for subdir in ("concepts", "connections", "qa"):
         root = knowledge_root / subdir
@@ -63,6 +68,19 @@ def build(call_graph: dict, knowledge_root: Path) -> dict:
                 "type": meta.get("type", "unknown"),
                 "confidence": meta.get("confidence"),
             }
+            article_contents[node_id] = content
+
+    # Pass 2: emit edges that reference other nodes.
+    for src_id, content in article_contents.items():
+        stripped = _HTML_COMMENT_RE.sub("", content)
+        for target, relation in [(m.group(1), m.group(2)) for m in _TYPED_WIKILINK_RE.finditer(stripped)]:
+            target_id = f"article:{target}"
+            if target_id not in nodes:
+                continue  # wikilink to nonexistent article — silently skip
+            edge: dict = {"from": src_id, "to": target_id, "kind": "wikilink"}
+            if relation is not None:
+                edge["relation"] = relation
+            edges.append(edge)
 
     return {"nodes": nodes, "edges": edges}
 

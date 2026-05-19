@@ -51,3 +51,28 @@ def test_article_without_title_falls_back_to_slug(tmp_path):
     (tmp_path / "concepts" / "no-title.md").write_text("just text", encoding="utf-8")
     result = unified_graph.build(call_graph={"symbols": {}, "edges": [], "classes": {}}, knowledge_root=tmp_path)
     assert result["nodes"]["article:concepts/no-title"]["label"] == "no-title"
+
+
+def test_wikilinks_become_article_to_article_edges(tmp_path):
+    (tmp_path / "concepts").mkdir()
+    (tmp_path / "concepts" / "src.md").write_text(
+        "See [[concepts/dst]] and [[concepts/other]]{depends_on}.",
+        encoding="utf-8",
+    )
+    (tmp_path / "concepts" / "dst.md").write_text("target", encoding="utf-8")
+    (tmp_path / "concepts" / "other.md").write_text("target2", encoding="utf-8")
+
+    result = unified_graph.build(call_graph={"symbols": {}, "edges": [], "classes": {}}, knowledge_root=tmp_path)
+
+    pairs = [(e["from"], e["to"], e.get("relation")) for e in result["edges"] if e["kind"] == "wikilink"]
+    assert ("article:concepts/src", "article:concepts/dst", None) in pairs
+    assert ("article:concepts/src", "article:concepts/other", "depends_on") in pairs
+
+
+def test_wikilink_to_missing_article_is_skipped(tmp_path):
+    (tmp_path / "concepts").mkdir()
+    (tmp_path / "concepts" / "src.md").write_text("See [[concepts/ghost]].", encoding="utf-8")
+
+    result = unified_graph.build(call_graph={"symbols": {}, "edges": [], "classes": {}}, knowledge_root=tmp_path)
+    wikilink_edges = [e for e in result["edges"] if e["kind"] == "wikilink"]
+    assert wikilink_edges == []
