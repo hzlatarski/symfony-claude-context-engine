@@ -213,6 +213,35 @@ resolve in a single hop instead of chaining `search_knowledge` →
 | `call` | symbol → symbol | `parsers.call_graph` resolved call edges (carries `confidence`) |
 | `render` | symbol → template | `$this->render('...')` calls |
 
+### Semantic Communities
+
+`scripts/communities.py` runs **Leiden modularity optimization** over the
+unified graph and partitions it into semantic clusters. Each community
+has a deterministic `label` (assembled from member node labels), a
+`hub_node` (highest-degree member), and an integer `community_id`. The
+partition is cached at `knowledge/communities.json` with a sha1
+signature over node IDs + edge endpoints — modifying article metadata
+that doesn't change structure (e.g., a confidence tweak) doesn't bust
+the cache.
+
+Two MCP tools surface the result:
+
+| Tool | Returns |
+|---|---|
+| `get_communities(min_size=3, top_n=10)` | Ranked list of the largest clusters with sample members |
+| `find_community(node_id)` | Which community a node belongs to + its siblings |
+
+Run `compile_truth.py --with-clusters` to inject a `## Concept Clusters`
+section at the bottom of `compiled-truth.md` — useful when the
+session-start budget can afford the extra ~2KB and you want the model
+to see the macro shape of the KB without an explicit tool call.
+
+Communities complement (don't replace) `get_hotspots`: hotspots rank
+files by **git churn**, communities rank nodes by **semantic
+centrality**. A file can be a churn hotspot but a community periphery
+(symptom: high-traffic dumping ground), or a community hub but a churn
+cold spot (symptom: stable foundational concept).
+
 
                    RETRIEVAL DURING A SESSION
                    ==========================
