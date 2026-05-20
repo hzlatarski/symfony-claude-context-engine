@@ -922,6 +922,63 @@ def _build_unified_neighbors(node_id: str, depth: int = 1) -> str:
     return "\n".join(lines)
 
 
+def _build_communities(min_size: int = 3, top_n: int = 10) -> str:
+    """Render the top-N largest semantic communities as markdown."""
+    from scripts import communities as _comm
+    from config import KNOWLEDGE_DIR
+
+    graph = _cache.get_unified_graph()
+    cache_path = KNOWLEDGE_DIR / "communities.json"
+    clusters = _comm.load_or_compute(graph, cache_path=cache_path, min_size=min_size)
+    if not clusters:
+        return "No communities found (graph too small or fully disconnected)."
+
+    lines = [f"# Semantic Communities (top {min(top_n, len(clusters))})", ""]
+    for c in clusters[:top_n]:
+        lines.append(f"## Community {c['community_id']}: {c['label']}")
+        lines.append(f"- Size: **{c['size']}**")
+        lines.append(f"- Hub node: `{c['hub_node']}`")
+        sample = c["members"][:8]
+        lines.append("- Sample members:")
+        for nid in sample:
+            label = graph["nodes"].get(nid, {}).get("label", "")
+            lines.append(f"  - `{nid}` — {label}")
+        if len(c["members"]) > 8:
+            lines.append(f"  - ... and {len(c['members']) - 8} more")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _build_find_community(node_id: str) -> str:
+    """Report which community a given node belongs to + sibling members."""
+    from scripts import communities as _comm
+    from config import KNOWLEDGE_DIR
+
+    graph = _cache.get_unified_graph()
+    if node_id not in graph["nodes"]:
+        return f"Node not found in unified graph: `{node_id}`"
+
+    cache_path = KNOWLEDGE_DIR / "communities.json"
+    clusters = _comm.load_or_compute(graph, cache_path=cache_path)
+    for c in clusters:
+        if node_id in c["members"]:
+            lines = [
+                f"# `{node_id}`",
+                f"- Community: **{c['community_id']} — {c['label']}**",
+                f"- Hub of this community: `{c['hub_node']}`",
+                f"- Community size: {c['size']}",
+                "",
+                "## Sibling members",
+            ]
+            for nid in c["members"]:
+                if nid == node_id:
+                    continue
+                label = graph["nodes"].get(nid, {}).get("label", "")
+                lines.append(f"- `{nid}` — {label}")
+            return "\n".join(lines)
+    return f"`{node_id}` is not in any community (likely singleton — below min_size)."
+
+
 # -----------------------------------------------------------------------------
 # FastMCP server bindings
 # -----------------------------------------------------------------------------
@@ -975,6 +1032,34 @@ def _make_server():
         within depth=3) without chaining ``search_codebase`` after ``get_article``.
         """
         return _build_unified_neighbors(node_id, depth)
+
+    @server.tool()
+    def get_communities(min_size: int = 3, top_n: int = 10) -> str:
+        """List the top-N semantic communities in the unified knowledge graph.
+
+        Communities are computed via Leiden modularity optimization over the
+        union of article wikilinks + code call graph. Each community returns
+        ``community_id``, ``size``, the highest-degree ``hub_node``, a
+        deterministic ``label`` assembled from member node labels, and up to
+        8 sample members.
+
+        ``min_size`` filters out tiny clusters (default 3); ``top_n`` caps the
+        result count (default 10). The cache lives at
+        ``knowledge/communities.json`` and is invalidated automatically when
+        the underlying graph changes.
+        """
+        return _build_communities(min_size, top_n)
+
+    @server.tool()
+    def find_community(node_id: str) -> str:
+        """Find the semantic community a given node belongs to + list its siblings.
+
+        ``node_id`` uses the same prefix convention as
+        ``get_unified_neighbors`` (``article:...``, ``file:...``, ``class:...``,
+        ``symbol:...``, ``template:...``). Returns a friendly error string
+        if the node is not in the graph or is below the singleton threshold.
+        """
+        return _build_find_community(node_id)
 
     @server.tool()
     def impact_of_change(

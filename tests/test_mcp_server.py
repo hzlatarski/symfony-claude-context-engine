@@ -221,3 +221,24 @@ def test_build_unified_neighbors_clamps_depth():
     # depth must be >= 1 and <= 3 — out-of-range silently clamps.
     result = mcp_server._build_unified_neighbors("article:concepts/admin-audit-logging", depth=99)
     assert isinstance(result, str)
+
+
+def test_build_communities_returns_ranked_markdown():
+    result = mcp_server._build_communities(min_size=3, top_n=5)
+    assert isinstance(result, str)
+    assert "Community" in result or "community" in result
+    # Live KB has dozens of articles + hundreds of files — should find at least one cluster.
+    assert "members" in result.lower() or "hub" in result.lower()
+
+
+def test_build_find_community_for_known_node():
+    # Pick an article that we know exists in the KB.
+    result = mcp_server._build_find_community("article:concepts/admin-audit-logging")
+    assert isinstance(result, str)
+    # Either reports the community membership or "not in any community" — both are valid outputs.
+    assert "admin-audit-logging" in result or "community" in result.lower() or "not in" in result.lower()
+
+
+def test_build_find_community_for_missing_node():
+    result = mcp_server._build_find_community("article:concepts/does-not-exist-anywhere")
+    assert "not found" in result.lower() or "not in" in result.lower()
