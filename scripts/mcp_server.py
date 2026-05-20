@@ -32,6 +32,7 @@ if str(_MEMORY_COMPILER_ROOT) not in sys.path:
     sys.path.insert(0, str(_MEMORY_COMPILER_ROOT))
 
 from scripts.parsers import PROJECT_ROOT, php_graph, route_map, twig_graph, stimulus_map, git_intel, call_graph
+from scripts import unified_graph
 from scripts import parent_watchdog, mermaid_render
 
 log = logging.getLogger("mcp_server")
@@ -61,6 +62,8 @@ class ParseCache:
         self._stim_mtime: float = 0.0
         self._call_graph_cache: dict | None = None
         self._call_graph_mtime: float = 0.0
+        self._unified_graph_cache: dict | None = None
+        self._unified_graph_signature: tuple = ()
 
     @staticmethod
     def _max_mtime(paths) -> float:
@@ -122,6 +125,34 @@ class ParseCache:
             self._call_graph_mtime = current
         return self._call_graph_cache
 
+    def get_unified_graph(self) -> dict:
+        """Cache the unified knowledge graph.
+
+        Invalidates when either the call graph or any article markdown file
+        in ``knowledge/{concepts,connections,qa}/`` changes. Signature is
+        ``(call_graph_mtime, articles_mtime)`` — recomputing the unified
+        graph is cheap (single linear pass over articles + dict copy of the
+        call graph) so we don't need a finer-grained dirty-set protocol.
+        """
+        from scripts.config import KNOWLEDGE_DIR
+
+        call_graph = self.get_call_graph()  # ensures cache + freshness
+        article_mtime = 0.0
+        for sub in ("concepts", "connections", "qa"):
+            root = KNOWLEDGE_DIR / sub
+            if root.exists():
+                article_mtime = max(article_mtime, self._max_mtime(root.glob("*.md")))
+
+        signature = (self._call_graph_mtime, article_mtime)
+        if self._unified_graph_cache is None or signature != self._unified_graph_signature:
+            log.info("Rebuilding unified knowledge graph cache")
+            self._unified_graph_cache = unified_graph.build(
+                call_graph=call_graph,
+                knowledge_root=KNOWLEDGE_DIR,
+            )
+            self._unified_graph_signature = signature
+        return self._unified_graph_cache
+
 
 _cache = ParseCache()
 
@@ -166,6 +197,24 @@ def _build_codebase_overview() -> str:
             f"- {h['file']}: score={h['score']} "
             f"commits={h['commits_total']} owner={h['primary_owner']}"
         )
+
+    unified = _cache.get_unified_graph()
+    article_nodes = [n for n in unified["nodes"] if n.startswith("article:")]
+    file_nodes = [n for n in unified["nodes"] if n.startswith("file:")]
+    wikilink_edges = [e for e in unified["edges"] if e["kind"] == "wikilink"]
+    cites_edges = [e for e in unified["edges"] if e["kind"] == "cites"]
+    referenced = {e["from"] for e in unified["edges"]} | {e["to"] for e in unified["edges"]}
+    orphan_articles = [n for n in article_nodes if n not in referenced]
+
+    lines.extend([
+        "",
+        "## Unified Graph",
+        f"- Articles: {len(article_nodes)}",
+        f"- Files: {len(file_nodes)}",
+        f"- Wikilink edges: {len(wikilink_edges)}",
+        f"- Cites edges: {len(cites_edges)}",
+        f"- Orphan articles (no in/out edges): {len(orphan_articles)}",
+    ])
     return "\n".join(lines)
 
 
@@ -792,6 +841,148 @@ def _build_hotspots(top_n: int = 10) -> str:
     return "\n".join(lines)
 
 
+def _build_unified_neighbors(node_id: str, depth: int = 1) -> str:
+    """Render a markdown summary of nodes within ``depth`` hops of ``node_id``.
+
+    Depth is clamped to ``[1, 3]``. Edges are grouped by direction (outgoing
+    first, then incoming) and by ``kind`` within each direction. Each
+    neighboring node shows kind + label; the edge between root and neighbor
+    shows the edge kind and ``relation``/``confidence`` if present.
+
+    Returns a friendly ``"Node not found"`` string when ``node_id`` is not in
+    the graph rather than raising — MCP tool callers prefer a string they
+    can hand to the model over an exception trace.
+    """
+    depth = max(1, min(3, int(depth)))
+    graph = _cache.get_unified_graph()
+    nodes = graph["nodes"]
+    edges = graph["edges"]
+    if node_id not in nodes:
+        return f"Node not found: `{node_id}`"
+
+    out_by_kind: dict[str, list[dict]] = {}
+    in_by_kind: dict[str, list[dict]] = {}
+    for e in edges:
+        if e["from"] == node_id:
+            out_by_kind.setdefault(e["kind"], []).append(e)
+        if e["to"] == node_id:
+            in_by_kind.setdefault(e["kind"], []).append(e)
+
+    root = nodes[node_id]
+    lines: list[str] = [
+        f"# `{node_id}`",
+        f"- Kind: **{root['kind']}**",
+        f"- Label: {root.get('label', '')}",
+        "",
+    ]
+    if out_by_kind:
+        lines.append("## Outgoing")
+        for kind, group in sorted(out_by_kind.items()):
+            lines.append(f"### {kind} ({len(group)})")
+            for e in group[:50]:
+                target = nodes.get(e["to"], {})
+                label = target.get("label", "")
+                suffix = ""
+                if "relation" in e:
+                    suffix = f" *(relation: {e['relation']})*"
+                elif "confidence" in e:
+                    suffix = f" *(conf={e['confidence']})*"
+                lines.append(f"- `{e['to']}` — {label}{suffix}")
+            lines.append("")
+    if in_by_kind:
+        lines.append("## Incoming")
+        for kind, group in sorted(in_by_kind.items()):
+            lines.append(f"### {kind} ({len(group)})")
+            for e in group[:50]:
+                source = nodes.get(e["from"], {})
+                label = source.get("label", "")
+                lines.append(f"- `{e['from']}` — {label}")
+            lines.append("")
+
+    if depth >= 2:
+        adj: dict[str, set[str]] = {}
+        for e in edges:
+            adj.setdefault(e["from"], set()).add(e["to"])
+            adj.setdefault(e["to"], set()).add(e["from"])
+        visited = {node_id}
+        frontier = {node_id}
+        for _ in range(depth):
+            next_frontier: set[str] = set()
+            for n in frontier:
+                next_frontier |= adj.get(n, set())
+            next_frontier -= visited
+            visited |= next_frontier
+            frontier = next_frontier
+        far = sorted(visited - {node_id} - set(e["to"] for e in edges if e["from"] == node_id) - set(e["from"] for e in edges if e["to"] == node_id))
+        if far:
+            lines.append(f"## {depth}-hop reachable (not direct)")
+            for nid in far[:80]:
+                lines.append(f"- `{nid}` — {nodes.get(nid, {}).get('label', '')}")
+
+    return "\n".join(lines)
+
+
+def _build_communities(min_size: int = 3, top_n: int = 10) -> str:
+    """Render the top-N largest semantic communities as markdown."""
+    from scripts import communities as _comm
+    from scripts.config import KNOWLEDGE_DIR
+
+    graph = _cache.get_unified_graph()
+    cache_path = KNOWLEDGE_DIR / f"communities.min{min_size}.json"
+    clusters = _comm.load_or_compute(graph, cache_path=cache_path, min_size=min_size)
+    if not clusters:
+        return "No communities found (graph too small or fully disconnected)."
+
+    lines = [f"# Semantic Communities (top {min(top_n, len(clusters))})", ""]
+    for c in clusters[:top_n]:
+        lines.append(f"## Community {c['community_id']}: {c['label']}")
+        lines.append(f"- Size: **{c['size']}**")
+        lines.append(f"- Hub node: `{c['hub_node']}`")
+        sample = c["members"][:8]
+        lines.append("- Sample members:")
+        for nid in sample:
+            label = graph["nodes"].get(nid, {}).get("label", "")
+            lines.append(f"  - `{nid}` — {label}")
+        if len(c["members"]) > 8:
+            lines.append(f"  - ... and {len(c['members']) - 8} more")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _build_find_community(node_id: str) -> str:
+    """Report which community a given node belongs to + sibling members."""
+    from scripts import communities as _comm
+    from scripts.config import KNOWLEDGE_DIR
+
+    graph = _cache.get_unified_graph()
+    if node_id not in graph["nodes"]:
+        return f"Node not found in unified graph: `{node_id}`"
+
+    # min_size=2 (detect()'s default) so a lookup sees every community,
+    # including small ones get_communities() filters out. Distinct cache
+    # file per min_size — no thrash against get_communities(min_size=3).
+    min_size = 2
+    cache_path = KNOWLEDGE_DIR / f"communities.min{min_size}.json"
+    clusters = _comm.load_or_compute(graph, cache_path=cache_path, min_size=min_size)
+    for c in clusters:
+        if node_id in c["members"]:
+            lines = [
+                f"# `{node_id}`",
+                f"- Community: **{c['community_id']} — {c['label']}**",
+                f"- Hub of this community: `{c['hub_node']}`",
+                f"- Community size: {c['size']}",
+                "",
+                "## Sibling members",
+            ]
+            for nid in c["members"]:
+                if nid == node_id:
+                    continue
+                label = graph["nodes"].get(nid, {}).get("label", "")
+                lines.append(f"- `{nid}` — {label}")
+            return "\n".join(lines)
+    return f"`{node_id}` is not in any community (likely singleton — below min_size)."
+
+
 # -----------------------------------------------------------------------------
 # FastMCP server bindings
 # -----------------------------------------------------------------------------
@@ -831,6 +1022,48 @@ def _make_server():
     def get_hotspots(top_n: int = 10) -> str:
         """Top N hot files ranked by git churn score, with co-change partners and ownership."""
         return _build_hotspots(top_n)
+
+    @server.tool()
+    def get_unified_neighbors(node_id: str, depth: int = 1) -> str:
+        """Neighbors of an article/file/class/symbol/template node in the unified graph.
+
+        Node IDs use prefixes: ``article:concepts/foo``, ``file:src/Foo.php``,
+        ``class:App\\Service\\Foo``, ``symbol:App\\Service\\Foo::bar``,
+        ``template:foo/index.html.twig``. ``depth`` is clamped to ``[1, 3]``.
+
+        Use this to answer questions like "what code does this article describe?"
+        (article → cites → file → contains → class → defines → symbol — reachable
+        within depth=3) without chaining ``search_codebase`` after ``get_article``.
+        """
+        return _build_unified_neighbors(node_id, depth)
+
+    @server.tool()
+    def get_communities(min_size: int = 3, top_n: int = 10) -> str:
+        """List the top-N semantic communities in the unified knowledge graph.
+
+        Communities are computed via Leiden modularity optimization over the
+        union of article wikilinks + code call graph. Each community returns
+        ``community_id``, ``size``, the highest-degree ``hub_node``, a
+        deterministic ``label`` assembled from member node labels, and up to
+        8 sample members.
+
+        ``min_size`` filters out tiny clusters (default 3); ``top_n`` caps the
+        result count (default 10). The cache lives at
+        ``knowledge/communities.json`` and is invalidated automatically when
+        the underlying graph changes.
+        """
+        return _build_communities(min_size, top_n)
+
+    @server.tool()
+    def find_community(node_id: str) -> str:
+        """Find the semantic community a given node belongs to + list its siblings.
+
+        ``node_id`` uses the same prefix convention as
+        ``get_unified_neighbors`` (``article:...``, ``file:...``, ``class:...``,
+        ``symbol:...``, ``template:...``). Returns a friendly error string
+        if the node is not in the graph or is below the singleton threshold.
+        """
+        return _build_find_community(node_id)
 
     @server.tool()
     def impact_of_change(

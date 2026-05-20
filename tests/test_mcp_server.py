@@ -15,6 +15,13 @@ def test_build_codebase_overview_returns_markdown():
     assert "Stimulus" in result or "controllers" in result.lower()
 
 
+def test_codebase_overview_mentions_unified_graph():
+    result = mcp_server._build_codebase_overview()
+    assert "Unified Graph" in result
+    assert "Articles:" in result
+    assert "Orphan articles" in result
+
+
 def test_build_file_deps_for_real_controller():
     result = mcp_server._build_file_deps("src/Entity/User.php")
     assert isinstance(result, str)
@@ -178,3 +185,60 @@ def test_mcp_server_launches_without_import_error(tmp_path):
     assert "No module named 'scripts" not in result.stderr, (
         f"Direct script execution failed with import error:\n{result.stderr}"
     )
+
+
+def test_unified_graph_cache_returns_nodes_and_edges():
+    graph = mcp_server._cache.get_unified_graph()
+    assert isinstance(graph, dict)
+    assert "nodes" in graph
+    assert "edges" in graph
+    # Live project has both articles and code, so neither should be empty.
+    article_nodes = [n for n in graph["nodes"] if n.startswith("article:")]
+    file_nodes = [n for n in graph["nodes"] if n.startswith("file:")]
+    assert len(article_nodes) > 0, "no article nodes in unified graph — knowledge_root path likely wrong"
+    assert len(file_nodes) > 0, "no file nodes in unified graph — call graph likely empty"
+
+
+def test_unified_graph_cache_is_memoized():
+    g1 = mcp_server._cache.get_unified_graph()
+    g2 = mcp_server._cache.get_unified_graph()
+    assert g1 is g2  # second call returns the same dict object (cache hit)
+
+
+def test_build_unified_neighbors_for_known_article():
+    # Pick any article from the live KB — concepts/admin-audit-logging.md exists per the gitignore listing.
+    result = mcp_server._build_unified_neighbors("article:concepts/admin-audit-logging", depth=1)
+    assert isinstance(result, str)
+    assert "admin-audit-logging" in result or "article" in result.lower()
+
+
+def test_build_unified_neighbors_for_missing_node_returns_error():
+    result = mcp_server._build_unified_neighbors("article:concepts/does-not-exist", depth=1)
+    assert "not found" in result.lower()
+
+
+def test_build_unified_neighbors_clamps_depth():
+    # depth must be >= 1 and <= 3 — out-of-range silently clamps.
+    result = mcp_server._build_unified_neighbors("article:concepts/admin-audit-logging", depth=99)
+    assert isinstance(result, str)
+
+
+def test_build_communities_returns_ranked_markdown():
+    result = mcp_server._build_communities(min_size=3, top_n=5)
+    assert isinstance(result, str)
+    assert "Community" in result or "community" in result
+    # Live KB has dozens of articles + hundreds of files — should find at least one cluster.
+    assert "members" in result.lower() or "hub" in result.lower()
+
+
+def test_build_find_community_for_known_node():
+    # Pick an article that we know exists in the KB.
+    result = mcp_server._build_find_community("article:concepts/admin-audit-logging")
+    assert isinstance(result, str)
+    # Either reports the community membership or "not in any community" — both are valid outputs.
+    assert "admin-audit-logging" in result or "community" in result.lower() or "not in" in result.lower()
+
+
+def test_build_find_community_for_missing_node():
+    result = mcp_server._build_find_community("article:concepts/does-not-exist-anywhere")
+    assert "not found" in result.lower() or "not in" in result.lower()

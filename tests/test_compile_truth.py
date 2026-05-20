@@ -250,3 +250,25 @@ Not a Truth section at all.
         zones = extract_zones(content)
         assert zones.observed == ""
         assert zones.synthesized == ""
+
+
+def test_compile_truth_with_clusters_includes_communities_section(tmp_path, monkeypatch):
+    """When --with-clusters is set, compiled-truth.md gets a Concept Clusters section.
+
+    We monkey-patch the cluster source to a stable fixture so the test isn't
+    coupled to live KB state.
+    """
+    from scripts import compile_truth
+
+    monkeypatch.setattr(
+        compile_truth,
+        "_load_clusters_for_truth",
+        lambda limit=5: [
+            {"label": "Test Cluster", "size": 4, "hub_node": "article:concepts/x", "sample": ["X", "Y", "Z"]},
+        ],
+    )
+    section = compile_truth._render_clusters_section(limit=5)
+    assert section is not None
+    assert "Concept Clusters" in section
+    assert "Test Cluster" in section
+    assert "article:concepts/x" in section
