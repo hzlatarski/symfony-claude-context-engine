@@ -398,6 +398,7 @@ def compile_truth(
     include_all: bool = False,
     verbose: bool = False,
     include_synth: bool = False,
+    with_clusters: bool = False,
 ) -> tuple[int, int, int]:
     """Generate compiled-truth.md with priority scoring.
 
@@ -551,10 +552,58 @@ def compile_truth(
 
     lines.append("")
 
+    if with_clusters:
+        section = _render_clusters_section()
+        if section:
+            lines.append(section)
+            lines.append("")
+
     KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
     COMPILED_TRUTH_FILE.write_text("\n".join(lines), encoding="utf-8")
 
     return included_count, total_count, pinned_count
+
+
+def _load_clusters_for_truth(limit: int = 5) -> list[dict]:
+    """Load up to ``limit`` largest communities for compiled-truth.
+
+    Pure-function wrapper around the same cache used by the MCP tools.
+    Returns a slim shape so the section renderer stays trivial.
+    """
+    from scripts import communities as _comm
+    from scripts import unified_graph as _ug
+    from scripts.parsers import call_graph as _cg, PROJECT_ROOT
+
+    graph = _ug.build(call_graph=_cg.parse(PROJECT_ROOT), knowledge_root=KNOWLEDGE_DIR)
+    cache_path = KNOWLEDGE_DIR / "communities.json"
+    clusters = _comm.load_or_compute(graph, cache_path=cache_path)
+    return [
+        {
+            "label": c["label"],
+            "size": c["size"],
+            "hub_node": c["hub_node"],
+            "sample": [graph["nodes"].get(m, {}).get("label", m) for m in c["members"][:5]],
+        }
+        for c in clusters[:limit]
+    ]
+
+
+def _render_clusters_section(limit: int = 5) -> str | None:
+    """Render the Concept Clusters section for compiled-truth.md.
+
+    Returns ``None`` when no clusters exist so the caller can skip the
+    heading entirely instead of emitting an empty section.
+    """
+    clusters = _load_clusters_for_truth(limit=limit)
+    if not clusters:
+        return None
+    lines = ["## Concept Clusters", ""]
+    for c in clusters:
+        lines.append(f"### {c['label']} (size {c['size']})")
+        lines.append(f"- Hub: `{c['hub_node']}`")
+        lines.append("- Sample: " + ", ".join(c["sample"]))
+        lines.append("")
+    return "\n".join(lines)
 
 
 def main():
@@ -584,6 +633,11 @@ def main():
         dest="include_synth",
         help="Include the Synthesized zone in compiled truth (default: Observed only)",
     )
+    parser.add_argument(
+        "--with-clusters",
+        action="store_true",
+        help="Append a 'Concept Clusters' section listing the top 5 Leiden communities.",
+    )
     args = parser.parse_args()
 
     included, total, pinned = compile_truth(
@@ -591,6 +645,7 @@ def main():
         include_all=args.include_all,
         verbose=args.verbose,
         include_synth=args.include_synth,
+        with_clusters=args.with_clusters,
     )
 
     excluded = total - included
