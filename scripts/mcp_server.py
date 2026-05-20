@@ -134,7 +134,7 @@ class ParseCache:
         graph is cheap (single linear pass over articles + dict copy of the
         call graph) so we don't need a finer-grained dirty-set protocol.
         """
-        from config import KNOWLEDGE_DIR
+        from scripts.config import KNOWLEDGE_DIR
 
         call_graph = self.get_call_graph()  # ensures cache + freshness
         article_mtime = 0.0
@@ -925,7 +925,7 @@ def _build_unified_neighbors(node_id: str, depth: int = 1) -> str:
 def _build_communities(min_size: int = 3, top_n: int = 10) -> str:
     """Render the top-N largest semantic communities as markdown."""
     from scripts import communities as _comm
-    from config import KNOWLEDGE_DIR
+    from scripts.config import KNOWLEDGE_DIR
 
     graph = _cache.get_unified_graph()
     cache_path = KNOWLEDGE_DIR / "communities.json"
@@ -952,7 +952,7 @@ def _build_communities(min_size: int = 3, top_n: int = 10) -> str:
 def _build_find_community(node_id: str) -> str:
     """Report which community a given node belongs to + sibling members."""
     from scripts import communities as _comm
-    from config import KNOWLEDGE_DIR
+    from scripts.config import KNOWLEDGE_DIR
 
     graph = _cache.get_unified_graph()
     if node_id not in graph["nodes"]:

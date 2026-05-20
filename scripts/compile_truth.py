@@ -570,9 +570,9 @@ def _load_clusters_for_truth(limit: int = 5) -> list[dict]:
     Pure-function wrapper around the same cache used by the MCP tools.
     Returns a slim shape so the section renderer stays trivial.
     """
-    from scripts import communities as _comm
-    from scripts import unified_graph as _ug
-    from scripts.parsers import call_graph as _cg, PROJECT_ROOT
+    import communities as _comm
+    import unified_graph as _ug
+    from parsers import call_graph as _cg, PROJECT_ROOT
 
     graph = _ug.build(call_graph=_cg.parse(PROJECT_ROOT), knowledge_root=KNOWLEDGE_DIR)
     cache_path = KNOWLEDGE_DIR / "communities.json"
