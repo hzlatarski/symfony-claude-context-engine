@@ -132,3 +132,22 @@ def test_call_graph_symbols_and_classes_become_nodes(tmp_path):
     assert kinds[("class:App\\Service\\Foo", "symbol:App\\Service\\Foo::bar")] == "defines"
     assert kinds[("symbol:App\\Service\\Foo::bar", "symbol:App\\Service\\Baz::qux")] == "call"
     assert kinds[("symbol:App\\Service\\Foo::bar", "template:foo/index.html.twig")] == "render"
+
+
+def test_unresolved_fetch_placeholder_edges_are_skipped(tmp_path):
+    """An unresolved JS fetch() edge must not become a malformed symbol: node."""
+    call_graph = {
+        "symbols": {
+            "js:arena::connect": {"file": "assets/controllers/arena_controller.js", "class": ""},
+        },
+        "edges": [
+            {"from": "js:arena::connect", "to": "fetch:POST /api/session", "kind": "call", "confidence": 0.7},
+        ],
+        "classes": {},
+    }
+    result = unified_graph.build(call_graph=call_graph, knowledge_root=tmp_path)
+
+    # No node ID may carry the fetch: placeholder (no "symbol:fetch:..." garbage).
+    assert not any("fetch:" in nid for nid in result["nodes"])
+    # The dead edge is dropped entirely.
+    assert result["edges"] == []

@@ -572,11 +572,12 @@ def _load_clusters_for_truth(limit: int = 5) -> list[dict]:
     """
     import communities as _comm
     import unified_graph as _ug
-    from parsers import call_graph as _cg, PROJECT_ROOT
+    from parsers import PROJECT_ROOT
 
-    graph = _ug.build(call_graph=_cg.parse(PROJECT_ROOT), knowledge_root=KNOWLEDGE_DIR)
-    cache_path = KNOWLEDGE_DIR / "communities.json"
-    clusters = _comm.load_or_compute(graph, cache_path=cache_path)
+    min_size = 2
+    graph = _ug.build_for_project(PROJECT_ROOT, KNOWLEDGE_DIR)
+    cache_path = KNOWLEDGE_DIR / f"communities.min{min_size}.json"
+    clusters = _comm.load_or_compute(graph, cache_path=cache_path, min_size=min_size)
     return [
         {
             "label": c["label"],

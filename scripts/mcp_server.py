@@ -928,7 +928,7 @@ def _build_communities(min_size: int = 3, top_n: int = 10) -> str:
     from scripts.config import KNOWLEDGE_DIR
 
     graph = _cache.get_unified_graph()
-    cache_path = KNOWLEDGE_DIR / "communities.json"
+    cache_path = KNOWLEDGE_DIR / f"communities.min{min_size}.json"
     clusters = _comm.load_or_compute(graph, cache_path=cache_path, min_size=min_size)
     if not clusters:
         return "No communities found (graph too small or fully disconnected)."
@@ -958,8 +958,12 @@ def _build_find_community(node_id: str) -> str:
     if node_id not in graph["nodes"]:
         return f"Node not found in unified graph: `{node_id}`"
 
-    cache_path = KNOWLEDGE_DIR / "communities.json"
-    clusters = _comm.load_or_compute(graph, cache_path=cache_path)
+    # min_size=2 (detect()'s default) so a lookup sees every community,
+    # including small ones get_communities() filters out. Distinct cache
+    # file per min_size — no thrash against get_communities(min_size=3).
+    min_size = 2
+    cache_path = KNOWLEDGE_DIR / f"communities.min{min_size}.json"
+    clusters = _comm.load_or_compute(graph, cache_path=cache_path, min_size=min_size)
     for c in clusters:
         if node_id in c["members"]:
             lines = [

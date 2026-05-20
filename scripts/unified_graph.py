@@ -78,8 +78,15 @@ def build(call_graph: dict, knowledge_root: Path) -> dict:
                 edges.append({"from": class_id, "to": symbol_id, "kind": "defines"})
 
     for edge in call_graph.get("edges", []):
-        src = f"symbol:{edge['from']}"
         dst = edge["to"]
+        # Unresolved JS fetch() placeholders ("fetch:POST /api/x") point at an
+        # endpoint with no matching route. resolve_fetch_edges() rewrites the
+        # resolvable ones to real PHP symbols upstream; whatever still carries
+        # the fetch: prefix here is dead — skip it rather than mint a malformed
+        # "symbol:fetch:POST /api/x" node.
+        if dst.startswith("fetch:"):
+            continue
+        src = f"symbol:{edge['from']}"
         if dst.startswith("template:"):
             dst_id = dst  # already prefixed
             if dst_id not in nodes:
@@ -137,6 +144,28 @@ def build(call_graph: dict, knowledge_root: Path) -> dict:
             edges.append({"from": src_id, "to": file_id, "kind": "cites"})
 
     return {"nodes": nodes, "edges": edges}
+
+
+def build_for_project(project_root: Path, knowledge_root: Path) -> dict:
+    """Parse the call graph + route map, resolve JS ``fetch()`` edges, then fuse.
+
+    Single source of truth for callers that lack a warm ``ParseCache`` —
+    ``compile_truth`` and ``kb_health``. Without this, each consumer would
+    call ``call_graph.parse()`` independently and *skip* fetch resolution,
+    so their graphs would silently disagree with the MCP server's (which
+    resolves fetch edges via ``ParseCache.get_call_graph``).
+
+    The ``parsers`` package resolves under two import regimes depending on
+    how the calling entrypoint set up ``sys.path`` — try both.
+    """
+    try:
+        from scripts.parsers import call_graph, route_map
+    except ImportError:
+        from parsers import call_graph, route_map
+
+    cg = call_graph.parse(project_root)
+    call_graph.resolve_fetch_edges(cg, route_map.parse(project_root))
+    return build(call_graph=cg, knowledge_root=knowledge_root)
 
 
 def _parse_article_frontmatter(content: str) -> dict:

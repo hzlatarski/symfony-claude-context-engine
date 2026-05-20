@@ -398,8 +398,8 @@ def _kb_health_impl() -> dict[str, Any]:
     # Unified-graph stats — guarded so a build failure doesn't break the diagnostic.
     try:
         from scripts import unified_graph as _ug
-        from scripts.parsers import call_graph as _cg, PROJECT_ROOT
-        _graph = _ug.build(call_graph=_cg.parse(PROJECT_ROOT), knowledge_root=KNOWLEDGE_DIR)
+        from scripts.parsers import PROJECT_ROOT
+        _graph = _ug.build_for_project(PROJECT_ROOT, KNOWLEDGE_DIR)
         _article_nodes = [n for n in _graph["nodes"] if n.startswith("article:")]
         _referenced = {e["from"] for e in _graph["edges"]} | {e["to"] for e in _graph["edges"]}
         graph_stats: dict[str, Any] = {

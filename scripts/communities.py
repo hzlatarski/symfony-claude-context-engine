@@ -56,22 +56,21 @@ def detect(graph: dict, *, seed: int = 42, min_size: int = 2) -> list[dict]:
 
     degrees = g.degree()
     results: list[dict] = []
-    for community_id, member_indices in enumerate(partition):
+    for member_indices in partition:
         if len(member_indices) < min_size:
             continue
         members = [node_ids[i] for i in member_indices]
         hub_idx = max(member_indices, key=lambda i: degrees[i])
         hub_node = node_ids[hub_idx]
         member_labels = [graph["nodes"][nid].get("label", nid) for nid in members]
-        record = {
-            "community_id": community_id,
+        results.append({
             "members": members,
             "hub_node": hub_node,
             "size": len(members),
             "label": label_for(member_labels),
-        }
-        results.append(record)
+        })
 
+    # community_id is assigned post-sort so it reflects rank (largest = 0).
     results.sort(key=lambda c: (-c["size"], c["hub_node"]))
     for idx, c in enumerate(results):
         c["community_id"] = idx
