@@ -922,6 +922,189 @@ def _build_unified_neighbors(node_id: str, depth: int = 1) -> str:
     return "\n".join(lines)
 
 
+_FENCE_LANGS = {
+    ".php": "php",
+    ".js": "javascript",
+    ".ts": "typescript",
+    ".jsx": "javascript",
+    ".tsx": "typescript",
+    ".twig": "twig",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".json": "json",
+    ".html": "html",
+    ".css": "css",
+    ".md": "markdown",
+}
+
+
+def _fence_lang(rel: str) -> str:
+    """Return the markdown fence language tag for a relative file path."""
+    from os.path import splitext
+
+    return _FENCE_LANGS.get(splitext(rel)[1].lower(), "")
+
+
+def _build_neighborhood(
+    node_id: str,
+    depth: int = 1,
+    include_source: bool = True,
+    max_source_lines: int = 200,
+) -> str:
+    """Neighbors + source for ``symbol:`` nodes grouped by owning file.
+
+    Codegraph_explore-inspired bundler. Replaces ``get_unified_neighbors`` →
+    N × ``Read`` with a single call that returns:
+
+    1. The relationship map (delegated to ``_build_unified_neighbors``).
+    2. A source bundle: every reachable ``symbol:`` node's source slice,
+       grouped under its owning file's heading so the agent sees coherent
+       units instead of scattered snippets.
+    3. Header excerpts for any reachable ``file:`` node that has no
+       ``contains`` edge — covers Twig templates, YAML configs, and plain
+       function-only PHP files that aren't represented by class symbols.
+    4. A list of reachable articles (call ``get_articles`` for bodies).
+
+    Budgets: ``max_source_lines`` per symbol; total source output capped
+    at ``5 * max_source_lines`` to keep one call from blowing the agent's
+    context. Truncation is announced inline so the agent knows when to
+    drill in further.
+    """
+    depth = max(1, min(3, int(depth)))
+    graph = _cache.get_unified_graph()
+    nodes, edges = graph["nodes"], graph["edges"]
+    if node_id not in nodes:
+        return f"Node not found: `{node_id}`"
+
+    # BFS over both directions for `depth` hops.
+    adj: dict[str, set[str]] = {}
+    for e in edges:
+        adj.setdefault(e["from"], set()).add(e["to"])
+        adj.setdefault(e["to"], set()).add(e["from"])
+    visited = {node_id}
+    frontier = {node_id}
+    for _ in range(depth):
+        nxt = {t for n in frontier for t in adj.get(n, set())} - visited
+        visited |= nxt
+        frontier = nxt
+
+    # Bucket reachable nodes. Symbols group by their owning file — this is
+    # the codegraph_explore differentiator: agent sees `User` as a coherent
+    # unit, not 5 unrelated snippets. The root is included when it's a
+    # symbol; excluding it would be a UX trap — the agent asked about a
+    # specific symbol and would get source for everything except that one.
+    syms = _cache.get_call_graph().get("symbols", {})
+    by_file: dict[str, list[tuple[str, dict]]] = {}
+    article_ids: list[str] = []
+    template_ids: list[str] = []
+    for nid in visited:
+        kind = nodes[nid]["kind"]
+        if kind == "symbol":
+            info = syms.get(nid.removeprefix("symbol:"))
+            if info and info.get("file"):
+                by_file.setdefault(info["file"], []).append((nid, info))
+        elif kind == "article" and nid != node_id:
+            article_ids.append(nid)
+        elif kind == "template" and nid != node_id:
+            template_ids.append(nid)
+
+    root = nodes[node_id]
+    out: list[str] = [
+        f"# Neighborhood of `{node_id}` (depth={depth})",
+        f"- Kind: **{root['kind']}** · Label: {root.get('label', '')}",
+        f"- Reached {len(visited) - 1} nodes · "
+        f"{len(by_file)} source files · "
+        f"{len(article_ids)} articles · "
+        f"{len(template_ids)} templates",
+        "",
+        _build_unified_neighbors(node_id, depth=1),
+        "",
+    ]
+
+    if include_source and by_file:
+        out += ["---", "## Source bundle", ""]
+        budget = max_source_lines * 5
+        spent = 0
+        exhausted = False
+        for rel in sorted(by_file):
+            try:
+                file_lines = (PROJECT_ROOT / rel).read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            lang = _fence_lang(rel)
+            out.append(f"### `{rel}`")
+            out.append("")
+            for sym_id, info in sorted(by_file[rel], key=lambda x: x[1]["line"]):
+                start = int(info["line"])
+                end = int(info.get("end_line", start))
+                # Trust metadata for the truncation decision: a symbol's
+                # claimed length is what the index says it spans, even if the
+                # file got truncated post-indexing. Use the actual sliced
+                # content though — a shrunk file just gives us less to show.
+                claimed_len = end - start + 1
+                slice_ = file_lines[start - 1:end]
+                if claimed_len > max_source_lines:
+                    trimmed = claimed_len - max_source_lines
+                    slice_ = slice_[:max_source_lines] + [
+                        f"// ... {trimmed} more lines truncated"
+                    ]
+                # Charge the larger of (claimed, actual) so huge symbols
+                # exhaust the budget even when their truncated emission is
+                # small — the agent gets one slice + one signal to narrow.
+                spent += max(claimed_len, len(slice_))
+                out.append(f"**`{sym_id}`** — lines {start}-{end}")
+                out.append(f"```{lang}")
+                out.extend(slice_)
+                out.append("```")
+                out.append("")
+                if spent >= budget:
+                    out.append(
+                        f"_Source budget exhausted ({budget} lines). "
+                        f"Use `Read` or call this tool with a narrower node "
+                        f"for remaining symbols._"
+                    )
+                    exhausted = True
+                    break
+            if exhausted:
+                break
+
+    # Bare files (no `contains` edge → not represented by class symbols)
+    # get a header excerpt — typically Twig templates, YAML configs, or
+    # plain function-only PHP. Skip files already in the source bundle.
+    if include_source:
+        file_ids = {nid for nid in visited - {node_id} if nodes[nid]["kind"] == "file"}
+        files_with_classes = {
+            e["from"] for e in edges if e["kind"] == "contains" and e["from"] in file_ids
+        }
+        bundled = {f"file:{r}" for r in by_file}
+        bare_files = sorted(file_ids - files_with_classes - bundled)
+        if bare_files:
+            out += ["---", "## File headers (no classes extracted)", ""]
+            for fid in bare_files:
+                rel = fid.removeprefix("file:")
+                try:
+                    head = (PROJECT_ROOT / rel).read_text(encoding="utf-8").splitlines()[:40]
+                except OSError:
+                    continue
+                lang = _fence_lang(rel)
+                out += [f"### `{rel}`", f"```{lang}", *head, "```", ""]
+
+    if article_ids:
+        out += [
+            "---",
+            "## Related articles (call `get_articles` for full bodies)",
+            "",
+        ]
+        for aid in sorted(article_ids):
+            n = nodes[aid]
+            out.append(
+                f"- `{aid}` — **{n.get('label', '')}** "
+                f"(type={n.get('type', '?')}, conf={n.get('confidence', '?')})"
+            )
+
+    return "\n".join(out)
+
+
 def _build_communities(min_size: int = 3, top_n: int = 10) -> str:
     """Render the top-N largest semantic communities as markdown."""
     from scripts import communities as _comm
@@ -1036,6 +1219,31 @@ def _make_server():
         within depth=3) without chaining ``search_codebase`` after ``get_article``.
         """
         return _build_unified_neighbors(node_id, depth)
+
+    @server.tool()
+    def get_neighborhood(
+        node_id: str,
+        depth: int = 1,
+        include_source: bool = True,
+        max_source_lines: int = 200,
+    ) -> str:
+        """Neighbors + source for ``symbol:`` nodes grouped by file, in one call.
+
+        Combines ``get_unified_neighbors`` with source extraction for every
+        ``symbol:`` node in the neighborhood, grouped under its owning file's
+        heading. Bare ``file:`` nodes (Twig, YAML, plain-function PHP — no
+        classes extracted) get a 40-line header excerpt. Articles in the
+        neighborhood are listed (not inlined — use ``get_articles`` for those).
+
+        Use when orienting in an unfamiliar area instead of chaining
+        ``get_unified_neighbors`` → N × ``Read``.
+
+        - ``depth``: 1–3 (clamped), same as ``get_unified_neighbors``.
+        - ``include_source=False``: structure-only view, ~10× cheaper.
+        - ``max_source_lines``: per-symbol cap; total output capped at 5×.
+          Truncation is announced inline.
+        """
+        return _build_neighborhood(node_id, depth, include_source, max_source_lines)
 
     @server.tool()
     def get_communities(min_size: int = 3, top_n: int = 10) -> str:
