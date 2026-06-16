@@ -4,6 +4,22 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [0.2.0] — 2026-06-16
+
+Per-task code-intelligence context. The knowledge base already had a strong "USE FIRST" directive + deferred-tool unlock at session start; the code-intel MCP did not, so its tools were rarely reached for. This release closes that asymmetry and adds automatic, per-prompt context injection.
+
+### Added
+
+- **UserPromptSubmit auto-context hook** — `hooks/user-prompt-submit.py`. Regex-detects file paths, Symfony routes (`GET /x`), PascalCase classes, and Stimulus controllers in the user's prompt, resolves them to repo paths, and injects the matching code-intel builder output (`get_file_deps` / `trace_route`) under an "Auto-fetched code intelligence" heading. The expensive `mcp_server` import only happens on a match, so conversational prompts pay only the regex cost (~0). All failures degrade to empty context — the hook never blocks or breaks a turn. Wire it in the host project's `.claude/settings.json` under a `UserPromptSubmit` hook.
+
+### Changed
+
+- **`hooks/session-start.py`** — now injects a "Use Code Intelligence before touching code" block, the structural twin of the existing KB directive: its own one-call `ToolSearch` unlock for the code-intel tools plus a trigger table (`get_file_deps` before editing, `trace_route` for request flow, `impact_of_change` before merging, `get_template_graph` before Twig changes).
+
+### Notes
+
+- The auto-context hook is opt-in per project: add the `UserPromptSubmit` entry to that project's `.claude/settings.json`. The session-start directive needs no wiring — it ships inside the existing session-start hook output.
+
 ## [0.1.0] — 2026-04-27
 
 First versioned release. Establishes the upgrade contract (`VERSION` + `check_update.py` + `upgrade.py` + `/memory-compiler-upgrade` skill) and ships the SocratiCode-inspired capability port.
