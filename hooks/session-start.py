@@ -312,6 +312,37 @@ def build_context() -> str:
         "mechanical refactors, or when the codebase itself unambiguously answers."
     )
 
+    # Code-intelligence directive — the structural twin of the KB block above.
+    # Without an explicit "use first" nudge + unlock command, the code-intel
+    # tools (also deferred) get skipped: the agent edits files blind to their
+    # dependents, routes, and blast radius. A UserPromptSubmit hook auto-injects
+    # context when the prompt names a concrete entity, but that only fires when
+    # the user spells out a path/route/class — this block covers the rest.
+    ci_prefix = f"mcp__{slug}-code-intel__"
+    parts.append(
+        "## Use Code Intelligence before touching code\n\n"
+        "Before editing a file, tracing a request, or judging the blast radius "
+        "of a change, query the `code-intel` graph instead of re-deriving "
+        "structure by hand. These tools are also deferred — unlock them in ONE "
+        "ToolSearch call:\n\n"
+        "```\n"
+        f"ToolSearch(query=\"select:{ci_prefix}get_file_deps,"
+        f"{ci_prefix}trace_route,{ci_prefix}impact_of_change,"
+        f"{ci_prefix}get_template_graph\", max_results=4)\n"
+        "```\n\n"
+        "Triggers:\n"
+        "- **Before editing any PHP/Twig/JS file** → `get_file_deps(path)` "
+        "(who depends on it, what it depends on, routes/templates it touches)\n"
+        "- **Tracing a URL → handler → services** → `trace_route(method, path)`\n"
+        "- **Before merging / after editing** → `impact_of_change(file=..., "
+        "since_ref=\"main\")` (affected routes + Stimulus controllers, risk-scored)\n"
+        "- **Before changing a Twig template** → `get_template_graph(template)` "
+        "(inheritance chain, includes, Stimulus bindings)\n\n"
+        "When the prompt names a concrete file/route/class, a hook may already "
+        "have injected this context under \"Auto-fetched code intelligence\" — "
+        "use it, and reach for the tools above only for what it didn't cover."
+    )
+
     # Update notice — first thing after the date so the user (and the
     # agent) sees the upgrade prompt before diving into KB context.
     update_notice = get_update_notice()
