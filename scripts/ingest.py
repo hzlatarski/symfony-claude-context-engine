@@ -25,7 +25,7 @@ from pathlib import Path
 import time
 
 import ingest_state
-from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, KNOWLEDGE_DIR, MODEL_INGEST, now_iso
+from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, KNOWLEDGE_DIR, MODEL_INGEST, NO_WINDOW_CREATIONFLAGS, now_iso
 from source_handlers import get_handler
 from utils import (
     SourceGroup,
@@ -258,6 +258,7 @@ architectural patterns.
             timeout=600,
             cwd=str(PROJECT_ROOT),
             env=env,
+            creationflags=NO_WINDOW_CREATIONFLAGS,
         )
 
     try:

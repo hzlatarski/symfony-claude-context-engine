@@ -20,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, MODEL_COMPILE, now_iso
+from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, MODEL_COMPILE, NO_WINDOW_CREATIONFLAGS, now_iso
 from utils import (
     file_hash,
     list_raw_files,
@@ -192,6 +192,7 @@ Read the daily log above and compile it into wiki articles following the schema 
             timeout=600,
             cwd=project_root,
             env=env,
+            creationflags=NO_WINDOW_CREATIONFLAGS,
         )
 
     try:

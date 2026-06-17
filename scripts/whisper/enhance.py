@@ -18,7 +18,7 @@ from dataclasses import dataclass
 CLEAN_TIMEOUT_SECONDS = 30.0
 REWRITE_TIMEOUT_SECONDS = 60.0
 
-from config import MODEL_CLEAN, MODEL_REWRITE
+from config import MODEL_CLEAN, MODEL_REWRITE, NO_WINDOW_CREATIONFLAGS
 from whisper.types import EnhanceResult, Hit
 from whisper.prompts import CLEAN_SYSTEM_PROMPT, REWRITE_SYSTEM_PROMPT
 
@@ -71,6 +71,7 @@ def _run_claude(
             encoding="utf-8",
             timeout=timeout,
             env=env,
+            creationflags=NO_WINDOW_CREATIONFLAGS,
         )
     except subprocess.TimeoutExpired as exc:
         raise EnhanceError(f"{error_prefix} timed out after {timeout}s") from exc
