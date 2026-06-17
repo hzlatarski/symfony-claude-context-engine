@@ -4,9 +4,9 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
-## [Unreleased]
+## [0.3.1] — 2026-06-17
 
-Three features cherry-picked from the [obsidian-wiki](https://github.com/Ar9av/obsidian-wiki) LLM-wiki framework — the ideas it had that this engine lacked. All three are pure-Python and add zero LLM cost.
+Three features cherry-picked from the [obsidian-wiki](https://github.com/Ar9av/obsidian-wiki) LLM-wiki framework — the ideas it had that this engine lacked. All three are pure-Python and add zero LLM cost. Plus a Windows quality-of-life fix for the flashing `claude` console window.
 
 ### Added
 
