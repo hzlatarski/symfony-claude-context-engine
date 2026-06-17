@@ -42,6 +42,18 @@ sources:
     category: captured-memory
     description: "Persistent auto-memory from past Claude Code sessions"
 
+  # Other agents' conversation history, mined into ingestible markdown.
+  # Populate with: uv run python scripts/import_agent_history.py --agent all
+  # (writes knowledge/imported/<agent>/<date>-<id>.md), then run ingest.py so
+  # the sessions compile into articles like any other source.
+  - id: imported-agent-history
+    type: markdown
+    include:
+      - "../../knowledge/imported/**/*.md"
+    exclude: []
+    category: imported-agent-history
+    description: "Sessions mined from other agents (Codex, other Claude Code projects) via import_agent_history.py"
+
   # Drop zone for external material — save files into sources/articles/,
   # sources/notes/, or sources/pdfs/ then run ingest.py
   - id: external-articles
