@@ -370,6 +370,9 @@ respond with exactly: FLUSH_OK
         "--max-turns", "2",
     ]
 
+    # Windows: suppress the flashing `claude` console window on spawn.
+    no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
     def _run() -> subprocess.CompletedProcess:
         return subprocess.run(
             cmd,
@@ -380,6 +383,7 @@ respond with exactly: FLUSH_OK
             timeout=120,
             cwd=str(ROOT),
             env=env,
+            creationflags=no_window,
         )
 
     try:

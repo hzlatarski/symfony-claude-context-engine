@@ -101,6 +101,7 @@ def expand(transcript: str) -> Expansion:
             encoding="utf-8",
             timeout=EXPAND_TIMEOUT_SECONDS,
             env=env,
+            creationflags=config.NO_WINDOW_CREATIONFLAGS,
         )
     except subprocess.TimeoutExpired as exc:
         raise ExpansionError(f"claude CLI timed out after {EXPAND_TIMEOUT_SECONDS}s") from exc

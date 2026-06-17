@@ -4,6 +4,24 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [Unreleased]
+
+Three features cherry-picked from the [obsidian-wiki](https://github.com/Ar9av/obsidian-wiki) LLM-wiki framework — the ideas it had that this engine lacked. All three are pure-Python and add zero LLM cost.
+
+### Added
+
+- **Multi-agent history mining** — `scripts/import_agent_history.py` + `scripts/agent_adapters/` (registry mirroring `source_handlers`). Reads Codex (`~/.codex/sessions`) and other Claude Code projects (`~/.claude/projects`) transcript stores, normalizes each session to ingestible markdown under `knowledge/imported/<agent>/`, and feeds the existing `ingest.py` pipeline. Project-scoped by `cwd`, idempotent (content-hash skip), `--dry-run`/`--since`/`--limit`/`--project all` flags. Closes the blind spot where work done through agents other than this project's Claude Code never reached the KB. The adapter registry is the extension point for more agents (Hermes deferred — format unconfirmed). Adds the `imported-agent-history` source group to `sources.yaml.example`.
+- **Wikilink backfill** — `scripts/crosslink.py`. Scans articles for unlinked prose mentions of other articles' titles/aliases and appends `[[wikilinks]]` to `### Related Concepts` (graph-safe against the path-based wikilink format; no inline prose rewriting). Conservative whole-word case-insensitive matching, masks frontmatter/code/existing links, dry-run by default (`--apply` to write). Densifies the graph feeding `compiled-truth.md` scoring, `get_unified_neighbors`, and Leiden communities.
+- **Graph exports** — `scripts/export_graph.py`. Serializes the unified knowledge graph to GraphML (Gephi/yEd), Neo4j Cypher, a self-contained interactive HTML viewer (vis-network via CDN), or raw JSON. CLI `--format`/`--out`; default output under `knowledge/exports/`.
+
+### Fixed
+
+- **Flashing `claude` console window on Windows** — `flush.py`, `compile.py`, `ingest.py`, and the whisper spawners (`enhance.py`, `expand_query.py`) launched the `claude` CLI via `subprocess` without `CREATE_NO_WINDOW`, so each spawn allocated a visible console window (most visibly on every session-end flush). The Python launcher in `session-end.py`/`pre-compact.py` already suppressed its own window, but the grandchild CLI did not inherit it. All five subprocess spawners now pass a shared `NO_WINDOW_CREATIONFLAGS` (defined in `config.py`; `CREATE_NO_WINDOW` on win32, `0` no-op elsewhere). The Agent-SDK spawners (`canary.py`, `lint.py`, `query.py`) are unaffected by this fix — they spawn through the SDK, which does not expose `creationflags`.
+
+### Tests
+
+- 53 new tests (`test_import_agent_history.py` ·12, `test_crosslink.py` ·23, `test_export_graph.py` ·18), all pure-Python (no network/Chroma). Full suite otherwise unchanged.
+
 ## [0.3.0] — 2026-06-16
 
 ### Changed

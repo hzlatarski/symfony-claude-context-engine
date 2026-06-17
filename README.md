@@ -22,6 +22,9 @@ A long-term memory system for Claude Code, purpose-built for Symfony projects. S
 - 🛠 **Symfony code intelligence** — Live-parsing MCP tools: `get_codebase_overview`, `get_file_deps`, `get_route_map`, `get_template_graph`, `get_stimulus_map`, `get_hotspots`, `trace_route`, `impact_of_change`, `get_circular_dependencies`. Mtime-cached, sub-second. `trace_route` and `impact_of_change` accept `output_format="mermaid"` for flowchart rendering.
 - 👀 **Live file watcher** — `scripts/watch.py` runs alongside the viewer, debounces filesystem events, and incrementally reindexes both knowledge articles and codebase chunks within ~2s of any save. No more "I edited the article and `search_knowledge` still returns the old version" gap.
 - 🔗 **Cross-project linked search** — Set `MEMORY_COMPILER_LINKED_PROJECTS=/path/a,/path/b` and pass `include_linked=true` to `search_knowledge` to fan out a single query across multiple project knowledge bases. Results are RRF-merged and tagged with the originating project name.
+- 🕮 **[Multi-agent history mining](#multi-agent-history-mining)** — `scripts/import_agent_history.py` reads other agents' transcript stores (Codex `~/.codex/sessions`, other Claude Code projects `~/.claude/projects`) and normalizes each session into ingestible markdown under `knowledge/imported/<agent>/`. Zero LLM cost, idempotent, project-scoped by `cwd`. Closes the blind spot where work done outside *this* Claude Code project never reached the knowledge base. Adapter registry is the extension point for more agents.
+- 🪢 **[Wikilink backfill](#wikilink-backfill)** — `scripts/crosslink.py` scans every article for unlinked prose mentions of other articles' titles/aliases and weaves in `[[wikilinks]]` (appended to `### Related Concepts`, graph-safe against the path-based wikilink format). Pure Python, zero LLM cost, dry-run by default. Densifies the graph that feeds `compiled-truth.md` priority scoring, `get_unified_neighbors`, and the Leiden communities.
+- 🗺 **[Graph exports](#graph-exports)** — `scripts/export_graph.py` serializes the unified knowledge graph to GraphML (Gephi/yEd), Neo4j Cypher, a self-contained interactive HTML viewer (vis-network), or raw JSON — for visualization beyond the Obsidian vault and MCP tools.
 - 🛡 **Cross-process locking** — Concurrent writers (the file watcher, a `SessionEnd` flush, a manual `ingest.py`) coordinate via `filelock` against per-collection lock files under `knowledge/chroma/.locks/`. No more SQLite "database is locked" surprises.
 - ⏸ **Resumable, interruptible ingest** — Per-file content-hash checkpointing makes `ingest.py` crash-safe — re-running skips files whose hash matches the last successful run. Live progress is written to `knowledge/.ingest-status.json` and exposed via the `ingest_status` MCP tool. `ingest_stop` raises a cooperative-cancel flag the next file boundary honors.
 - 🩺 **`kb_health` MCP tool** — One-shot diagnostic: collection sizes, articles by memory type, broken `[src:]` anchors, quarantine count, last ingest timestamp. Replaces six manual scripts when you need to know "is the KB healthy?".
@@ -526,6 +529,9 @@ uv run pytest tests/whisper_tray/ -v
 ```bash
 # Knowledge pipeline
 uv run python scripts/compile.py               # compile daily logs → articles
+uv run python scripts/import_agent_history.py --agent all   # mine Codex/Claude history → knowledge/imported/
+uv run python scripts/crosslink.py             # preview wikilink backfill (add --apply to write)
+uv run python scripts/export_graph.py --format graphml      # export unified graph (graphml|cypher|html|json)
 uv run python scripts/ingest.py                # compile source files → articles
 uv run python scripts/ingest.py --all          # force re-ingest (per-file hash checkpoint still saves rerun cost)
 uv run python scripts/compile_truth.py         # regenerate compiled-truth.md (pure Python)
@@ -682,6 +688,67 @@ search_knowledge {
 Each linked project is searched in parallel (vector-only — cross-process BM25 isn't exposed) and merged into the local results via Reciprocal Rank Fusion. Hits are tagged with a `project` field — `"<local>"` for the current project, otherwise the linked project's directory name. Non-existent paths are silently skipped at search time, so a stale `LINKED_PROJECTS` won't break the call.
 
 **Constraints.** All linked projects must use the default Chroma embedder (this engine's bundled ONNX MiniLM). Cross-process BM25 indexes are intentionally not exposed: vector recall is good enough for the "have we seen this elsewhere?" use case, and a shared BM25 corpus would require either a remote service or a tighter coupling between projects than the env-var contract justifies.
+
+---
+
+## Multi-Agent History Mining
+
+The hooks capture *this* Claude Code project's sessions automatically. Work you do through **other** agents — Codex, or Claude Code in a different project — never reaches the knowledge base. `import_agent_history.py` closes that gap.
+
+```bash
+uv run python scripts/import_agent_history.py --agent all          # this project's sessions only
+uv run python scripts/import_agent_history.py --agent codex --project all   # every project Codex touched
+uv run python scripts/import_agent_history.py --agent claude --since 2026-06-01 --dry-run
+```
+
+It reads each agent's transcript store, parses sessions into a normalized model, and writes one markdown file per session to `knowledge/imported/<agent>/<date>-<short-id>.md` with `type: event` frontmatter. **Zero LLM cost** (pure parsing) and **idempotent** (re-runs skip files whose content is unchanged). By default only sessions whose `cwd` matches the current project are imported; `--project all` lifts that filter.
+
+| Agent | Store | Format |
+|---|---|---|
+| `codex` | `~/.codex/sessions/**/rollout-*.jsonl` | `session_meta` + `response_item` JSONL; user/assistant messages kept, `developer`/tool items dropped |
+| `claude` | `~/.claude/projects/<encoded>/*.jsonl` | message lines kept; `queue-operation`, hook attachments, and tool-only lines dropped |
+
+The imported files are picked up by the `imported-agent-history` source group in `sources.yaml` — run `ingest.py` afterward and the sessions compile into articles like any other source.
+
+**Extending to a new agent** (e.g. Hermes — not shipped, format unconfirmed): add `scripts/agent_adapters/<agent>.py` exposing `parse(lines) -> AgentSession`, `default_store()`, and a `glob`, then register it in `agent_adapters/__init__.py`. The CLI's `--agent` choices and `--agent all` read from the registry — no other code changes.
+
+---
+
+## Wikilink Backfill
+
+`crosslink.py` is a pure-Python, zero-cost pass that densifies the knowledge graph. It scans every article body for **unlinked prose mentions** of other articles' titles or aliases and adds the missing `[[wikilinks]]`.
+
+```bash
+uv run python scripts/crosslink.py            # dry-run preview (default)
+uv run python scripts/crosslink.py --apply    # write changes
+```
+
+Because this repo's wikilink syntax is **path-based** (`[[concepts/foo]]`) and does not support `[[slug|display]]` pipe aliases (a pipe would corrupt the graph node id), the pass does **not** rewrite prose inline. Instead, when article A mentions article B it appends `[[B-slug]]` to A's `### Related Concepts` section (creating the section under `## Truth` if absent). Matching is deliberately conservative — case-insensitive whole-word, titles/aliases longer than three characters, longest-first, and never inside frontmatter, fenced or inline code, existing wikilinks, or markdown links. It never links an article to itself or duplicates an existing link.
+
+A denser graph directly improves `compiled-truth.md` priority scoring (cross-linkedness is a weight), `get_unified_neighbors` traversal, and Leiden community detection.
+
+---
+
+## Graph Exports
+
+The unified graph (articles + call graph + `[src:]` citations) is reachable via MCP tools and an Obsidian vault, but sometimes you want it in an external tool. `export_graph.py` serializes it.
+
+```bash
+uv run python scripts/export_graph.py --format graphml   # → knowledge/exports/graph.graphml (Gephi / yEd)
+uv run python scripts/export_graph.py --format cypher     # → Neo4j CREATE/MERGE statements
+uv run python scripts/export_graph.py --format html       # → self-contained interactive viewer (vis-network)
+uv run python scripts/export_graph.py --format json       # → raw {nodes, edges}
+uv run python scripts/export_graph.py --format html --out /tmp/brain.html
+```
+
+| Format | Consumer | Notes |
+|---|---|---|
+| `graphml` | Gephi, yEd, NetworkX | Valid GraphML XML; node attrs `label`/`kind`/`type`/`confidence`, edge attrs `kind`/`confidence`/`relation`; all values XML-escaped |
+| `cypher` | Neo4j | `MERGE` per node + per relationship; idempotent re-import; string values escaped |
+| `html` | Any browser | Single self-contained file, force-directed layout, nodes colored by `kind`; loads `vis-network` from CDN |
+| `json` | Anything | Pretty-printed `{nodes, edges}` — the same dict the MCP graph tools traverse |
+
+Default output lives under `knowledge/exports/` (created on first run).
 
 ---
 

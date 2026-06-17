@@ -151,6 +151,16 @@ def _parse_extra_extensions() -> tuple[str, ...]:
 EXTRA_EXTENSIONS: tuple[str, ...] = _parse_extra_extensions()
 
 
+# ── Subprocess window suppression (Windows) ───────────────────────────
+# Spawning the `claude` CLI via subprocess on Windows allocates a visible
+# console window for the child process — a flashing popup on every flush /
+# compile / ingest. CREATE_NO_WINDOW suppresses it. The flag only exists on
+# win32; everywhere else this is 0 (a no-op). Apply it to every
+# subprocess.run/Popen that launches the `claude` CLI.
+import subprocess as _subprocess
+NO_WINDOW_CREATIONFLAGS = _subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
 def now_iso() -> str:
     """Current time in ISO 8601 format."""
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
