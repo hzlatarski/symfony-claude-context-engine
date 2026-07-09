@@ -25,7 +25,7 @@ from pathlib import Path
 import time
 
 import ingest_state
-from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, KNOWLEDGE_DIR, MODEL_INGEST, NO_WINDOW_CREATIONFLAGS, now_iso
+from config import AGENTS_FILE, CLAUDE_BIN, CONCEPTS_DIR, CONNECTIONS_DIR, KNOWLEDGE_DIR, MODEL_INGEST, NO_WINDOW_CREATIONFLAGS, now_iso
 from source_handlers import get_handler
 from utils import (
     SourceGroup,
@@ -240,7 +240,7 @@ architectural patterns.
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
 
     cmd = [
-        "claude", "-p",
+        CLAUDE_BIN, "-p",
         "--model", MODEL_INGEST,
         "--no-session-persistence",
         "--output-format", "text",

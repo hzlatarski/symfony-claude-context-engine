@@ -84,7 +84,7 @@ def expand(transcript: str) -> Expansion:
     """
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     cmd = [
-        "claude", "-p",
+        config.CLAUDE_BIN, "-p",
         "--model", config.MODEL_EXPAND,
         "--system-prompt", QUERY_EXPANSION_SYSTEM_PROMPT,
         "--no-session-persistence",

@@ -38,7 +38,7 @@ WIP_FILE = ROOT / "wip.md"
 # which silently landed session flushes at a stale path the rest of the
 # pipeline never saw.
 sys.path.insert(0, str(SCRIPTS_DIR))
-from config import DAILY_DIR  # noqa: E402
+from config import CLAUDE_BIN, DAILY_DIR  # noqa: E402
 
 # Set up file-based logging so we can verify the background process ran.
 # The parent process sends stdout/stderr to DEVNULL (to avoid the inherited
@@ -362,7 +362,7 @@ respond with exactly: FLUSH_OK
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
 
     cmd = [
-        "claude", "-p",
+        CLAUDE_BIN, "-p",
         "--model", model,
         "--no-session-persistence",
         "--tools", "",

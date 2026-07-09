@@ -20,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, MODEL_COMPILE, NO_WINDOW_CREATIONFLAGS, now_iso
+from config import AGENTS_FILE, CLAUDE_BIN, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, MODEL_COMPILE, NO_WINDOW_CREATIONFLAGS, now_iso
 from utils import (
     file_hash,
     list_raw_files,
@@ -174,7 +174,7 @@ Read the daily log above and compile it into wiki articles following the schema 
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
 
     cmd = [
-        "claude", "-p",
+        CLAUDE_BIN, "-p",
         "--model", MODEL_COMPILE,
         "--no-session-persistence",
         "--output-format", "text",

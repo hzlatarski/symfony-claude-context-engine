@@ -161,6 +161,45 @@ import subprocess as _subprocess
 NO_WINDOW_CREATIONFLAGS = _subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
+# ── Claude CLI binary resolution ──────────────────────────────────────
+# Never spawn a bare "claude" and trust PATH. The native installer drops the
+# binary in ~/.local/bin and appends that directory to the *persisted* user
+# PATH, but long-lived parents (VSCode, its extension host, explorer.exe) keep
+# the environment block they started with. Hooks spawned from those parents
+# inherit a PATH without ~/.local/bin, and subprocess dies with
+# FileNotFoundError [WinError 2] — which is silently swallowed into
+# FLUSH_ERROR, so sessions never reach the knowledge base.
+import shutil as _shutil
+import sys as _sys
+
+
+def _resolve_claude_bin() -> str:
+    override = os.environ.get("MEMORY_COMPILER_CLAUDE_BIN")
+    if override:
+        return override
+
+    found = _shutil.which("claude")
+    if found:
+        return found
+
+    _win = _sys.platform == "win32"
+    home = Path.home()
+    for candidate in (
+        home / ".local" / "bin" / ("claude.exe" if _win else "claude"),
+        home / ".claude" / "local" / ("claude.exe" if _win else "claude"),
+        home / "AppData" / "Roaming" / "npm" / "claude.cmd",
+    ):
+        if candidate.exists():
+            return str(candidate)
+
+    # Last resort: preserve the original behaviour so the failure is visible
+    # rather than masked by a wrong path.
+    return "claude"
+
+
+CLAUDE_BIN = _resolve_claude_bin()
+
+
 def now_iso() -> str:
     """Current time in ISO 8601 format."""
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")

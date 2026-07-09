@@ -18,7 +18,7 @@ from dataclasses import dataclass
 CLEAN_TIMEOUT_SECONDS = 30.0
 REWRITE_TIMEOUT_SECONDS = 60.0
 
-from config import MODEL_CLEAN, MODEL_REWRITE, NO_WINDOW_CREATIONFLAGS
+from config import CLAUDE_BIN, MODEL_CLEAN, MODEL_REWRITE, NO_WINDOW_CREATIONFLAGS
 from whisper.types import EnhanceResult, Hit
 from whisper.prompts import CLEAN_SYSTEM_PROMPT, REWRITE_SYSTEM_PROMPT
 
@@ -54,7 +54,7 @@ def _run_claude(
     """
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     cmd = [
-        "claude", "-p",
+        CLAUDE_BIN, "-p",
         "--model", model,
         "--system-prompt", system_prompt,
         "--no-session-persistence",
