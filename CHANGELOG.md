@@ -4,6 +4,14 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [0.4.1] — 2026-07-11
+
+### Changed
+
+- fix(upgrade): reconfigure stdout/stderr to UTF-8 so upgrade never exits non-zero on Windows
+- feat: Graphify-inspired improvements + richer auto-injection (v0.4.0)
+- fix(subprocess): resolve claude binary explicitly instead of trusting PATH
+
 ## [0.4.0] — 2026-07-11
 
 Four improvements adapted from [Graphify](https://github.com/Graphify-Labs/graphify)'s code-intelligence graph — the ideas it had that this engine lacked, filtered to what fits a curated + retrieval hybrid (its "no embeddings" thesis and multi-LLM backends were deliberately *not* adopted). All four are pure-Python and add zero LLM cost.
