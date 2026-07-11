@@ -29,6 +29,17 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Windows consoles default to cp1252, which can't encode the glyphs used in
+# progress output ("→", "…") and would raise UnicodeEncodeError on the final
+# success line — corrupting the exit code even though the upgrade succeeded.
+# Prefer UTF-8 where the stream supports it; fall back to error replacement so
+# a non-reconfigurable stream still never crashes on an un-encodable glyph.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent
 for _p in (str(_ROOT), str(_HERE)):
