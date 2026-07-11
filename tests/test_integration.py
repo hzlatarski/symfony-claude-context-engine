@@ -12,13 +12,14 @@ from scripts.parsers import PROJECT_ROOT, git_intel
 def test_success_criterion_1_file_deps_under_1s():
     """get_file_deps must return in under 1 second (with all caches warm).
 
-    _build_file_deps for a PHP entity reads PHP graph + route map + git intel,
-    so all three caches must be warm before timing to avoid measuring one-off
-    subprocess/disk costs.
+    _build_file_deps for a PHP entity reads PHP graph + route map + git intel
+    + the call graph (for the Inline Rationale section), so all four caches
+    must be warm before timing to avoid measuring one-off subprocess/disk costs.
     """
     mcp_server._cache.get_php_graph()
     mcp_server._cache.get_route_map()
     mcp_server._cache.get_git_intel()
+    mcp_server._cache.get_call_graph()
     start = time.time()
     result = mcp_server._build_file_deps("src/Entity/User.php")
     elapsed = time.time() - start

@@ -15,6 +15,7 @@ caches to knowledge/git-intel.json (HEAD-based invalidation).
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -292,6 +293,29 @@ def _file_deps_php(file_path: str) -> str:
             for p in hotspot["co_change_partners"][:5]:
                 lines.append(f"  - {p['file']} (score={p['score']})")
 
+    # Inline rationale (WHY / HACK / TODO / @deprecated). Parse ONLY this one
+    # file — a single tree-sitter pass, ~milliseconds. Do NOT touch the whole
+    # call graph here: the UserPromptSubmit hook imports _build_file_deps into a
+    # fresh cold process per prompt, so anything that parses (or disk-caches)
+    # all of src/**/*.php would make every PHP-naming prompt pay for the whole
+    # tree. find_rationale (the cross-codebase view) uses the warm ParseCache;
+    # this per-file view stays cheap.
+    rationale_rows: list[tuple[int, str, str]] = []
+    try:
+        abs_path = PROJECT_ROOT / file_path
+        syms, _edges, classes = call_graph._parse_file(abs_path, file_path)
+        for info in list(syms.values()) + list(classes.values()):
+            for n in info.get("rationale", []):
+                rationale_rows.append((n.get("line", 0), n.get("tag", ""), n.get("text", "")))
+    except Exception:  # noqa: BLE001 — rationale is a best-effort add-on
+        rationale_rows = []
+    if rationale_rows:
+        rationale_rows.sort()
+        lines.append("")
+        lines.append("## Inline Rationale")
+        for line_no, tag_name, text in rationale_rows:
+            lines.append(f"- L{line_no} **{tag_name}**: {text}")
+
     return "\n".join(lines)
 
 
@@ -442,11 +466,34 @@ def _build_stimulus_map(controller: str = "") -> str:
     return "\n".join(lines)
 
 
+# Entity getter/setter calls (User::setEmail, User::getId, …) dominate a trace
+# tree without adding architectural signal — a real usefulness complaint. We
+# collapse leaf calls to `\Entity\` accessors into a single summary line per
+# parent so the meaningful service/repository hops stand out.
+_ACCESSOR_METHOD_RE = re.compile(r"^(get|set|is|has|add|remove)[A-Z0-9_]")
+
+
+def _is_entity_accessor(node: dict) -> bool:
+    """True if ``node`` is a childless call to a getter/setter on an Entity class."""
+    if node.get("children") or node.get("truncated"):
+        # A setter that does real work isn't noise; a cycle-/depth-truncated
+        # node must keep its own line so the ``_(cycle)_`` marker isn't lost.
+        return False
+    symbol = node.get("symbol", "")
+    if "::" not in symbol:
+        return False
+    class_part, _, method = symbol.rpartition("::")
+    if "\\Entity\\" not in class_part:
+        return False
+    return bool(_ACCESSOR_METHOD_RE.match(method))
+
+
 def _build_trace_route(
     method: str,
     path: str,
     max_depth: int = 6,
     output_format: str = "text",
+    collapse_accessors: bool = True,
 ) -> str:
     """Trace the call graph from a route's controller action down through services + repos.
 
@@ -501,11 +548,17 @@ def _build_trace_route(
             f"- `{from_id}` (no symbol — controller action not picked up by call graph)"
         )
     else:
-        _render_trace_node(tree, lines, indent=0, is_root=True)
+        _render_trace_node(tree, lines, indent=0, is_root=True, collapse_accessors=collapse_accessors)
     return "\n".join(lines)
 
 
-def _render_trace_node(node: dict, lines: list[str], indent: int, is_root: bool) -> None:
+def _render_trace_node(
+    node: dict,
+    lines: list[str],
+    indent: int,
+    is_root: bool,
+    collapse_accessors: bool = True,
+) -> None:
     """Append one indented line per node in the trace tree, depth-first.
 
     A ``missing=True`` flag (target not in local symbol table — vendor or
@@ -525,8 +578,29 @@ def _render_trace_node(node: dict, lines: list[str], indent: int, is_root: bool)
         ev_text = f" :: `{evidence}`" if evidence else ""
         kind_tag = f"[{kind}]"
         lines.append(f"{prefix}{kind_tag} `{node['symbol']}`{conf_text}{ev_text}{marker_text}")
-    for child in node["children"]:
-        _render_trace_node(child, lines, indent + 1, is_root=False)
+
+    children = node["children"]
+    if collapse_accessors:
+        accessors = [c for c in children if _is_entity_accessor(c)]
+        rest = [c for c in children if not _is_entity_accessor(c)]
+    else:
+        accessors, rest = [], children
+
+    for child in rest:
+        _render_trace_node(child, lines, indent + 1, is_root=False, collapse_accessors=collapse_accessors)
+
+    if accessors:
+        child_prefix = "  " * (indent + 1) + "- "
+        names = [a["symbol"].rpartition("::")[0].rsplit("\\", 1)[-1] + "::" + a["symbol"].rpartition("::")[2]
+                 for a in accessors]
+        # Dedup while preserving order (the same setter can appear twice).
+        seen: set[str] = set()
+        uniq = [n for n in names if not (n in seen or seen.add(n))]
+        shown = ", ".join(uniq[:6])
+        more = f" +{len(uniq) - 6} more" if len(uniq) > 6 else ""
+        lines.append(
+            f"{child_prefix}_[{len(accessors)} entity accessor call(s) collapsed]_ {shown}{more}"
+        )
 
 
 def _run_git_diff(since_ref: str, file: str | None = None) -> str:
@@ -547,6 +621,118 @@ def _run_git_diff(since_ref: str, file: str | None = None) -> str:
         ).decode("utf-8", errors="replace")
     except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         return ""
+
+
+def _git_lines(args: list[str]) -> list[str]:
+    """Run ``git <args>`` in PROJECT_ROOT, return non-empty stripped stdout lines.
+
+    Returns ``[]`` on any git failure (missing ref, not a repo, git absent) —
+    callers treat empty as "nothing / unavailable".
+    """
+    try:
+        out = subprocess.check_output(
+            ["git", *args],
+            cwd=str(PROJECT_ROOT),
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace")
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return []
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+# Branch-name prefixes auto-detection skips by default. This repo's worktree
+# workflow mints a `backup/main-pre-merge-<date>` safety branch on every merge;
+# each is "ahead of main" by a whole feature and would flood the report. Pass
+# explicit `branches` to override.
+_MERGE_RISK_SKIP_PREFIXES = ("backup/", "archive/", "wip/", "tmp/")
+
+
+def _branches_ahead_of(base: str, max_branches: int) -> list[str]:
+    """Local branches (excluding ``base`` + noise prefixes) ahead of ``base``."""
+    all_branches = _git_lines(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
+    ahead: list[str] = []
+    for b in all_branches:
+        if b == base or b.startswith(_MERGE_RISK_SKIP_PREFIXES):
+            continue
+        cnt = _git_lines(["rev-list", "--count", f"{base}..{b}"])
+        if cnt and cnt[0].isdigit() and int(cnt[0]) > 0:
+            ahead.append(b)
+        if len(ahead) >= max_branches:
+            break
+    return ahead
+
+
+def _branch_ancestry(branches: list[str]) -> set[tuple[str, str]]:
+    """Return ``{(ancestor, descendant)}`` for every ordered pair that is one.
+
+    Uses ``git merge-base --is-ancestor a b`` (exit 0 ⇒ a is an ancestor of
+    b). O(n²) subprocesses, but ``branches`` is capped small (≤ max_branches).
+    """
+    pairs: set[tuple[str, str]] = set()
+    for a in branches:
+        for b in branches:
+            if a == b:
+                continue
+            try:
+                rc = subprocess.call(
+                    ["git", "merge-base", "--is-ancestor", a, b],
+                    cwd=str(PROJECT_ROOT),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                )
+            except (FileNotFoundError, OSError):
+                return set()
+            if rc == 0:
+                pairs.add((a, b))
+    return pairs
+
+
+def _build_merge_order_risk(
+    base: str = "main",
+    branches: list[str] | None = None,
+    max_branches: int = 12,
+) -> str:
+    """Assess merge-order conflict risk across in-flight branches.
+
+    Auto-detects local branches ahead of ``base`` when ``branches`` is not
+    given, diffs each against ``base`` (three-dot / merge-base), maps the
+    changed files into unified-graph communities, and reports direct file
+    conflicts + community-overlap coupling risk.
+    """
+    from scripts import communities as _comm, merge_risk
+    from scripts.config import KNOWLEDGE_DIR
+
+    graph = _cache.get_unified_graph()
+    # min_size=2 so even small clusters participate (same partition as
+    # find_community), maximizing overlap detection.
+    cache_path = KNOWLEDGE_DIR / "communities.min2.json"
+    clusters = _comm.load_or_compute(graph, cache_path=cache_path, min_size=2)
+    node_community = merge_risk.build_node_community_map(clusters)
+
+    if branches is None:
+        branches = _branches_ahead_of(base, max_branches)
+    else:
+        branches = [b for b in branches if b != base][:max_branches]
+
+    if not branches:
+        return (
+            f"No branches found ahead of `{base}`. Nothing in flight to compare. "
+            f"(Pass explicit branch names, or check that `{base}` exists.)"
+        )
+
+    branch_files: dict[str, list[str]] = {}
+    for b in branches:
+        files = _git_lines(["diff", "--name-only", f"{base}...{b}"])
+        branch_files[b] = [f.replace("\\", "/") for f in files]
+
+    # Detect stacked branches so we don't report a parent's files restated in
+    # a child's diff as a conflict.
+    ancestry = _branch_ancestry(branches)
+
+    result = merge_risk.compute(branch_files, node_community, ancestry=ancestry)
+    return merge_risk.render(result, base)
 
 
 def _build_impact_of_change(
@@ -922,6 +1108,93 @@ def _build_unified_neighbors(node_id: str, depth: int = 1) -> str:
     return "\n".join(lines)
 
 
+def _build_trace_path(from_node: str, to_node: str, max_depth: int = 8) -> str:
+    """Shortest connection between two nodes in the unified graph.
+
+    BFS over the undirected projection (edge direction is informational —
+    "how are these related?" doesn't care which way an edge points, matching
+    the community-detection projection). Returns the hop-by-hop path with the
+    edge kind / relation / confidence annotating each step, so the agent sees
+    *why* two concepts are connected — e.g. an article that cites a file whose
+    class defines a symbol that another article also cites.
+
+    ``max_depth`` (clamped ``[1, 12]``) bounds the search: if the shortest
+    path is longer, the tool reports the nodes as not connected within that
+    many hops rather than walking the whole graph.
+    """
+    max_depth = max(1, min(12, int(max_depth)))
+    graph = _cache.get_unified_graph()
+    nodes, edges = graph["nodes"], graph["edges"]
+
+    missing = [n for n in (from_node, to_node) if n not in nodes]
+    if missing:
+        return "Node(s) not found in unified graph: " + ", ".join(f"`{m}`" for m in missing)
+    if from_node == to_node:
+        return f"`{from_node}` is the same node — path length 0."
+
+    # Adjacency with the connecting edge + direction relative to traversal.
+    adj: dict[str, list[tuple[str, dict, str]]] = {}
+    for e in edges:
+        adj.setdefault(e["from"], []).append((e["to"], e, "→"))
+        adj.setdefault(e["to"], []).append((e["from"], e, "←"))
+
+    # BFS carrying (prev_node, edge, arrow) so we can reconstruct + annotate.
+    parent: dict[str, tuple[str, dict, str]] = {from_node: ("", {}, "")}
+    frontier = [from_node]
+    depth = 0
+    found = False
+    while frontier and depth < max_depth and not found:
+        nxt: list[str] = []
+        for n in frontier:
+            for neighbor, edge, arrow in adj.get(n, ()):
+                if neighbor in parent:
+                    continue
+                parent[neighbor] = (n, edge, arrow)
+                if neighbor == to_node:
+                    found = True
+                    break
+                nxt.append(neighbor)
+            if found:
+                break
+        frontier = nxt
+        depth += 1
+
+    if to_node not in parent:
+        return (
+            f"No path from `{from_node}` to `{to_node}` within {max_depth} hops. "
+            f"They may be in disconnected components — try `find_community` on each."
+        )
+
+    # Reconstruct the path from to_node back to from_node.
+    chain: list[tuple[str, dict, str]] = []
+    cur = to_node
+    while cur != from_node:
+        prev, edge, arrow = parent[cur]
+        chain.append((cur, edge, arrow))
+        cur = prev
+    chain.reverse()
+
+    def _label(nid: str) -> str:
+        n = nodes.get(nid, {})
+        return f"{n.get('kind', '?')}:{n.get('label', nid)}"
+
+    lines = [
+        f"# Path: `{from_node}` → `{to_node}`",
+        f"- Hops: **{len(chain)}**",
+        "",
+        f"1. `{from_node}` — {_label(from_node)}",
+    ]
+    for i, (nid, edge, arrow) in enumerate(chain, start=2):
+        kind = edge.get("kind", "?")
+        extra = ""
+        if "relation" in edge:
+            extra = f", relation={edge['relation']}"
+        elif "confidence" in edge:
+            extra = f", conf={edge['confidence']}"
+        lines.append(f"{i}. {arrow} *[{kind}{extra}]* `{nid}` — {_label(nid)}")
+    return "\n".join(lines)
+
+
 _FENCE_LANGS = {
     ".php": "php",
     ".js": "javascript",
@@ -1132,6 +1405,66 @@ def _build_communities(min_size: int = 3, top_n: int = 10) -> str:
     return "\n".join(lines)
 
 
+def _build_find_rationale(tag: str | None = None, query: str | None = None, limit: int = 100) -> str:
+    """List inline rationale comments (WHY / HACK / TODO / @deprecated / …).
+
+    Scans the call graph's per-symbol and per-class ``rationale`` buckets —
+    design-intent comments the parser lifted out of ``src/**/*.php``. Filter
+    by ``tag`` (case-insensitive exact match) and/or ``query`` (case-
+    insensitive substring over the comment text). Results are grouped by
+    file so related notes read together.
+    """
+    cg = _cache.get_call_graph()
+    tag_up = tag.upper() if tag else None
+    q_low = query.lower() if query else None
+
+    # Collect (file, line, tag, text, owner) rows from symbols + classes.
+    rows: list[tuple[str, int, str, str, str]] = []
+    for sid, info in cg.get("symbols", {}).items():
+        for n in info.get("rationale", []):
+            rows.append((info.get("file", ""), n.get("line", 0), n.get("tag", ""), n.get("text", ""), sid))
+    for fqcn, info in cg.get("classes", {}).items():
+        for n in info.get("rationale", []):
+            rows.append((info.get("file", ""), n.get("line", 0), n.get("tag", ""), n.get("text", ""), fqcn))
+
+    filtered = [
+        r for r in rows
+        if (tag_up is None or r[2] == tag_up)
+        and (q_low is None or q_low in (r[3] or "").lower())
+    ]
+    if not filtered:
+        crit = []
+        if tag:
+            crit.append(f"tag={tag}")
+        if query:
+            crit.append(f"query={query!r}")
+        suffix = f" matching {', '.join(crit)}" if crit else ""
+        return f"No inline rationale comments found{suffix}."
+
+    filtered.sort(key=lambda r: (r[0], r[1]))
+    total = len(filtered)
+    by_tag: dict[str, int] = {}
+    for r in filtered:
+        by_tag[r[2]] = by_tag.get(r[2], 0) + 1
+
+    lines = [
+        f"# Inline rationale ({total} comment{'s' if total != 1 else ''})",
+        "- By tag: " + ", ".join(f"{k}={v}" for k, v in sorted(by_tag.items())),
+        "",
+    ]
+    current_file = None
+    for file_path, line, tag_name, text, owner in filtered[:limit]:
+        if file_path != current_file:
+            current_file = file_path
+            lines.append(f"## {file_path}")
+        owner_short = owner.rsplit("\\", 1)[-1]
+        lines.append(f"- L{line} **{tag_name}** ({owner_short}): {text}")
+    if total > limit:
+        lines.append("")
+        lines.append(f"_… {total - limit} more truncated. Narrow with tag= or query=._")
+    return "\n".join(lines)
+
+
 def _build_find_community(node_id: str) -> str:
     """Report which community a given node belongs to + sibling members."""
     from scripts import communities as _comm
@@ -1246,6 +1579,31 @@ def _make_server():
         return _build_neighborhood(node_id, depth, include_source, max_source_lines)
 
     @server.tool()
+    def trace_path(from_node: str, to_node: str, max_depth: int = 8) -> str:
+        """Find the shortest connection between two nodes in the unified graph.
+
+        Answers "how is X related to Y?" — e.g. how a controller symbol
+        connects to a knowledge article, or how two articles relate through
+        shared code. Complements ``get_unified_neighbors`` (which shows the
+        radius around one node) by returning the actual chain *between* two.
+
+        Node IDs use the same prefixes as ``get_unified_neighbors``:
+        ``article:concepts/foo``, ``file:src/Foo.php``,
+        ``class:App\\Service\\Foo``, ``symbol:App\\Service\\Foo::bar``,
+        ``template:foo.html.twig``, ``note:src/Foo.php:42``.
+
+        Args:
+            from_node / to_node: fully-qualified node IDs.
+            max_depth: hop budget, clamped to ``[1, 12]`` (default 8).
+
+        Returns:
+            A numbered hop-by-hop path with each step annotated by the edge
+            kind (cites / wikilink / call / defines / annotates / …) and its
+            relation or confidence, or a friendly "no path" message.
+        """
+        return _build_trace_path(from_node, to_node, max_depth)
+
+    @server.tool()
     def get_communities(min_size: int = 3, top_n: int = 10) -> str:
         """List the top-N semantic communities in the unified knowledge graph.
 
@@ -1274,6 +1632,31 @@ def _make_server():
         return _build_find_community(node_id)
 
     @server.tool()
+    def find_rationale(tag: str | None = None, query: str | None = None) -> str:
+        """Surface inline design-intent comments across the PHP codebase.
+
+        The parser lifts rationale comments — ``// WHY:``, ``// HACK``,
+        ``// TODO:``, ``// FIXME``, ``/** @deprecated */``, and similar — out
+        of ``src/**/*.php`` and attaches them to the method or class they
+        annotate. This tool lists them so you can answer "where are the known
+        hacks / deprecations / TODOs?" without grepping, and understand *why*
+        a piece of code is the way it is before changing it.
+
+        Recognized tags: WHY, HACK, NOTE, TODO, FIXME, XXX, BUG, WARNING,
+        OPTIMIZE, DEPRECATED (``@deprecated`` folds into DEPRECATED).
+
+        Args:
+            tag: restrict to one tag (case-insensitive), e.g. ``HACK`` or
+                ``DEPRECATED``. Omit for all tags.
+            query: case-insensitive substring filter over the comment text.
+
+        Returns:
+            Markdown grouped by file: ``L<line> **TAG** (owner): text``,
+            with a per-tag count header.
+        """
+        return _build_find_rationale(tag=tag, query=query)
+
+    @server.tool()
     def impact_of_change(
         file: str | None = None,
         since_ref: str = "HEAD",
@@ -1298,6 +1681,7 @@ def _make_server():
         path: str,
         max_depth: int = 6,
         output_format: str = "text",
+        collapse_accessors: bool = True,
     ) -> str:
         """Trace the call graph from a route's controller action down through services + repositories.
 
@@ -1305,11 +1689,48 @@ def _make_server():
         Doctrine ``getRepository(X::class)`` chains. Templates rendered via
         ``$this->render()`` appear as leaves marked ``[render]``.
 
+        ``collapse_accessors`` (default True) folds childless getter/setter
+        calls to ``\\Entity\\`` classes (``User::setEmail`` …) into one summary
+        line per parent, so the architecturally-meaningful service/repository
+        hops aren't buried. Set False for the fully-expanded tree.
+
         Set ``output_format='mermaid'`` to receive a ``flowchart TD`` block
         instead of an indented bullet tree — the diagram form scales much
         better past depth 3.
         """
-        return _build_trace_route(method, path, max_depth, output_format)
+        return _build_trace_route(method, path, max_depth, output_format, collapse_accessors)
+
+    @server.tool()
+    def merge_order_risk(
+        base: str = "main",
+        branches: list[str] | None = None,
+    ) -> str:
+        """Assess which in-flight branches will collide, and in what order to merge.
+
+        Purpose-built for this repo's reality: a chronically-dirty ``main`` and
+        several feature branches / worktrees open at once. Surfaces two risks
+        plain ``git`` can't rank for you:
+
+        - **Direct file conflicts** — the same file changed on 2+ branches
+          (git *will* conflict; merge those back-to-back).
+        - **Community-overlap risk** — different files in the same semantic
+          cluster (Leiden community over the unified graph): no textual
+          conflict, but a coupling risk worth reviewing together. This is the
+          signal that catches "these two branches both reshape the billing
+          subsystem from different files."
+
+        Args:
+            base: branch to compare against (default ``main``). Use ``master``
+                for the prod mainline in this repo if that's your target.
+            branches: explicit branch names to compare. Omit to auto-detect
+                every local branch with commits ahead of ``base`` (capped 12).
+
+        Returns:
+            A markdown report: per-branch summary, direct conflicts (merge
+            these adjacent), and community-overlap pairs (review together,
+            smaller change first).
+        """
+        return _build_merge_order_risk(base=base, branches=branches)
 
     @server.tool()
     def get_circular_dependencies(

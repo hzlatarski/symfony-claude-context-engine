@@ -36,7 +36,37 @@ PROJECT_ROOT = ROOT.parent.parent                      # repo root (AiTutor)
 MAX_FILES = 3
 MAX_ROUTES = 2
 MAX_SECTION_CHARS = 1_600
-MAX_TOTAL_CHARS = 7_000
+MAX_TOTAL_CHARS = 9_000
+MAX_CODEBASE_HITS = 3
+MAX_KB_HITS = 4
+
+# Conceptual-question triggers. When the prompt has NO concrete code entity but
+# DOES read like a why/decision/how question, we run a KB search so the curated
+# knowledge base is surfaced automatically — the gap where the code-entity
+# regexes match nothing and the agent would otherwise never see the KB.
+#
+# Stems use ``\w*`` so derivatives fire too (reason→reasons/reasoning,
+# strateg→strategy/strategic, architect→architecture) — a plain trailing ``\b``
+# silently killed every plural/derivative. Bare domain nouns (grading, scenario,
+# persona, pricing) are deliberately NOT triggers: they're everyday nouns in
+# this codebase and would fire the ~1.5s KB load on ordinary mechanical prompts
+# ("improve the grading UI", "bump the persona image size"). We trigger on
+# genuine question/decision language instead.
+_CONCEPTUAL_RE = re.compile(
+    r"\b(?:"
+    r"why|reason\w*|rational\w*|purpose|"
+    r"decision\w*|decid\w*|"
+    r"architect\w*|approach\w*|trade-?off\w*|convention\w*|prefer\w*|strateg\w*|"
+    r"how (?:does|do we|is|are|should|did)|"
+    r"we (?:discussed|decided|agreed)|the decision|"
+    r"what.?s the (?:point|purpose|reason)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_conceptual(prompt: str) -> bool:
+    return bool(_CONCEPTUAL_RE.search(prompt))
 
 # Hook disable mechanism, mirroring the other memory-compiler hooks.
 _disabled = os.environ.get("MEMORY_COMPILER_DISABLED_HOOKS", "").lower().split(",")
@@ -146,10 +176,94 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + "\n…(truncated)"
 
 
+# -----------------------------------------------------------------------------
+# Section builders (each self-contained + failure-isolated — one broken section
+# must never suppress the others or break the turn).
+# -----------------------------------------------------------------------------
+
+def _kb_section(prompt: str) -> str:
+    """Top curated-KB matches for a conceptual prompt (hybrid BM25+vector).
+
+    Cold cost measured at ~1.3s (import + query) — well inside the hook
+    budget. Uses the same `_search_knowledge_impl` the MCP tool exposes.
+    """
+    try:
+        from scripts.knowledge_mcp_server import _search_knowledge_impl
+        hits = _search_knowledge_impl(query=prompt, limit=MAX_KB_HITS, mode="hybrid")
+    except Exception:
+        return ""
+    if not hits:
+        return ""
+    lines = [
+        "## Auto-fetched knowledge base",
+        "",
+        "Your prompt reads like a why/decision/how question. Top matches from the "
+        "curated KB — call `get_article(slug)` for the full body, or "
+        "`search_knowledge` for more/filtered results:",
+        "",
+    ]
+    for h in hits:
+        slug = h.get("slug")
+        snippet = (h.get("snippet") or "").replace("\n", " ")
+        md = h.get("metadata") or {}
+        mtype = md.get("type")
+        conf = md.get("confidence")
+        meta = f" _(type={mtype}, conf={conf})_" if mtype else ""
+        lines.append(f"- **{slug}**{meta} — {snippet}")
+    return "\n".join(lines)
+
+
+def _codebase_section(prompt: str, exclude_rels: set[str]) -> str:
+    """Semantically-related code chunks not already named in the prompt.
+
+    Exclusion and dedup are by **basename**: the codebase index can key the
+    same file under both a repo-relative path and a bare filename (a Windows
+    drive-letter-case fallback in index_codebase), so `src/Foo.php` and
+    `Foo.php` are the same hit — comparing full paths would leak the named
+    file back in and let duplicates crowd out the slots. Over-fetch generously
+    since the prompt usually names the most-similar file itself.
+    """
+    exclude_names = {r.rsplit("/", 1)[-1] for r in exclude_rels}
+    try:
+        from scripts.knowledge_mcp_server import _search_codebase_impl
+        hits = _search_codebase_impl(query=prompt, limit=MAX_CODEBASE_HITS * 2 + len(exclude_rels) + 2)
+    except Exception:
+        return ""
+    rows = []
+    seen_base: set[str] = set()
+    for h in hits:
+        rel = (h.get("path") or "").split(":")[0]
+        # Skip indexed copies living in sibling worktrees / vendor — they're
+        # duplicates of real src files and pure noise in a "related code" list.
+        if ".worktrees/" in rel or rel.startswith("vendor/"):
+            continue
+        base = rel.rsplit("/", 1)[-1]
+        if not base or base in exclude_names or base in seen_base:
+            continue
+        seen_base.add(base)
+        rows.append(h)
+        if len(rows) >= MAX_CODEBASE_HITS:
+            break
+    if not rows:
+        return ""
+    lines = [
+        "## Auto-fetched related code",
+        "",
+        "Semantically-related code the dependency graph does not directly link:",
+        "",
+    ]
+    for h in rows:
+        sym = f" — {h['symbols']}" if h.get("symbols") else ""
+        lines.append(f"- `{h.get('path')}`{sym}")
+    return "\n".join(lines)
+
+
 def main() -> None:
     # 1. Read the prompt (stdin JSON). Failure → no-op.
     try:
         payload = json.loads(sys.stdin.read() or "{}")
+        if not isinstance(payload, dict):
+            _emit("")
         prompt = payload.get("prompt", "") or ""
     except (json.JSONDecodeError, ValueError):
         _emit("")
@@ -157,52 +271,68 @@ def main() -> None:
     if not prompt.strip():
         _emit("")
 
-    # 2. Cheap entity extraction. If nothing matched, exit before the costly
-    #    import — conversational prompts pay only the regex cost.
+    # 2. Cheap entity extraction + conceptual sniff. If nothing at all matched,
+    #    exit before any costly import — conversational prompts pay only regex.
     files = _resolve_files(prompt)
     routes = _resolve_routes(prompt)
-    if not files and not routes:
+    conceptual = _looks_conceptual(prompt)
+    if not files and not routes and not conceptual:
         _emit("")
 
-    # 3. Now (and only now) import the code-intel builders. Wrapped so an import
-    #    or parse failure degrades to no injected context, never a broken turn.
-    sections: list[str] = []
-    try:
-        if str(ROOT) not in sys.path:
-            sys.path.insert(0, str(ROOT))
-        from scripts.mcp_server import _build_file_deps, _build_trace_route
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
 
-        _MISS_MARKERS = ("not found", "Unknown file type", "No route found")
+    # 3. Code-intel sections (structure from the graph). Failure-isolated so a
+    #    parse error here still lets the KB section below run.
+    code_sections: list[str] = []
+    if files or routes:
+        try:
+            from scripts.mcp_server import _build_file_deps, _build_trace_route
 
-        for rel in files:
-            out = _build_file_deps(rel)
-            if out and not any(m in out for m in _MISS_MARKERS):
-                sections.append(f"### `{rel}`\n{_clip(out, MAX_SECTION_CHARS)}")
+            _MISS_MARKERS = ("not found", "Unknown file type", "No route found")
 
-        for method, path in routes:
-            out = _build_trace_route(method, path)
-            if out and not any(m in out for m in _MISS_MARKERS):
-                sections.append(
-                    f"### Route trace: {method} {path}\n{_clip(out, MAX_SECTION_CHARS)}"
-                )
-    except Exception:
+            for rel in files:
+                out = _build_file_deps(rel)
+                if out and not any(m in out for m in _MISS_MARKERS):
+                    code_sections.append(f"### `{rel}`\n{_clip(out, MAX_SECTION_CHARS)}")
+
+            for method, path in routes:
+                out = _build_trace_route(method, path)
+                if out and not any(m in out for m in _MISS_MARKERS):
+                    code_sections.append(
+                        f"### Route trace: {method} {path}\n{_clip(out, MAX_SECTION_CHARS)}"
+                    )
+        except Exception:
+            code_sections = code_sections  # keep whatever succeeded
+
+    # 4. Retrieval sections (curated KB + semantically-related code). These load
+    #    Chroma once; both share the import cost.
+    kb_sections: list[str] = []
+    if conceptual:
+        s = _kb_section(prompt)
+        if s:
+            kb_sections.append(_clip(s, MAX_SECTION_CHARS))
+    if files:
+        s = _codebase_section(prompt, set(files))
+        if s:
+            kb_sections.append(_clip(s, MAX_SECTION_CHARS))
+
+    all_sections = code_sections + kb_sections
+    if not all_sections:
         _emit("")
 
-    if not sections:
-        _emit("")
-
-    body = "\n\n".join(sections)
     header = (
-        "## Auto-fetched code intelligence\n\n"
-        "Your prompt named code below. This structure was pulled automatically "
-        "from the `aitutor-code-intel` graph (dependencies, routes, call chains) "
-        "so you don't have to re-derive it. Treat it as ground truth for *what "
-        "connects to what*. For anything not shown — deeper call chains, "
-        "blast-radius of a change, template inheritance — unlock and call the "
-        "`aitutor-code-intel` MCP tools (`get_file_deps`, `trace_route`, "
-        "`impact_of_change`, `get_template_graph`).\n\n"
+        "## Auto-fetched context\n\n"
+        "Pulled automatically from the memory-compiler MCP servers so you don't "
+        "re-derive it: `aitutor-code-intel` for *what connects to what* "
+        "(dependencies, routes, call chains) and `aitutor-knowledge` for *why it "
+        "was built this way* (curated articles). Treat the code structure as "
+        "ground truth. For anything not shown — deeper chains, template "
+        "inheritance, full articles — unlock and call the MCP tools "
+        "(`get_file_deps`, `trace_route`, `impact_of_change`, `get_article`, "
+        "`search_knowledge`).\n\n"
     )
-    _emit(_clip(header + body, MAX_TOTAL_CHARS))
+    _emit(_clip(header + "\n\n".join(all_sections), MAX_TOTAL_CHARS))
 
 
 if __name__ == "__main__":

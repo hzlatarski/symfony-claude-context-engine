@@ -248,6 +248,47 @@ def _list_contradictions_impl() -> dict[str, Any]:
     return {"quarantined": slugs, "count": len(slugs)}
 
 
+def _record_retrieval_outcome_impl(
+    slug: str,
+    outcome: str,
+    note: str = "",
+) -> dict[str, Any]:
+    """Persist a retrieval-outcome rating for one article slug.
+
+    Validates ``outcome`` against ``retrieval_feedback.OUTCOMES`` and
+    verifies the slug resolves to a real article so a typo'd slug can't
+    silently accrue feedback that never influences ranking.
+    """
+    import config
+    import retrieval_feedback
+
+    normalized = slug.removesuffix(".md")
+    path = config.KNOWLEDGE_DIR / f"{normalized}.md"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"No article at slug {normalized!r} — refusing to record feedback "
+            f"for a slug that doesn't resolve to a file."
+        )
+
+    if outcome not in retrieval_feedback.OUTCOMES:
+        raise ValueError(
+            f"outcome must be one of {sorted(retrieval_feedback.OUTCOMES)}, got {outcome!r}"
+        )
+
+    rec = retrieval_feedback.record(normalized, outcome, note=note)
+    return {
+        "ok": True,
+        "slug": normalized,
+        "outcome": outcome,
+        "totals": {
+            "useful": rec.get("useful", 0),
+            "dead_end": rec.get("dead_end", 0),
+            "corrected": rec.get("corrected", 0),
+        },
+        "score": retrieval_feedback.score_for(normalized),
+    }
+
+
 _CODEBASE_FILE_TYPES = {"php", "js", "twig", "yaml"}
 
 
@@ -373,6 +414,27 @@ def _kb_health_impl() -> dict[str, Any]:
     # Quarantine count.
     contradictions = sorted(load_contradictions())
 
+    # Retrieval-outcome feedback rollup — surfaces the most-contested
+    # articles (repeatedly dead_end / corrected) as a review signal
+    # alongside the automated contradiction quarantine.
+    try:
+        import retrieval_feedback
+
+        agg = retrieval_feedback.aggregate()
+        rated = len(agg)
+        contested = [
+            {"slug": r["slug"], "score": round(r["score"], 3),
+             "corrected": r["corrected"], "dead_end": r["dead_end"], "useful": r["useful"]}
+            for r in agg if r["score"] < 0.4
+        ][:10]
+        feedback_stats = {
+            "rated_articles": rated,
+            "contested_count": sum(1 for r in agg if r["score"] < 0.4),
+            "most_contested": contested,
+        }
+    except Exception as exc:  # noqa: BLE001 — kb_health must never raise
+        feedback_stats = {"error": str(exc)}
+
     # Last ingest timestamp — most recent `ingested_at` in state.json.
     last_ingest_at: str | None = None
     state = load_state()
@@ -426,6 +488,7 @@ def _kb_health_impl() -> dict[str, Any]:
             "count": len(contradictions),
             "slugs": contradictions,
         },
+        "feedback": feedback_stats,
         "freshness": {
             "last_ingest_at": last_ingest_at,
             "compiled_truth_mtime": compiled_truth_mtime,
@@ -612,6 +675,47 @@ def _make_server():
             bad slug does NOT abort the batch — the rest still return.
         """
         return _get_articles_impl(slugs)
+
+    @server.tool()
+    def record_retrieval_outcome(
+        slug: str,
+        outcome: str,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Record whether an article you retrieved actually helped.
+
+        Call this AFTER you have used an article from ``search_knowledge`` /
+        ``get_article`` and know whether it was any good. The outcome is
+        recency-weighted and feeds directly into ``compiled-truth.md``
+        priority scoring (via ``retrieval_feedback``) — so rating articles
+        makes the knowledge base rank genuinely-useful ones higher over time
+        and sink misleading ones. This is the one signal time-based
+        confidence decay can't capture: whether the content was *correct and
+        useful*, not merely *recent*.
+
+        When to record which outcome:
+            - ``useful``    — the article answered the question / was correct
+              and load-bearing for what you did.
+            - ``dead_end``  — retrieved but unhelpful (off-topic, too vague,
+              didn't apply). Not wrong, just not useful here.
+            - ``corrected`` — the article was WRONG or stale and you had to
+              correct course. The strongest negative signal — repeatedly
+              ``corrected`` articles surface in ``reflect.py`` / ``kb_health``
+              for human review.
+
+        Args:
+            slug: article slug without ``.md`` (e.g. ``concepts/foo``). Must
+                resolve to a real article or this raises FileNotFoundError.
+            outcome: ``useful`` | ``dead_end`` | ``corrected``.
+            note: optional short context ("stale — prod moved to X"), stored
+                with the event and shown in reflect/kb_health.
+
+        Returns:
+            ``{ok, slug, outcome, totals, score}`` where ``score`` is the
+            article's new recency-weighted feedback score in ``[0, 1]``
+            (0.5 = neutral).
+        """
+        return _record_retrieval_outcome_impl(slug=slug, outcome=outcome, note=note)
 
     @server.tool()
     def list_contradictions() -> dict[str, Any]:

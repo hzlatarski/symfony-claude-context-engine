@@ -576,6 +576,152 @@ def _extract_extends(class_node, source: bytes, imports: dict[str, str], namespa
     return ""
 
 
+# Inline rationale tags. Design-intent comments (`// WHY:`, `// HACK`,
+# `/** @deprecated */`, `# TODO:`) carry knowledge that lives next to the
+# code, not in the article store. We promote them to first-class graph
+# nodes so `trace_route` / `get_neighborhood` / `find_rationale` surface the
+# *why* alongside the *what*. Idea borrowed from Graphify's rationale nodes.
+_RATIONALE_TAGS = (
+    "WHY", "HACK", "NOTE", "TODO", "FIXME", "XXX",
+    "BUG", "WARNING", "OPTIMIZE", "DEPRECATED",
+)
+# Bare tags are matched UPPERCASE-ONLY (no IGNORECASE) so ordinary prose like
+# "Note that we…" / "why do we…" is not swept up as rationale — a real
+# problem flagged in review. ``@deprecated`` is the one exception: it is an
+# unambiguous PHPDoc annotation, so it matches case-insensitively and
+# ANYWHERE in a line (summary-first docblocks put it on line 3+, not line 1).
+_BARE_TAG_RE = re.compile(r"\b(" + "|".join(_RATIONALE_TAGS) + r")\b")
+_DEPRECATED_RE = re.compile(r"@deprecated\b", re.IGNORECASE)
+_LINE_MARKER_RE = re.compile(r"^\s*(?:/\*+|\*+/|//+|#+|\*+)|\s*\*/\s*$")
+_RATIONALE_TEXT_MAX = 240
+
+
+def _strip_line_marker(line: str) -> str:
+    """Strip comment punctuation (``//`` ``#`` ``/*`` ``*`` ``*/``) from one line."""
+    return _LINE_MARKER_RE.sub("", line).strip()
+
+
+def _extract_rationale_comments(root, source: bytes) -> list[dict]:
+    """Return one record per rationale-tagged line inside comment nodes.
+
+    Each record: ``{tag, text, line, c_start, c_end}`` where ``line`` is the
+    tag's own physical line and ``c_start``/``c_end`` bound the whole comment
+    node (used for attribution). Scanning **per line** (not the flattened
+    body) is what lets summary-first ``@deprecated`` docblocks —
+    ``/**\\n * Summary.\\n * @deprecated x\\n */`` — be found: the tag can sit
+    on any line, not just the first.
+    """
+    out: list[dict] = []
+    for node in _walk(root):
+        if node.type != "comment":
+            continue
+        c_start = node.start_point[0] + 1
+        c_end = node.end_point[0] + 1
+        for offset, raw_line in enumerate(_text(node, source).splitlines()):
+            cleaned = _strip_line_marker(raw_line)
+            if not cleaned:
+                continue
+            tag = None
+            rest = ""
+            dm = _DEPRECATED_RE.search(cleaned)
+            if dm:
+                tag = "DEPRECATED"
+                rest = cleaned[dm.end():]
+            else:
+                bm = _BARE_TAG_RE.search(cleaned)
+                if bm:
+                    tag = bm.group(1).upper()
+                    rest = cleaned[bm.end():]
+            if tag is None:
+                continue
+            text = rest.lstrip(" :\t-").strip()[:_RATIONALE_TEXT_MAX]
+            out.append({
+                "tag": tag,
+                "text": text,
+                "line": c_start + offset,
+                "c_start": c_start,
+                "c_end": c_end,
+            })
+    return out
+
+
+def _assign_rationale(
+    comments: list[dict],
+    sym_spans: list[tuple[str, int, int]],
+    class_spans: list[tuple[str, int, int]],
+) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
+    """Bucket rationale notes onto the method or class they annotate.
+
+    Attribution is measured from the whole comment's ``[c_start, c_end]``
+    span (not the tag line) so a long docblock still attaches to the method
+    just below its closing ``*/``. Order matters:
+
+    1. Comment span overlaps a method body → that method (smallest).
+    2. Comment sits inside a class body → the method whose docblock it is
+       (starts 1–3 lines below ``c_end``, **within the same class**), else
+       the class.
+    3. Comment is 1–3 lines above a class declaration → that class.
+    4. Comment is 1–3 lines above a method (not in/above any class) → method.
+
+    Anything else (file headers) is dropped.
+    """
+    by_symbol: dict[str, list[dict]] = {}
+    by_class: dict[str, list[dict]] = {}
+
+    def _note(c: dict) -> dict:
+        return {"tag": c["tag"], "text": c["text"], "line": c["line"]}
+
+    for c in comments:
+        cs, ce = c["c_start"], c["c_end"]
+
+        # 1. Comment overlaps a method body → smallest such method.
+        contained: tuple[str, int, int] | None = None
+        for sid, s, e in sym_spans:
+            if s <= ce and cs <= e and (contained is None or (e - s) < (contained[2] - contained[1])):
+                contained = (sid, s, e)
+        if contained is not None:
+            by_symbol.setdefault(contained[0], []).append(_note(c))
+            continue
+
+        # Enclosing class of the comment's start line, if any.
+        enclosing = next(
+            ((fqcn, s, e) for fqcn, s, e in class_spans if s <= cs <= e), None
+        )
+
+        # 2. Inside a class body: leading docblock for a method of THAT class,
+        #    else the class itself.
+        if enclosing is not None:
+            efqcn, es, ee = enclosing
+            lead = None
+            for sid, s, e in sym_spans:
+                if 1 <= (s - ce) <= 3 and es <= s and e <= ee and (lead is None or s < lead[1]):
+                    lead = (sid, s, e)
+            if lead is not None:
+                by_symbol.setdefault(lead[0], []).append(_note(c))
+            else:
+                by_class.setdefault(efqcn, []).append(_note(c))
+            continue
+
+        # 3. Leading comment above a class declaration → that class.
+        class_lead = None
+        for fqcn, s, e in class_spans:
+            if 1 <= (s - ce) <= 3 and (class_lead is None or s < class_lead[1]):
+                class_lead = (fqcn, s)
+        if class_lead is not None:
+            by_class.setdefault(class_lead[0], []).append(_note(c))
+            continue
+
+        # 4. Leading comment above a method with no class context → that method.
+        method_lead = None
+        for sid, s, e in sym_spans:
+            if 1 <= (s - ce) <= 3 and (method_lead is None or s < method_lead[1]):
+                method_lead = (sid, s)
+        if method_lead is not None:
+            by_symbol.setdefault(method_lead[0], []).append(_note(c))
+        # else: file-level header — not rationale about any symbol; dropped.
+    return by_symbol, by_class
+
+
 def _parse_file(
     path: Path,
     rel_path: str,
@@ -598,6 +744,8 @@ def _parse_file(
     symbols: dict[str, dict] = {}
     edges: list[dict] = []
     classes: dict[str, dict] = {}
+    class_spans: list[tuple[str, int, int]] = []
+    sym_spans: list[tuple[str, int, int]] = []
 
     for node in _walk(root):
         if node.type != "class_declaration":
@@ -611,6 +759,7 @@ def _parse_file(
         property_types = _extract_property_types_from_class(node, source, imports, namespace)
         parent_fqcn = _extract_extends(node, source, imports, namespace)
         classes[fqcn] = {"file": rel_path, "extends": parent_fqcn}
+        class_spans.append((fqcn, node.start_point[0] + 1, node.end_point[0] + 1))
 
         decl_list = _find_child(node, "declaration_list")
         if decl_list is None:
@@ -624,17 +773,31 @@ def _parse_file(
                 continue
             method_name = _text(method_name_node, source)
             symbol_id = f"{fqcn}::{method_name}"
+            start_line = member.start_point[0] + 1
+            end_line = member.end_point[0] + 1
             symbols[symbol_id] = {
                 "file": rel_path,
-                "line": member.start_point[0] + 1,
-                "end_line": member.end_point[0] + 1,
+                "line": start_line,
+                "end_line": end_line,
                 "kind": "method",
                 "visibility": _method_visibility(member, source),
             }
+            sym_spans.append((symbol_id, start_line, end_line))
             edges.extend(_walk_method_for_calls(
                 member, source, symbol_id, rel_path, property_types,
                 imports, namespace, fqcn, parent_fqcn,
             ))
+
+    # Attach inline rationale comments (WHY / HACK / TODO / @deprecated / …)
+    # to the method or class they annotate. Stored on the symbol/class dict
+    # so unified_graph can materialize note: nodes and find_rationale can scan.
+    rationale = _extract_rationale_comments(root, source)
+    if rationale:
+        by_symbol, by_class = _assign_rationale(rationale, sym_spans, class_spans)
+        for sid, notes in by_symbol.items():
+            symbols[sid]["rationale"] = notes
+        for fqcn, notes in by_class.items():
+            classes[fqcn]["rationale"] = notes
 
     return symbols, edges, classes
 

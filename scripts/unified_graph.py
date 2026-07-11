@@ -54,6 +54,36 @@ def build(call_graph: dict, knowledge_root: Path) -> dict:
     edges: list[dict] = []
     article_contents: dict[str, str] = {}
 
+    def _emit_rationale(owner_id: str, file_path: str, notes: list[dict]) -> None:
+        """Materialize ``note:`` leaf nodes for one symbol/class's rationale.
+
+        Each note is a degree-1 leaf keyed by ``note:<file>:<line>:<tag>`` so
+        it clusters into its owner's Leiden community without adding hub
+        noise. The ``annotates`` edge points owner → note. Notes with no owning
+        file are skipped (no ``note::N`` orphans), and a repeated id (two
+        identically-tagged comments on one line) is emitted once — no dangling
+        duplicate edge.
+        """
+        if not file_path:
+            return
+        for n in notes or []:
+            line = n.get("line", 0)
+            tag = n.get("tag", "NOTE")
+            note_id = f"note:{file_path}:{line}:{tag}"
+            if note_id in nodes:
+                continue
+            text = (n.get("text") or "").strip()
+            label = f"[{tag}] {text[:60]}" if text else f"[{tag}]"
+            nodes[note_id] = {
+                "kind": "rationale",
+                "label": label,
+                "tag": tag,
+                "text": text,
+                "line": line,
+                "file": file_path,
+            }
+            edges.append({"from": owner_id, "to": note_id, "kind": "annotates"})
+
     # Pass 0: materialize call-graph nodes + structural edges.
     for class_fqcn, class_info in call_graph.get("classes", {}).items():
         class_id = f"class:{class_fqcn}"
@@ -64,6 +94,7 @@ def build(call_graph: dict, knowledge_root: Path) -> dict:
             if file_id not in nodes:
                 nodes[file_id] = {"kind": "file", "label": file_path}
             edges.append({"from": file_id, "to": class_id, "kind": "contains"})
+        _emit_rationale(class_id, file_path, class_info.get("rationale", []))
 
     for symbol_id_raw, sym_info in call_graph.get("symbols", {}).items():
         symbol_id = f"symbol:{symbol_id_raw}"
@@ -76,6 +107,7 @@ def build(call_graph: dict, knowledge_root: Path) -> dict:
             class_id = f"class:{cls}"
             if class_id in nodes:
                 edges.append({"from": class_id, "to": symbol_id, "kind": "defines"})
+        _emit_rationale(symbol_id, sym_info.get("file", ""), sym_info.get("rationale", []))
 
     for edge in call_graph.get("edges", []):
         dst = edge["to"]

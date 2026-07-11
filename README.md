@@ -25,6 +25,10 @@ A long-term memory system for Claude Code, purpose-built for Symfony projects. S
 - 🕮 **[Multi-agent history mining](#multi-agent-history-mining)** — `scripts/import_agent_history.py` reads other agents' transcript stores (Codex `~/.codex/sessions`, other Claude Code projects `~/.claude/projects`) and normalizes each session into ingestible markdown under `knowledge/imported/<agent>/`. Zero LLM cost, idempotent, project-scoped by `cwd`. Closes the blind spot where work done outside *this* Claude Code project never reached the knowledge base. Adapter registry is the extension point for more agents.
 - 🪢 **[Wikilink backfill](#wikilink-backfill)** — `scripts/crosslink.py` scans every article for unlinked prose mentions of other articles' titles/aliases and weaves in `[[wikilinks]]` (appended to `### Related Concepts`, graph-safe against the path-based wikilink format). Pure Python, zero LLM cost, dry-run by default. Densifies the graph that feeds `compiled-truth.md` priority scoring, `get_unified_neighbors`, and the Leiden communities.
 - 🗺 **[Graph exports](#graph-exports)** — `scripts/export_graph.py` serializes the unified knowledge graph to GraphML (Gephi/yEd), Neo4j Cypher, a self-contained interactive HTML viewer (vis-network), or raw JSON — for visualization beyond the Obsidian vault and MCP tools.
+- 🔁 **[Retrieval-outcome feedback](#retrieval-outcome-feedback)** — the one signal time-based decay can't capture: *was an article useful when retrieved?* The agent marks a retrieval `useful` / `dead_end` / `corrected` via `record_retrieval_outcome`; outcomes are recency-weighted and feed a `WEIGHT_FEEDBACK` axis in priority scoring. `reflect.py` digests them into `LESSONS.md`; contested articles surface in `kb_health`. Backward-compatible — unrated articles score neutral. (Graphify's `save-result`/`reflect`.)
+- 💬 **[Inline rationale nodes](#inline-rationale-nodes)** — the call-graph parser lifts `// WHY:` / `// HACK` / `// TODO` / `/** @deprecated */` comments out of `src/**/*.php` and attaches them to the annotated method/class as first-class `note:` graph nodes. Surfaced via `find_rationale` and in `get_file_deps`. Answers "where are the known hacks / deprecations?" and gives `trace_route` the *why* next to the *what*.
+- 🧭 **`trace_path(A, B)`** — shortest connection between any two unified-graph nodes (BFS, edge-kind-annotated hops). Answers "how is this symbol related to that article?" — the between-two-nodes complement to `get_unified_neighbors`' one-node radius.
+- 🔀 **[Merge-order conflict risk](#merge-order-conflict-risk)** — `merge_order_risk` / `scripts/merge_risk.py`: maps each in-flight branch's changed files into graph communities and flags **direct file conflicts** (git *will* conflict) and **community-overlap coupling** (different files, same semantic cluster) so you know what to merge back-to-back. (Graphify's `prs --conflicts`.)
 - 🛡 **Cross-process locking** — Concurrent writers (the file watcher, a `SessionEnd` flush, a manual `ingest.py`) coordinate via `filelock` against per-collection lock files under `knowledge/chroma/.locks/`. No more SQLite "database is locked" surprises.
 - ⏸ **Resumable, interruptible ingest** — Per-file content-hash checkpointing makes `ingest.py` crash-safe — re-running skips files whose hash matches the last successful run. Live progress is written to `knowledge/.ingest-status.json` and exposed via the `ingest_status` MCP tool. `ingest_stop` raises a cooperative-cancel flag the next file boundary honors.
 - 🩺 **`kb_health` MCP tool** — One-shot diagnostic: collection sizes, articles by memory type, broken `[src:]` anchors, quarantine count, last ingest timestamp. Replaces six manual scripts when you need to know "is the KB healthy?".
@@ -64,9 +68,12 @@ Six pure-Python parsers plus a tree-sitter call graph expose your live codebase 
 | `get_template_graph(t)` | Twig inheritance, includes, Stimulus bindings |
 | `get_stimulus_map(c)` | Bidirectional JS ↔ Twig map with orphan detection |
 | `get_hotspots(top_n)` | Churn-ranked files with ownership and bus-factor scoring |
-| `trace_route(method, path, output_format="text")` | Full call chain a route triggers — controller action down through services, repositories, and rendered templates. Each hop carries a confidence score reflecting how the receiver type was resolved. Set `output_format="mermaid"` for a `flowchart TD` rendering. |
+| `trace_route(method, path, output_format="text", collapse_accessors=True)` | Full call chain a route triggers — controller action down through services, repositories, and rendered templates. Each hop carries a confidence score reflecting how the receiver type was resolved. `collapse_accessors` (default on) folds `\Entity\` getter/setter leaf calls into one summary line per parent so meaningful hops aren't buried. Set `output_format="mermaid"` for a `flowchart TD` rendering. |
 | `impact_of_change(file=None, since_ref="HEAD", output_format="text")` | Reverse-walks the call graph from edited lines (parsed from `git diff -U0`) to surface affected HTTP routes **and** Stimulus controllers, risk-scored by hotspot weight. Crosses the JS↔PHP boundary via resolved `fetch()` URLs. Mermaid output mode renders affected routes + reached methods as a two-tier flowchart. |
 | `get_circular_dependencies(scope="vendor-excluded", output_format="text")` | Tarjan's SCC over the resolved call graph. Reports cycles (SCCs of size > 1 plus self-loops) sorted by size. `scope` filters to `php`, `js`, `all`, or `vendor-excluded` (default — keeps only `src/...` symbols). |
+| `trace_path(from_node, to_node, max_depth=8)` | Shortest connection between two unified-graph nodes via BFS over the undirected projection. Each hop is annotated with the edge kind / relation / confidence. The between-two-nodes complement to `get_unified_neighbors`. |
+| `find_rationale(tag=None, query=None)` | Lists inline design-intent comments (`WHY` / `HACK` / `TODO` / `FIXME` / `@deprecated` / …) parsed from `src/**/*.php`, grouped by file with a per-tag count. Filter by exact `tag` and/or a substring `query`. |
+| `merge_order_risk(base="main", branches=None)` | Maps each branch's changed files into graph communities. Reports direct file conflicts (same file on 2+ branches) and community-overlap coupling risk (different files, same cluster). Auto-detects branches ahead of `base` when `branches` is omitted. |
 
 Runs live, mtime-cached, under one second. Git intelligence caches to `knowledge/git-intel.json` (HEAD-based invalidation); the symbol-level call graph caches to `knowledge/call-graph.json` (mtime + HEAD invalidation).
 
@@ -97,6 +104,7 @@ A **second** MCP server (`knowledge-compiler`) — separate from the code-intel 
 | `search_codebase(query, file_type)` | Hybrid BM25 + vector search over indexed source files. PHP and JS are chunked at class/method/function boundaries via tree-sitter (see below); Twig and YAML use 150-line windows. Returns chunked file excerpts with line ranges, plus the source group's `source_description` so the agent learns *when* to consult that file group. |
 | `get_article(slug)` | Full markdown + parsed frontmatter for one article |
 | `get_articles([slugs])` | Batch-fetch full bodies for multiple slugs in one round trip. Missing slugs return `{slug, error: "not_found"}` so one bad slug doesn't abort the batch. |
+| `record_retrieval_outcome(slug, outcome, note="")` | Rate a retrieved article ``useful`` / ``dead_end`` / ``corrected``. Recency-weighted, feeds `compiled-truth.md` priority scoring. The signal confidence-decay can't capture: whether the content was *correct and useful*, not merely *recent*. |
 | `list_contradictions()` | Current contradiction-quarantine list |
 | `list_sources()` | Source-group catalog: `{file_type, patterns, description, chunk_count}` per group. Use **before** `search_codebase` when you don't know which `file_type` fits — descriptions tell you when to consult each group. Doubles as a freshness check (`chunk_count: 0` for an expected group means the index is stale). |
 | `kb_health()` | One-shot diagnostic. Returns `{vector_store, codebase_store, articles{total,by_type}, anchors{broken,articles_missing_anchors}, quarantine, freshness, ingest}`. Use as a CI gate or before answering critical KB questions. |
@@ -531,6 +539,7 @@ uv run pytest tests/whisper_tray/ -v
 uv run python scripts/compile.py               # compile daily logs → articles
 uv run python scripts/import_agent_history.py --agent all   # mine Codex/Claude history → knowledge/imported/
 uv run python scripts/crosslink.py             # preview wikilink backfill (add --apply to write)
+uv run python scripts/reflect.py               # aggregate retrieval feedback → knowledge/LESSONS.md (--dry-run to preview)
 uv run python scripts/export_graph.py --format graphml      # export unified graph (graphml|cypher|html|json)
 uv run python scripts/ingest.py                # compile source files → articles
 uv run python scripts/ingest.py --all          # force re-ingest (per-file hash checkpoint still saves rerun cost)
@@ -752,6 +761,65 @@ Default output lives under `knowledge/exports/` (created on first run).
 
 ---
 
+## Retrieval-Outcome Feedback
+
+Confidence decay answers "is this article *old*?" — it can't answer "is this article *any good*?". Two articles updated the same day rank identically even if one has proven correct a dozen times and the other keeps getting corrected. This loop closes that gap.
+
+```jsonc
+// After using an article, the agent rates it (knowledge-compiler MCP):
+record_retrieval_outcome { "slug": "concepts/tailwind-rebuild", "outcome": "useful" }
+record_retrieval_outcome { "slug": "concepts/stale-deploy-path", "outcome": "corrected",
+                           "note": "prod moved to /var/projects — article still says /srv" }
+```
+
+- **Outcomes** — `useful` (correct + load-bearing), `dead_end` (retrieved but unhelpful), `corrected` (was wrong — the strongest negative).
+- **Recency-weighted** — each event carries a timestamp and decays with a 45-day half-life, so a fix silently promotes an article out of the contested set as its recent ratings turn positive.
+- **Feeds priority scoring** — a new `WEIGHT_FEEDBACK` axis in `compile_truth.py`. Unrated articles score a neutral `0.5`, so introducing this weight leaves the relative order of never-rated articles untouched — only rated ones move.
+- **`reflect.py` → `LESSONS.md`** — a git-diffable digest bucketing articles into *Trusted* and *⚠ Contested — review or retire*. Regenerated each run; zero LLM cost.
+- **`kb_health`** gains a `feedback` block listing the most-contested articles alongside the automated contradiction quarantine.
+
+The store lives at `knowledge/retrieval-feedback.json`. Idea borrowed from [Graphify](https://github.com/Graphify-Labs/graphify)'s `save-result` / `reflect` learning overlay.
+
+---
+
+## Inline Rationale Nodes
+
+Design rationale often lives *next to the code* — `// HACK: force a repaint, the iframe swallows the first frame`, `/** @deprecated use bulkAssign() */` — not in the knowledge base. The call-graph parser now promotes these to first-class graph nodes so that knowledge is queryable.
+
+```bash
+# All deprecations across the PHP codebase:
+find_rationale { "tag": "DEPRECATED" }
+# Every hack mentioning "iframe":
+find_rationale { "tag": "HACK", "query": "iframe" }
+```
+
+- **Recognized tags** — `WHY`, `HACK`, `NOTE`, `TODO`, `FIXME`, `XXX`, `BUG`, `WARNING`, `OPTIMIZE`, `DEPRECATED` (`@deprecated` folds into `DEPRECATED`).
+- **Attachment** — a comment inside a method body attaches to that method; a docblock 1–3 lines above attaches to it (covers `@deprecated`); otherwise it attaches to the containing class. File-header comments are dropped.
+- **Graph shape** — each becomes a `note:<file>:<line>` node with kind `rationale` and an `annotates` edge from its owner. Notes are degree-1 leaves, so Leiden clusters them into their owner's community without adding hub noise; they also flow into `get_neighborhood` and the graph exports for free.
+- **Also surfaced** in `get_file_deps` under an **Inline Rationale** heading.
+
+Idea borrowed from [Graphify](https://github.com/Graphify-Labs/graphify)'s rationale nodes.
+
+---
+
+## Merge-Order Conflict Risk
+
+With a chronically-dirty `main` and several worktrees open at once (this project's normal state), the question that bites at merge time is *which branches, merged in the wrong order, will collide?* `git` sees textual conflicts; it can't see semantic coupling.
+
+```jsonc
+// code-intel MCP — auto-detect branches ahead of main:
+merge_order_risk { "base": "main" }
+// or compare specific branches:
+merge_order_risk { "base": "main", "branches": ["feat/billing", "feat/checkout"] }
+```
+
+- **Direct file conflicts** — the same file changed on 2+ branches. Git *will* conflict; merge those back-to-back.
+- **Community-overlap risk** — different files that live in the same Leiden community (e.g. two branches reshaping the billing subsystem from different files). No textual conflict, but a coupling risk worth reviewing together — the signal plain `git` can't surface.
+
+`scripts/merge_risk.py` holds a pure, testable core (`compute` / `render`); the MCP tool wires in `git diff` against `PROJECT_ROOT` and the cached community partition. Idea borrowed from [Graphify](https://github.com/Graphify-Labs/graphify)'s `prs --conflicts`.
+
+---
+
 ## Live File Watcher
 
 Run `scripts/watch.py` alongside `viewer.py` to keep the article and codebase indexes live as you edit:
@@ -844,6 +912,7 @@ Default acquisition timeout is 60s (configurable via `CHROMA_LOCK_TIMEOUT_SECOND
 - Forked from [coleam00/claude-memory-compiler](https://github.com/coleam00/claude-memory-compiler) by Cole Medin
 - Inspired by [Andrej Karpathy's LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
 - Verbatim drawer layer concept from [MemPalace](https://github.com/MemPalace/mempalace)
+- Retrieval-outcome feedback loop, inline rationale nodes, and merge-order conflict risk adapted from [Graphify](https://github.com/Graphify-Labs/graphify)
 - Built on the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk) and [FastMCP](https://github.com/modelcontextprotocol/python-sdk)
 
 ## License

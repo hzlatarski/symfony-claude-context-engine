@@ -4,6 +4,33 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [0.4.0] — 2026-07-11
+
+Four improvements adapted from [Graphify](https://github.com/Graphify-Labs/graphify)'s code-intelligence graph — the ideas it had that this engine lacked, filtered to what fits a curated + retrieval hybrid (its "no embeddings" thesis and multi-LLM backends were deliberately *not* adopted). All four are pure-Python and add zero LLM cost.
+
+### Added
+
+- **Retrieval-outcome feedback loop** — `scripts/retrieval_feedback.py` + `record_retrieval_outcome` MCP tool (knowledge server) + `scripts/reflect.py`. The one signal time-based confidence decay can't capture: *was an article actually useful when retrieved?* The agent marks a retrieval `useful` / `dead_end` / `corrected`; outcomes are recency-weighted (45-day half-life) and feed a new `WEIGHT_FEEDBACK` axis in `compile_truth.py` priority scoring. Backward-compatible: an unrated article scores a neutral `0.5`, so the relative ranking of never-rated articles is unchanged. `reflect.py` aggregates the store into `knowledge/LESSONS.md` (trusted vs. contested articles); `kb_health` gains a `feedback` block surfacing the most-contested articles for review. Graphify's `save-result` / `reflect` pattern.
+- **Inline rationale nodes** — the call-graph parser (`parsers/call_graph.py`) now lifts design-intent comments (`// WHY:`, `// HACK`, `// TODO`, `// FIXME`, `/** @deprecated */`, and 5 more tags) out of `src/**/*.php` and attaches them to the method or class they annotate. `unified_graph.py` materializes them as `note:<file>:<line>` leaf nodes with `annotates` edges (degree-1, so they cluster into their owner's Leiden community without adding hub noise). Surfaced via a new `find_rationale(tag, query)` MCP tool and an **Inline Rationale** section in `get_file_deps`. Answers "where are the known hacks / deprecations / TODOs?" and gives `trace_route` the *why* next to the *what*.
+- **`trace_path(from_node, to_node)` MCP tool** (code-intel server) — shortest connection between any two unified-graph nodes via BFS over the undirected projection, with each hop annotated by edge kind / relation / confidence. Answers "how is this controller symbol related to that article?" — complements `get_unified_neighbors` (radius around one node) by returning the actual chain *between* two.
+- **`merge_order_risk(base, branches)` MCP tool** (code-intel server) + `scripts/merge_risk.py`. For this project's chronically-dirty-`main` + many-worktrees reality: auto-detects branches ahead of `base` (skipping `backup/`/`archive/`/`wip/` noise), diffs each, maps changed files into unified-graph communities, and reports **direct file conflicts** (same file on 2+ branches — git *will* conflict) and **community-overlap risk** (different files in the same semantic cluster — a coupling risk plain git can't see). Detects **stacked branches** via `git merge-base --is-ancestor` so a child restating its parent's files isn't a false conflict. Graphify's `prs --conflicts` signal.
+
+### Changed — richer, more automatic context surface
+
+Prompted by "is the compiler actually being called enough, and is what it returns useful?":
+
+- **`trace_route` collapses entity accessor noise** — childless getter/setter calls to `\Entity\` classes (`User::setEmail`, `getId`, …) folded into one summary line per parent, so the architecturally-meaningful service/repository hops aren't buried. New `collapse_accessors` param (default True) on the tool.
+- **Auto-injection hook now surfaces the knowledge base** — `hooks/user-prompt-submit.py` previously injected code-intel *only* when the prompt named a concrete file/route/class; a conceptual "why/decision/how" prompt got nothing. It now also runs a `search_knowledge` (hybrid) when the prompt matches conceptual triggers and injects the top curated-KB matches — closing the gap where the KB was never auto-surfaced.
+- **Auto-injection hook adds related code** — when a file is named it now also injects semantically-related code (`search_codebase`), excluding the named file and sibling-worktree/vendor duplicates. `get_file_deps`' inline-rationale section now parses just the one named file (a ~ms tree-sitter pass) instead of the whole call graph, so the per-prompt hook stays cheap. (`impact_of_change` was intentionally left OUT of the hook — in a fresh cold process it forces a whole-graph parse for niche value; call it on-demand instead.)
+
+### Tests
+
+- ~55 new tests (`test_retrieval_feedback.py`, `test_rationale.py`, `test_trace_path.py`, `test_merge_risk.py`, `test_trace_route_collapse.py`, `test_prompt_hook_triggers.py`) plus a rationale PHP fixture. `test_integration.py`'s file-deps timing test now warms the call-graph cache (a new `get_file_deps` dependency). All pure-Python (no network/Chroma).
+
+### Notes
+
+Every finding from an adversarial review of this release was fixed before merge: summary-first `@deprecated` docblocks (per-line scan), docblock attribution from the comment's end line, uppercase-only bare tags (no "Note that…" false positives), proportional weight rebalance (unrated-article ranking provably preserved), corrupt-feedback-store backup instead of clobber, stacked-branch ancestry, and the `get_file_deps` cold-process latency regression (disk-cached parse).
+
 ## [0.3.1] — 2026-06-17
 
 Three features cherry-picked from the [obsidian-wiki](https://github.com/Ar9av/obsidian-wiki) LLM-wiki framework — the ideas it had that this engine lacked. All three are pure-Python and add zero LLM cost. Plus a Windows quality-of-life fix for the flashing `claude` console window.

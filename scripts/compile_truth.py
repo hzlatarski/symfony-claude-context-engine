@@ -39,10 +39,21 @@ DEFAULT_BUDGET_CHARS = 40_000
 # ── Scoring weights ──────────────────────────────────────────────────
 # These control how articles are ranked for inclusion in compiled truth.
 # Pinned articles bypass scoring entirely (always included first).
-WEIGHT_RECENCY = 0.35     # recently updated articles score higher
-WEIGHT_LINKEDNESS = 0.30  # more cross-linked articles are more foundational
-WEIGHT_ACCESS = 0.20      # frequently queried articles are more useful
-WEIGHT_CONFIDENCE = 0.15  # well-validated facts score higher than speculation
+# Weights sum to 1.0. WEIGHT_FEEDBACK folds in the retrieval-outcome signal
+# (retrieval_feedback.py) — an article marked useful when retrieved rises,
+# one repeatedly marked dead_end / corrected sinks. Articles with no feedback
+# score a neutral 0.5 on that axis. To make introducing this axis a true
+# no-op for the relative ranking of never-rated articles, the four original
+# weights are scaled *proportionally* by 0.85 (0.35/0.30/0.20/0.15 × 0.85)
+# and feedback takes the freed 0.15. Because all four keep their old ratios,
+# an unrated article's new score is exactly ``0.85·old + 0.075`` — a
+# monotonic transform, so their order is preserved. (A non-proportional
+# rebalance would silently reshuffle compiled-truth on upgrade.)
+WEIGHT_RECENCY = 0.2975     # recently updated articles score higher
+WEIGHT_LINKEDNESS = 0.2550  # more cross-linked articles are more foundational
+WEIGHT_ACCESS = 0.1700      # frequently queried articles are more useful
+WEIGHT_CONFIDENCE = 0.1275  # well-validated facts score higher than speculation
+WEIGHT_FEEDBACK = 0.1500    # articles that proved useful when retrieved rank higher
 
 
 def parse_frontmatter(content: str) -> dict:
@@ -328,13 +339,22 @@ def compute_score(
     linkedness: float,
     access: float,
     confidence: float = 0.5,
+    feedback: float = 0.5,
 ) -> float:
-    """Weighted combination of scoring signals."""
+    """Weighted combination of scoring signals.
+
+    ``feedback`` defaults to the neutral 0.5. Because the four non-feedback
+    weights were scaled proportionally (×0.85) when this axis was added, an
+    unrated article's score is ``0.85·(old weighted sum) + 0.075`` — a
+    monotonic transform of the old score, so the relative ordering of
+    never-rated articles is exactly preserved.
+    """
     return (
         WEIGHT_RECENCY * recency
         + WEIGHT_LINKEDNESS * linkedness
         + WEIGHT_ACCESS * access
         + WEIGHT_CONFIDENCE * confidence
+        + WEIGHT_FEEDBACK * feedback
     )
 
 
@@ -345,7 +365,7 @@ class ScoredArticle:
 
     __slots__ = (
         "rel_path", "truth", "pinned", "score",
-        "recency", "linkedness", "access", "confidence", "char_count",
+        "recency", "linkedness", "access", "confidence", "feedback", "char_count",
     )
 
     def __init__(
@@ -358,6 +378,7 @@ class ScoredArticle:
         linkedness: float,
         access: float,
         confidence: float,
+        feedback: float = 0.5,
     ):
         self.rel_path = rel_path
         self.truth = truth
@@ -367,6 +388,7 @@ class ScoredArticle:
         self.linkedness = linkedness
         self.access = access
         self.confidence = confidence
+        self.feedback = feedback
         # Pre-compute the character cost of including this article
         slug = rel_path.replace(".md", "")
         self.char_count = len(f"\n---\n\n## {slug}\n\n{truth}\n")
@@ -410,6 +432,12 @@ def compile_truth(
     inbound_map = build_inbound_link_map()
     quarantined = load_contradictions()
 
+    # Retrieval-outcome feedback scores (slug -> [0,1]); slugs absent from
+    # the map have no feedback and fall back to the neutral 0.5. Loaded once
+    # here rather than per-article so we read the store a single time.
+    import retrieval_feedback
+    feedback_scores = retrieval_feedback.load_scores(today=today)
+
     # ── Extract and score all articles ────────────────────────────────
     articles: list[ScoredArticle] = []
 
@@ -452,7 +480,8 @@ def compile_truth(
                 updated=updated,
                 today=today,
             )
-            total_score = compute_score(rec, lnk, acc, conf)
+            fb = feedback_scores.get(slug, retrieval_feedback.NEUTRAL_SCORE)
+            total_score = compute_score(rec, lnk, acc, conf, fb)
 
             articles.append(ScoredArticle(
                 rel_path=rel,
@@ -463,6 +492,7 @@ def compile_truth(
                 linkedness=lnk,
                 access=acc,
                 confidence=conf,
+                feedback=fb,
             ))
 
     total_count = len(articles)
@@ -500,8 +530,8 @@ def compile_truth(
         print(f"  Priority Scoring Breakdown ({total_count} articles)")
         print(f"  Budget: {budget:,} chars | Pinned: {pinned_count}")
         print(f"{'-' * 70}")
-        print(f"  {'#':>3}  {'Score':>5}  {'R':>4}  {'L':>4}  {'A':>4}  {'C':>4}  {'Pin':>3}  {'Chars':>6}  Article")
-        print(f"  {'---':>3}  {'-----':>5}  {'----':>4}  {'----':>4}  {'----':>4}  {'----':>4}  {'---':>3}  {'------':>6}  {'-----'}")
+        print(f"  {'#':>3}  {'Score':>5}  {'R':>4}  {'L':>4}  {'A':>4}  {'C':>4}  {'F':>4}  {'Pin':>3}  {'Chars':>6}  Article")
+        print(f"  {'---':>3}  {'-----':>5}  {'----':>4}  {'----':>4}  {'----':>4}  {'----':>4}  {'----':>4}  {'---':>3}  {'------':>6}  {'-----'}")
 
         # Show all articles sorted by score (pinned first)
         all_sorted = pinned_articles + unpinned_articles
@@ -514,7 +544,7 @@ def compile_truth(
             print(
                 f"  {marker}{i:>2}  {article.score:.3f}  "
                 f"{article.recency:.2f}  {article.linkedness:.2f}  {article.access:.2f}  "
-                f"{article.confidence:.2f}  "
+                f"{article.confidence:.2f}  {article.feedback:.2f}  "
                 f"{pin}  {article.char_count:>5}  {slug}"
             )
 
