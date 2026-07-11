@@ -6,11 +6,9 @@ The version recorded in `VERSION` at the repo root is the source of truth. The `
 
 ## [0.4.1] — 2026-07-11
 
-### Changed
+### Fixed
 
-- fix(upgrade): reconfigure stdout/stderr to UTF-8 so upgrade never exits non-zero on Windows
-- feat: Graphify-inspired improvements + richer auto-injection (v0.4.0)
-- fix(subprocess): resolve claude binary explicitly instead of trusting PATH
+- **`upgrade.py` no longer exits non-zero on Windows.** The final "Upgrade complete" line and the progress lines use non-ASCII glyphs (arrow, ellipsis). On a Windows cp1252 console these raised `UnicodeEncodeError` on the closing print — *after* the upgrade had already fully succeeded — corrupting the exit code to 1 and tripping the skill's failure path (and any auto-upgrade wrapper that checks the return code). `sys.stdout`/`stderr` are now reconfigured to UTF-8 with `errors="replace"` at startup (guarded for non-reconfigurable streams), so glyphs render on capable terminals and un-encodable ones degrade to a replacement char instead of crashing.
 
 ## [0.4.0] — 2026-07-11
 
