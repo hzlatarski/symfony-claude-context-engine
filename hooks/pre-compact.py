@@ -34,6 +34,10 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT / "scripts"
 STATE_DIR = SCRIPTS_DIR
 
+sys.path.insert(0, str(SCRIPTS_DIR))
+from flush_cursor import load_cursor  # noqa: E402
+from transcript import extract_conversation_context  # noqa: E402
+
 logging.basicConfig(
     filename=str(SCRIPTS_DIR / "flush.log"),
     level=logging.INFO,
@@ -41,59 +45,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-MAX_TURNS = 30
-MAX_CONTEXT_CHARS = 15_000
 MIN_TURNS_TO_FLUSH = 5
-
-
-def extract_conversation_context(transcript_path: Path) -> tuple[str, int]:
-    """Read JSONL transcript and extract last ~N conversation turns as markdown."""
-    turns: list[str] = []
-
-    with open(transcript_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            msg = entry.get("message", {})
-            if isinstance(msg, dict):
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-            else:
-                role = entry.get("role", "")
-                content = entry.get("content", "")
-
-            if role not in ("user", "assistant"):
-                continue
-
-            if isinstance(content, list):
-                text_parts = []
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                    elif isinstance(block, str):
-                        text_parts.append(block)
-                content = "\n".join(text_parts)
-
-            if isinstance(content, str) and content.strip():
-                label = "User" if role == "user" else "Assistant"
-                turns.append(f"**{label}:** {content.strip()}\n")
-
-    recent = turns[-MAX_TURNS:]
-    context = "\n".join(recent)
-
-    if len(context) > MAX_CONTEXT_CHARS:
-        context = context[-MAX_CONTEXT_CHARS:]
-        boundary = context.find("\n**")
-        if boundary > 0:
-            context = context[boundary + 1 :]
-
-    return context, len(recent)
 
 
 def main() -> None:
@@ -130,9 +82,16 @@ def main() -> None:
             logging.info("SKIP: transcript missing: %s", transcript_path_str)
             return
 
+    # Only summarize turns this session hasn't flushed yet — a long session can
+    # compact several times, and each compaction used to re-summarize the same
+    # trailing 30 turns.
+    cursor = load_cursor(session_id)
+
     # Extract conversation context in the hook
     try:
-        context, turn_count = extract_conversation_context(transcript_path)
+        context, total_turns, turn_count = extract_conversation_context(
+            transcript_path, start_turn=cursor
+        )
     except Exception as e:
         logging.error("Context extraction failed: %s", e)
         return
@@ -142,7 +101,10 @@ def main() -> None:
         return
 
     if turn_count < MIN_TURNS_TO_FLUSH:
-        logging.info("SKIP: only %d turns (min %d)", turn_count, MIN_TURNS_TO_FLUSH)
+        logging.info(
+            "SKIP: only %d new turns since cursor %d (min %d)",
+            turn_count, cursor, MIN_TURNS_TO_FLUSH,
+        )
         return
 
     # Write context to a temp file for the background process
@@ -162,6 +124,8 @@ def main() -> None:
         str(flush_script),
         str(context_file),
         session_id,
+        # New cursor — recorded by flush.py only once the flush succeeds.
+        str(total_turns),
     ]
 
     creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -173,7 +137,10 @@ def main() -> None:
             stderr=subprocess.DEVNULL,
             creationflags=creation_flags,
         )
-        logging.info("Spawned flush.py for session %s (%d turns, %d chars)", session_id, turn_count, len(context))
+        logging.info(
+            "Spawned flush.py for session %s (%d new turns, cursor %d -> %d, %d chars)",
+            session_id, turn_count, cursor, total_turns, len(context),
+        )
     except Exception as e:
         logging.error("Failed to spawn flush.py: %s", e)
 

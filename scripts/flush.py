@@ -39,6 +39,7 @@ WIP_FILE = ROOT / "wip.md"
 # pipeline never saw.
 sys.path.insert(0, str(SCRIPTS_DIR))
 from config import CLAUDE_BIN, DAILY_DIR  # noqa: E402
+from flush_cursor import load_cursor, save_cursor  # noqa: E402
 
 # Set up file-based logging so we can verify the background process ran.
 # The parent process sends stdout/stderr to DEVNULL (to avoid the inherited
@@ -473,15 +474,47 @@ def main():
     context_file = Path(sys.argv[1])
     session_id = sys.argv[2]
 
+    # Optional 4th arg: the transcript turn cursor this flush covers. Recorded
+    # only after the flush lands in the daily log, so a failed flush leaves the
+    # cursor where it was and the next flush retries the same window.
+    new_cursor: int | None = None
+    if len(sys.argv) > 3:
+        try:
+            new_cursor = int(sys.argv[3])
+        except ValueError:
+            logging.warning("Ignoring non-integer turn cursor: %r", sys.argv[3])
+
     logging.info("flush.py started for session %s, context: %s", session_id, context_file)
 
     if not context_file.exists():
         logging.error("Context file not found: %s", context_file)
         return
 
-    # Deduplication: skip if same session was flushed within 60 seconds
+    # Deduplication.
+    #
+    # When we have a cursor, dedup on CONTENT, not on time: skip only when this
+    # window adds nothing past what has already been flushed. The old 60-second
+    # time throttle is actively harmful once a cursor exists — it silently drops
+    # windows that carry new turns. Two ways that bites:
+    #   * A PreCompact flush errors (cursor correctly not advanced), the user
+    #     quits <60s later, SessionEnd re-extracts the same window to retry it —
+    #     and the throttle eats the retry. Those turns are never summarized.
+    #   * A PreCompact flush succeeds, then SessionEnd carries a *disjoint*
+    #     later window; the throttle eats that too.
+    # Cursor-based dedup skips exactly the no-op case and nothing else.
     state = load_flush_state()
-    if (
+    if new_cursor is not None:
+        already = load_cursor(session_id)
+        if new_cursor <= already:
+            logging.info(
+                "Skipping flush for session %s: no new turns (cursor %d, window ends at %d)",
+                session_id, already, new_cursor,
+            )
+            context_file.unlink(missing_ok=True)
+            return
+    elif (
+        # Legacy path: a caller that passed no cursor gets the old time throttle,
+        # which is the best we can do without knowing what the window covers.
         state.get("session_id") == session_id
         and time.time() - state.get("timestamp", 0) < 60
     ):
@@ -517,13 +550,24 @@ def main():
     # Run the LLM extraction
     response, flush_cost = asyncio.run(run_flush(context, tool_events_text))
 
+    # Sentinels are matched as a PREFIX of the stripped response, not as a
+    # substring of it. A substring test throws away any real summary that merely
+    # *mentions* the sentinel — and sessions that work on this compiler discuss
+    # FLUSH_OK / FLUSH_ERROR by name constantly. Combined with the turn cursor
+    # (which advances past a FLUSH_OK window) a false positive here would mark
+    # those turns permanently flushed while storing nothing: silent knowledge
+    # loss, unrecoverable.
+    stripped = response.strip()
+    is_flush_ok = stripped.startswith("FLUSH_OK")
+    is_flush_error = stripped.startswith("FLUSH_ERROR")
+
     # Append to daily log
-    if "FLUSH_OK" in response:
+    if is_flush_ok:
         logging.info("Result: FLUSH_OK")
         append_to_daily_log(
             "FLUSH_OK - Nothing worth saving from this session", "Memory Flush"
         )
-    elif "FLUSH_ERROR" in response:
+    elif is_flush_error:
         logging.error("Result: %s", response)
         append_to_daily_log(response, "Memory Flush")
     else:
@@ -551,10 +595,20 @@ def main():
         "session_id": session_id,
         "timestamp": time.time(),
         "cost_usd": flush_cost,
-        "result": "FLUSH_OK" if "FLUSH_OK" in response else ("error" if "FLUSH_ERROR" in response else "saved"),
+        "result": "FLUSH_OK" if is_flush_ok else ("error" if is_flush_error else "saved"),
     })
     state["flush_costs"] = flush_costs
     save_flush_state(state)
+
+    # Advance the transcript cursor so the next flush of this session starts
+    # after these turns. Skipped on FLUSH_ERROR: the window was never actually
+    # summarized, so it must stay eligible for the next attempt.
+    if new_cursor is not None and not is_flush_error:
+        try:
+            save_cursor(session_id, new_cursor)
+            logging.info("Advanced turn cursor for %s to %d", session_id, new_cursor)
+        except OSError as e:
+            logging.error("Failed to save turn cursor: %s", e)
 
 
     # Clean up context file

@@ -31,6 +31,7 @@ from utils import (
     save_state,
 )
 from compile_truth import compile_truth as regenerate_truth, COMPILED_TRUTH_FILE
+import dedup
 
 
 # ── Paths for the LLM to use ──────────────────────────────────────────
@@ -51,6 +52,19 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
     if COMPILED_TRUTH_FILE.exists():
         compiled_truth = COMPILED_TRUTH_FILE.read_text(encoding="utf-8")
 
+    # Duplicate prevention. Telling the model to "check the index for
+    # near-duplicates" against a 678-line index does not work — the KB has
+    # byte-identical articles under two slugs to prove it. Naming the specific
+    # articles this source is semantically closest to gives it something it can
+    # actually act on. Zero cost: local embeddings, no LLM, no network.
+    preflight = ""
+    try:
+        preflight = dedup.format_preflight_block(
+            dedup.similar_to_text(log_content, limit=5)
+        )
+    except Exception as exc:  # never let dedup block a compile
+        print(f"  Duplicate pre-flight failed (continuing): {exc}", file=sys.stderr)
+
     timestamp = now_iso()
 
     prompt = f"""You are a knowledge compiler. Your job is to read a daily conversation log
@@ -67,6 +81,8 @@ and extract knowledge into structured wiki articles.
 ## Current Knowledge (compiled truth)
 
 {compiled_truth if compiled_truth else "(No compiled truth yet — run compile_truth.py first)"}
+
+{preflight}
 
 ## Daily Log to Compile
 
@@ -115,7 +131,7 @@ Read the daily log above and compile it into wiki articles following the schema 
        query comes from missing index on user_id"). Promote to `discovery` or `fact`
        in a later compile when corroborated.
      Pick the MOST specific type that fits. When genuinely uncertain, default to `fact`.
-     An unknown value here fails lint — use exactly one of the six above.
+     An unknown value here fails lint — use exactly one of the eight above.
    - Write Truth in encyclopedia style — dense, factual, no "we discovered"
 3. **Create connection articles** in `knowledge/connections/` if this log reveals non-obvious
    relationships between 2+ existing concepts

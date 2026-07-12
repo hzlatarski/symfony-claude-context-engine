@@ -136,3 +136,46 @@ class TestCheckMemoryTypes:
         assert len(issues) == 2
         severities = sorted(i["severity"] for i in issues)
         assert severities == ["error", "suggestion"]
+
+
+class TestPromptTaxonomyMatchesConfig:
+    """The compiler prompts must teach exactly the taxonomy that lint enforces.
+
+    compile.py's prompt listed all eight types but then closed with "use exactly
+    one of the six above" — a stale count left behind when `tension` and
+    `hypothesis` were added. The LLM writes `type:` from the prompt; lint
+    validates it against config.MEMORY_TYPES. Any drift between the two shows up
+    as articles that fail lint for a type the prompt told the model to use.
+    """
+
+    def _prompt_sources(self):
+        from pathlib import Path
+        root = Path(__file__).resolve().parent.parent / "scripts"
+        return {
+            name: (root / name).read_text(encoding="utf-8")
+            for name in ("compile.py", "ingest.py")
+        }
+
+    def test_every_config_type_is_offered_by_both_prompts(self):
+        from config import MEMORY_TYPES
+        for name, src in self._prompt_sources().items():
+            for mtype in MEMORY_TYPES:
+                assert f"`{mtype}`" in src, f"{name} prompt never offers type '{mtype}'"
+
+    def test_prompts_do_not_state_a_stale_type_count(self):
+        from config import MEMORY_TYPES
+        words = {
+            4: "four", 5: "five", 6: "six", 7: "seven",
+            8: "eight", 9: "nine", 10: "ten",
+        }
+        correct = words[len(MEMORY_TYPES)]
+        wrong = {w for n, w in words.items() if w != correct}
+        for name, src in self._prompt_sources().items():
+            for w in wrong:
+                assert f"one of the {w}" not in src, (
+                    f"{name} says 'one of the {w}' but config.MEMORY_TYPES has "
+                    f"{len(MEMORY_TYPES)} types ({correct})"
+                )
+            assert f"one of the {correct}" in src, (
+                f"{name} never states the correct type count ({correct})"
+            )

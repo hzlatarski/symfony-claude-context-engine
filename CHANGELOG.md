@@ -4,6 +4,25 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [0.5.0] — 2026-07-12
+
+Fixes for three defects found while comparing this engine against [TencentDB Agent Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory), plus the duplicate-detection mechanism it had and this one lacked. Its layered-memory half is largely what this engine already does; its context-offload half needs host hooks that rewrite the live message array, which Claude Code does not expose. What transferred is the *principle* that a lossy summary must ship a handle back to the full text — applied here to compiled-truth excerpts.
+
+### Fixed
+
+- **compiled-truth had collapsed to 8 of 678 articles.** Entries were full article bodies, and at a ~4,000-char mean a 40,000-char budget fit almost nothing — the priority scoring was choosing between a handful of verbose articles instead of ranking the knowledge base. Entries are now capped to a 1,200-char excerpt (`MAX_ARTICLE_CHARS`, `--max-article-chars 0` to disable) carrying a `get_article(slug)` pointer to the full text. 8 → 37 articles in the file; ~1.5 → 18 in the session-start injection.
+- **The session-start heading lied.** It read "Compiled Truth (all current knowledge)" while injecting the top 25%, so the agent believed it had the whole KB and skipped `search_knowledge`. Heading and truncation notice now state what is and isn't included.
+- **Duplicate and per-turn flushes.** `settings.local.json` bound the flush hook to `Stop` (fires every assistant turn) and duplicated the `PreCompact` binding. Both removed; `settings.json` already wired `SessionEnd` and `PreCompact` correctly.
+- **Overlapping flush windows.** Every flush re-read the last 30 turns of the whole transcript, so PreCompact and SessionEnd re-summarized the same turns into duplicate daily-log entries. New per-session turn cursor (`flush_cursor.py`) advances only after a flush succeeds, so a failed flush retries its window instead of losing it.
+- **Flush sentinels were substring-matched.** A real summary that merely *mentioned* `FLUSH_OK` was discarded and replaced with "Nothing worth saving" — and sessions working on this compiler mention it constantly. Now matched as a prefix of the stripped response.
+- **`compile.py`'s prompt said "one of the six"** memory types while listing all eight, contradicting `config.MEMORY_TYPES`. A drift-guard test now fails if the prompts and the config taxonomy disagree.
+
+### Added
+
+- **`dedup.py` — near-duplicate detection.** All-pairs cosine sweep over the article vectors already in Chroma; zero LLM, zero network, zero cost. The compiler prompt had always *asked* the LLM not to create near-duplicates; nothing ever checked. It had not been working: the live KB held byte-identical articles under two slugs, three HeyGen v3 articles, and three CSRF articles. Surfaced as the `near_duplicate` lint check. Deliberately does not auto-merge — choosing which facts survive a merge is not a decision to automate.
+- **Duplicate prevention at compile time.** `compile.py` and `ingest.py` now name the existing articles a source is semantically closest to ("prefer UPDATING one of these"), instead of telling the model to scan a 678-line index. The source is chunked before embedding, since the embedder truncates at 256 tokens and would otherwise see only the first session of a daily log.
+- **Stale-vector detection and pruning.** Deleting or renaming an article left its embedding behind, so `search_knowledge` could return a slug that `get_article` cannot open. `dedup.py --prune-stale` removes them; surfaced as the `stale_vector` lint check. Six were found and pruned in this repo.
+
 ## [0.4.0] — 2026-07-11
 
 Four improvements adapted from [Graphify](https://github.com/Graphify-Labs/graphify)'s code-intelligence graph — the ideas it had that this engine lacked, filtered to what fits a curated + retrieval hybrid (its "no embeddings" thesis and multi-LLM backends were deliberately *not* adopted). All four are pure-Python and add zero LLM cost.

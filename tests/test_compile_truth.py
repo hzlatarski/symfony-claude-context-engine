@@ -272,3 +272,144 @@ def test_compile_truth_with_clusters_includes_communities_section(tmp_path, monk
     assert "Concept Clusters" in section
     assert "Test Cluster" in section
     assert "article:concepts/x" in section
+
+
+class TestExcerptTruth:
+    """Entries are capped to an excerpt so the budget buys breadth, not depth."""
+
+    def test_short_truth_is_returned_untouched(self):
+        from scripts.compile_truth import excerpt_truth
+        truth = "Short and sweet."
+        assert excerpt_truth(truth, "concepts/foo", cap=1_200) == truth
+
+    def test_cap_zero_disables_excerpting(self):
+        from scripts.compile_truth import excerpt_truth
+        truth = "x" * 5_000
+        assert excerpt_truth(truth, "concepts/foo", cap=0) == truth
+
+    def test_long_truth_is_capped_and_gets_a_full_text_pointer(self):
+        from scripts.compile_truth import excerpt_truth
+        truth = ("Paragraph one is here.\n\n" * 200)
+        out = excerpt_truth(truth, "concepts/foo", cap=1_200)
+        assert len(out) < len(truth)
+        # The pointer is what makes the lossy cut safe — without it the model
+        # cannot tell the entry is partial or how to recover the rest.
+        assert 'get_article("concepts/foo")' in out
+        assert "excerpt" in out
+
+    def test_cut_lands_on_a_paragraph_boundary(self):
+        from scripts.compile_truth import excerpt_truth
+        truth = ("Sentence a. " * 50) + "\n\n" + ("Sentence b. " * 200)
+        out = excerpt_truth(truth, "concepts/foo", cap=1_200)
+        body = out.split("\n\n_…")[0]
+        # Must not end mid-word
+        assert not body.endswith("Sen")
+        assert body.rstrip().endswith(".")
+
+    def test_unbroken_paragraph_still_keeps_at_least_half_the_cap(self):
+        from scripts.compile_truth import excerpt_truth
+        truth = "x" * 5_000  # no separators at all
+        out = excerpt_truth(truth, "concepts/foo", cap=1_200)
+        body = out.split("\n\n_…")[0]
+        assert len(body) >= 600, "a separator-free body must not collapse to nothing"
+        assert len(body) <= 1_200
+
+
+class TestCompiledTruthBreadth:
+    """A budget of verbose articles must not crowd the KB down to a handful."""
+
+    def test_excerpting_admits_far_more_articles_than_full_bodies(self, tmp_path, monkeypatch):
+        import sys
+        from scripts import compile_truth, config, utils
+
+        knowledge = tmp_path / "knowledge"
+        (knowledge / "concepts").mkdir(parents=True)
+        (knowledge / "connections").mkdir()
+
+        # 20 articles, each far larger than the per-entry cap.
+        for i in range(20):
+            (knowledge / "concepts" / f"a{i:02d}.md").write_text(
+                f"---\ntitle: A{i}\nupdated: 2026-04-12\nconfidence: 0.9\n---\n\n"
+                "## Truth\n\n" + (f"Body of article {i}. " * 300) + "\n",
+                encoding="utf-8",
+            )
+
+        contradictions = knowledge / "contradictions.json"
+        contradictions.write_text(json.dumps({"quarantined": [], "updated": "2026-04-12T00:00:00+00:00"}))
+
+        for mod in (config, compile_truth):
+            monkeypatch.setattr(mod, "KNOWLEDGE_DIR", knowledge, raising=False)
+            monkeypatch.setattr(mod, "CONCEPTS_DIR", knowledge / "concepts", raising=False)
+            monkeypatch.setattr(mod, "CONNECTIONS_DIR", knowledge / "connections", raising=False)
+        monkeypatch.setattr(compile_truth, "COMPILED_TRUTH_FILE", knowledge / "compiled-truth.md")
+        monkeypatch.setattr(utils, "CONTRADICTIONS_FILE", contradictions)
+        # Bare-form module copies (see TestCompileTruthQuarantine for why).
+        for name, patched in (("utils", utils), ("config", config), ("compile_truth", compile_truth)):
+            bare = sys.modules.get(name)
+            if bare is None or bare is patched:
+                continue
+            if name == "utils":
+                monkeypatch.setattr(bare, "CONTRADICTIONS_FILE", contradictions)
+                continue
+            monkeypatch.setattr(bare, "KNOWLEDGE_DIR", knowledge, raising=False)
+            monkeypatch.setattr(bare, "CONCEPTS_DIR", knowledge / "concepts", raising=False)
+            monkeypatch.setattr(bare, "CONNECTIONS_DIR", knowledge / "connections", raising=False)
+            if name == "compile_truth":
+                monkeypatch.setattr(bare, "COMPILED_TRUTH_FILE", knowledge / "compiled-truth.md")
+
+        budget = 20_000
+
+        full, _, _ = compile_truth.compile_truth(budget=budget, max_article_chars=0)
+        excerpted, _, _ = compile_truth.compile_truth(budget=budget, max_article_chars=1_200)
+
+        # This is the regression: at ~6,000 chars/article a 20k budget held 3.
+        assert full <= 4
+        assert excerpted >= 15
+        assert excerpted > full
+
+        output = (knowledge / "compiled-truth.md").read_text(encoding="utf-8")
+        assert len(output) <= budget + 2_000  # header + banner overhead
+        assert "not** all of it" in output  # honest-scope banner
+
+
+class TestExcerptMarkdownSafety:
+    """compiled-truth.md concatenates entries, so a cut must not corrupt the doc."""
+
+    def test_cut_inside_a_code_fence_closes_the_fence(self):
+        from scripts.compile_truth import excerpt_truth
+        truth = "Intro paragraph.\n\n```php\n" + ("$x = 1;\n" * 400) + "```\n"
+        out = excerpt_truth(truth, "concepts/foo", cap=1_200)
+        # An unclosed ``` would swallow every following article into a code block.
+        assert out.count("```") % 2 == 0, "excerpt left an unbalanced code fence"
+
+    def test_balanced_fence_is_left_alone(self):
+        from scripts.compile_truth import excerpt_truth
+        truth = "```php\n$x = 1;\n```\n\n" + ("Filler paragraph. " * 300)
+        out = excerpt_truth(truth, "concepts/foo", cap=1_200)
+        assert out.count("```") % 2 == 0
+
+    def test_separator_below_half_cap_is_rejected_and_cut_is_hard(self):
+        """The `idx >= cap // 2` rule: a separator too early must not be used.
+
+        Otherwise one early newline in a long unbroken run would collapse the
+        entry to a fragment.
+        """
+        from scripts.compile_truth import excerpt_truth
+        # Only separator sits at char 100 — well below cap//2 (600).
+        truth = ("a" * 100) + "\n\n" + ("b" * 5_000)
+        out = excerpt_truth(truth, "concepts/foo", cap=1_200)
+        body = out.split("\n\n_…")[0]
+        assert len(body) > 600, "cut at an early separator collapsed the entry"
+        assert len(body) <= 1_200
+
+    def test_separator_past_half_cap_is_used(self):
+        from scripts.compile_truth import excerpt_truth
+        truth = ("a" * 800) + "\n\n" + ("b" * 5_000)
+        out = excerpt_truth(truth, "concepts/foo", cap=1_200)
+        body = out.split("\n\n_…")[0]
+        assert body == "a" * 800, "should have cut at the paragraph break"
+
+    def test_text_exactly_at_cap_is_untouched(self):
+        from scripts.compile_truth import excerpt_truth
+        truth = "a" * 1_200
+        assert excerpt_truth(truth, "concepts/foo", cap=1_200) == truth
