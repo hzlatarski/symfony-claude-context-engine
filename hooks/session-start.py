@@ -54,7 +54,11 @@ PROJECT_KNOWLEDGE_DIR = ROOT.parent.parent / "knowledge"
 INDEX_FILE = PROJECT_KNOWLEDGE_DIR / "index.md"
 DAILY_DIR = PROJECT_KNOWLEDGE_DIR / "daily"
 COMPILED_TRUTH_FILE = PROJECT_KNOWLEDGE_DIR / "compiled-truth.md"
-MAX_COMPILED_TRUTH_CHARS = 10_000
+# compile_truth.py caps each entry to a ~1,200-char excerpt, so this budget now
+# buys ~16 articles rather than the 1.5 verbose ones it bought when entries were
+# full article bodies. Kept well under MAX_CONTEXT_CHARS so the index and the
+# daily log below still fit.
+MAX_COMPILED_TRUTH_CHARS = 20_000
 MAX_INDEX_CHARS = 20_000
 STATE_FILE = ROOT / "scripts" / "state.json"
 FLUSH_STATE_FILE = ROOT / "scripts" / "last-flush.json"
@@ -101,7 +105,19 @@ def get_compiled_truth() -> str | None:
         last_sep = truncated.rfind("\n---\n")
         if last_sep > 0:
             truncated = truncated[:last_sep]
-        content = truncated + "\n\n...(truncated)"
+        # Say what was dropped. A bare "(truncated)" under a heading that used to
+        # read "all current knowledge" told the model it had the whole KB, so it
+        # skipped search_knowledge — the single worst thing this hook can do.
+        # Count only article headings (`## concepts/foo`), not any `## ` that
+        # happens to appear inside an article body.
+        _heading = re.compile(r"^## (?:concepts|connections|qa)/", re.MULTILINE)
+        shown = len(_heading.findall(truncated))
+        total = len(_heading.findall(content))
+        content = (
+            truncated
+            + f"\n\n_…(compiled truth truncated — {shown} of {total} scored articles "
+            "shown; use `search_knowledge` to reach the rest)_"
+        )
     return content
 
 
@@ -393,10 +409,15 @@ def build_context() -> str:
     else:
         parts.append("## Knowledge Base Index\n\n(empty - no articles compiled yet)")
 
-    # Compiled truth — dense summary of all current knowledge
+    # Compiled truth — the highest-priority slice of the KB, in excerpt form.
+    # NOT all current knowledge: with 600+ articles this is a few percent of the
+    # base, so the heading must not imply completeness.
     compiled_truth = get_compiled_truth()
     if compiled_truth:
-        parts.append(f"## Compiled Truth (all current knowledge)\n\n{compiled_truth}")
+        parts.append(
+            "## Compiled Truth (highest-priority excerpts — not the whole KB)"
+            f"\n\n{compiled_truth}"
+        )
 
     # Recent daily log
     recent_log = get_recent_log()

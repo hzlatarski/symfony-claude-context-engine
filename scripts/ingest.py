@@ -39,6 +39,7 @@ from utils import (
     save_state,
 )
 from compile_truth import compile_truth as regenerate_truth, COMPILED_TRUTH_FILE
+import dedup
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
@@ -104,6 +105,17 @@ async def ingest_source_file(
     if COMPILED_TRUTH_FILE.exists():
         compiled_truth = COMPILED_TRUTH_FILE.read_text(encoding="utf-8")
 
+    # Duplicate prevention — name the existing articles this source is closest
+    # to, so "prefer UPDATE over CREATE" has concrete targets instead of being
+    # an instruction to search a 678-line index. See dedup.py.
+    preflight = ""
+    try:
+        preflight = dedup.format_preflight_block(
+            dedup.similar_to_text(doc.content, limit=5)
+        )
+    except Exception as exc:  # never let dedup block an ingest
+        print(f"  Duplicate pre-flight failed (continuing): {exc}", file=sys.stderr)
+
     timestamp = now_iso()
     rel_source = f"sources/{group.id}/{file_path.name}"
 
@@ -121,6 +133,8 @@ extract knowledge into structured wiki articles.
 ## Current Knowledge (compiled truth)
 
 {compiled_truth if compiled_truth else "(No compiled truth yet — run compile_truth.py first)"}
+
+{preflight}
 
 ## Source Document to Ingest
 

@@ -295,6 +295,84 @@ def check_memory_types() -> list[dict]:
     return issues
 
 
+def check_near_duplicates() -> list[dict]:
+    """Flag article pairs whose Observed text is near-identical.
+
+    Zero-cost (local embeddings already in Chroma, pure numpy sweep). The
+    compiler prompt has always *asked* the LLM not to create near-duplicates;
+    this is the first check that verifies it actually didn't. Never auto-fixes:
+    merging two articles decides which facts survive, and getting that wrong
+    destroys knowledge silently.
+    """
+    try:
+        import dedup
+    except ImportError as exc:  # numpy missing, etc. — a lint check must not crash
+        return [{
+            "check": "near_duplicate",
+            "file": "-",
+            "severity": "warning",
+            "detail": f"near-duplicate check unavailable: {exc}",
+        }]
+
+    try:
+        pairs = dedup.find_near_duplicates()
+    except Exception as exc:
+        return [{
+            "check": "near_duplicate",
+            "file": "-",
+            "severity": "warning",
+            "detail": f"near-duplicate scan failed: {exc}",
+        }]
+
+    return [
+        {
+            "check": "near_duplicate",
+            "file": f"{p.slug_a}.md",
+            # Effectively-identical text is a defect, not a style nit: two slugs
+            # hold the same fact and they will drift apart on the next edit.
+            "severity": "error" if p.identical else "warning",
+            "detail": (
+                f"{'identical to' if p.identical else 'near-duplicate of'} "
+                f"{p.slug_b} (cosine {p.similarity:.3f}) — merge them, or "
+                "differentiate the two articles"
+            ),
+        }
+        for p in pairs
+    ]
+
+
+def check_stale_vectors() -> list[dict]:
+    """Flag vectors whose article file no longer exists.
+
+    Deleting or renaming an article leaves its embedding behind. search_knowledge
+    then returns a slug that get_article cannot open — a guaranteed dead end for
+    whoever retrieves it.
+    """
+    try:
+        import dedup
+        stale = dedup.find_stale_vectors()
+    except Exception as exc:
+        return [{
+            "check": "stale_vector",
+            "file": "-",
+            "severity": "warning",
+            "detail": f"stale-vector scan failed: {exc}",
+        }]
+
+    return [
+        {
+            "check": "stale_vector",
+            "file": f"{slug}.md",
+            "severity": "warning",
+            "detail": (
+                "indexed in Chroma but no file on disk — search can return it and "
+                "get_article will fail. Fix: scripts/dedup.py --prune-stale"
+            ),
+        }
+        for slug in stale
+    ]
+
+
 def check_low_priority_articles() -> list[dict]:
     """Check for articles that score below the inclusion threshold.
 
@@ -567,6 +645,8 @@ def main():
         ("Source anchors", check_source_anchors),
         ("Memory types", check_memory_types),
         ("Wikilink relations", check_wikilink_relations),
+        ("Near-duplicate articles", check_near_duplicates),
+        ("Stale vectors", check_stale_vectors),
     ]
 
     for name, check_fn in checks:

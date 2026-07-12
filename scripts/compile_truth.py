@@ -36,6 +36,16 @@ from utils import (
 COMPILED_TRUTH_FILE = KNOWLEDGE_DIR / "compiled-truth.md"
 DEFAULT_BUDGET_CHARS = 40_000
 
+# Per-article excerpt cap. Article truth bodies average ~4,000 chars and reach
+# 22,000 at the tail, so filling the budget with *whole* bodies buys almost no
+# breadth: at 678 articles the 40,000-char budget held only 8 of them, and the
+# priority scoring was effectively choosing between a handful of verbose
+# articles rather than ranking the knowledge base. Capping each entry to an
+# excerpt trades depth for breadth (~30 articles at 1,200 chars) and is safe
+# because every entry carries a get_article() pointer back to the full text —
+# compiled truth is a map, not the territory. Set to 0 to disable capping.
+MAX_ARTICLE_CHARS = 1_200
+
 # ── Scoring weights ──────────────────────────────────────────────────
 # These control how articles are ranked for inclusion in compiled truth.
 # Pinned articles bypass scoring entirely (always included first).
@@ -358,6 +368,43 @@ def compute_score(
     )
 
 
+# ── Excerpting ───────────────────────────────────────────────────────
+
+def excerpt_truth(truth: str, slug: str, cap: int = MAX_ARTICLE_CHARS) -> str:
+    """Trim ``truth`` to ``cap`` chars at a clean boundary, with a full-text pointer.
+
+    Cuts at the last paragraph break before the cap, falling back to a line break
+    and then a word break. If no separator sits past the halfway mark (one long
+    unbroken run of text) the cut is hard at ``cap`` rather than collapsing the
+    entry to a fragment.
+
+    Any code fence left open by the cut is closed, because compiled-truth.md
+    concatenates every entry into one document: a stray ``` would swallow all
+    following articles into a code block for whoever reads it.
+
+    Returns ``truth`` untouched when it already fits or when ``cap`` is 0.
+    """
+    if cap <= 0 or len(truth) <= cap:
+        return truth
+
+    head = truth[:cap]
+    for sep in ("\n\n", "\n", " "):
+        idx = head.rfind(sep)
+        # Require the cut to keep at least half the budget, otherwise a single
+        # long unbroken paragraph would collapse the entry to a few words.
+        if idx >= cap // 2:
+            head = head[:idx]
+            break
+
+    head = head.rstrip()
+
+    # An odd number of fence markers means we cut inside a code block.
+    if head.count("```") % 2 == 1:
+        head += "\n```"
+
+    return f'{head}\n\n_…(excerpt — full article: `get_article("{slug}")`)_'
+
+
 # ── Article data ─────────────────────────────────────────────────────
 
 class ScoredArticle:
@@ -421,6 +468,7 @@ def compile_truth(
     verbose: bool = False,
     include_synth: bool = False,
     with_clusters: bool = False,
+    max_article_chars: int = MAX_ARTICLE_CHARS,
 ) -> tuple[int, int, int]:
     """Generate compiled-truth.md with priority scoring.
 
@@ -464,6 +512,9 @@ def compile_truth(
                 truth = extract_fallback_truth(content)
             if not truth:
                 continue
+
+            # Cap the entry so the budget buys breadth, not a few long articles
+            truth = excerpt_truth(truth, slug, max_article_chars)
 
             # Parse frontmatter for metadata
             fm = parse_frontmatter(content)
@@ -565,6 +616,15 @@ def compile_truth(
         "",
         f"> {included_count} articles (of {total_count} total, {budget_note}) | Generated {timestamp}",
     ]
+
+    if max_article_chars > 0:
+        lines.append("")
+        lines.append(
+            f"> Entries are excerpts (max {max_article_chars:,} chars each). This is the "
+            f"highest-priority slice of the knowledge base, **not** all of it — call "
+            f"`get_article(slug)` for an article's full text, and `search_knowledge(query)` "
+            f"for the {total_count - included_count} articles not listed here."
+        )
 
     if quarantined:
         lines.append("")
@@ -669,6 +729,15 @@ def main():
         action="store_true",
         help="Append a 'Concept Clusters' section listing the top 5 Leiden communities.",
     )
+    parser.add_argument(
+        "--max-article-chars",
+        type=int,
+        default=MAX_ARTICLE_CHARS,
+        help=(
+            f"Excerpt cap per article (default: {MAX_ARTICLE_CHARS:,}; "
+            "0 = include full article bodies)"
+        ),
+    )
     args = parser.parse_args()
 
     included, total, pinned = compile_truth(
@@ -677,6 +746,7 @@ def main():
         verbose=args.verbose,
         include_synth=args.include_synth,
         with_clusters=args.with_clusters,
+        max_article_chars=args.max_article_chars,
     )
 
     excluded = total - included
