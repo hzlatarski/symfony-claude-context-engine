@@ -166,9 +166,23 @@ def test_same_tick_content_change_is_detected(tmp_path, monkeypatch) -> None:
 
 # ── retry bounding ───────────────────────────────────────────────────────────
 
-def test_failures_are_bounded_then_skipped(tmp_path, monkeypatch) -> None:
-    """A permanently-failing file must not be retried forever."""
+@pytest.fixture
+def isolated_state(monkeypatch):
+    """Stub save_state.
+
+    record_failure persists through ingest.save_state, which writes the REAL
+    scripts/state.json. Without this stub these tests overwrite it with their
+    own throwaway dict — which is exactly what happened on 2026-07-26,
+    destroying 494 ingested-source records and 2197 codebase hashes.
+    """
     import ingest
+    monkeypatch.setattr(ingest, "save_state", lambda *_a, **_k: None)
+    return ingest
+
+
+def test_failures_are_bounded_then_skipped(isolated_state, monkeypatch) -> None:
+    """A permanently-failing file must not be retried forever."""
+    ingest = isolated_state
     state: dict = {}
     key, h = "research-output/bad.md", "hash-1"
     for _ in range(ingest.MAX_INGEST_ATTEMPTS):
@@ -177,8 +191,8 @@ def test_failures_are_bounded_then_skipped(tmp_path, monkeypatch) -> None:
     assert ingest.should_skip_after_failures(state, key, h)
 
 
-def test_editing_a_failed_source_resets_its_attempts(tmp_path, monkeypatch) -> None:
-    import ingest
+def test_editing_a_failed_source_resets_its_attempts(isolated_state) -> None:
+    ingest = isolated_state
     state: dict = {}
     key = "research-output/bad.md"
     for _ in range(ingest.MAX_INGEST_ATTEMPTS):
@@ -187,9 +201,9 @@ def test_editing_a_failed_source_resets_its_attempts(tmp_path, monkeypatch) -> N
     assert not ingest.should_skip_after_failures(state, key, "hash-2")
 
 
-def test_failures_never_land_in_ingested_sources(tmp_path, monkeypatch) -> None:
+def test_failures_never_land_in_ingested_sources(isolated_state) -> None:
     """Recording a success hash is what makes a file invisible — keep them apart."""
-    import ingest
+    ingest = isolated_state
     state: dict = {"ingested_sources": {}}
     ingest.record_failure(state, "research-output/bad.md", "h")
     assert state["ingested_sources"] == {}
