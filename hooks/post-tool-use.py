@@ -62,12 +62,19 @@ try:
 except Exception:  # pragma: no cover — absolute last-resort fallback
     DAILY_DIR = ROOT.parent.parent / "knowledge" / "daily"
 
-logging.basicConfig(
-    filename=str(SCRIPTS_DIR / "flush.log"),
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [post-tool-use] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+_LOG_FMT = "%(asctime)s %(levelname)s [post-tool-use] %(message)s"
+try:
+    from log_setup import configure as configure_logging  # noqa: E402
+
+    configure_logging(SCRIPTS_DIR / "flush.log", _LOG_FMT)
+except Exception:  # pragma: no cover — mirrors the config import guard above
+    # This hook fires on every tool use; an unrotated log beats a broken hook.
+    logging.basicConfig(
+        filename=str(SCRIPTS_DIR / "flush.log"),
+        level=logging.INFO,
+        format=_LOG_FMT,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 # Cap every digest value at this length. Bash commands, Grep patterns, and
 # Task descriptions can run long; the drawer is for shape + intent, not for

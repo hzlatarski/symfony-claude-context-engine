@@ -40,16 +40,12 @@ WIP_FILE = ROOT / "wip.md"
 sys.path.insert(0, str(SCRIPTS_DIR))
 from config import CLAUDE_BIN, DAILY_DIR  # noqa: E402
 from flush_cursor import load_cursor, save_cursor  # noqa: E402
+from log_setup import configure as configure_logging  # noqa: E402
 
 # Set up file-based logging so we can verify the background process ran.
 # The parent process sends stdout/stderr to DEVNULL (to avoid the inherited
 # file handle bug on Windows), so this is our only observability channel.
-logging.basicConfig(
-    filename=str(LOG_FILE),
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+configure_logging(LOG_FILE, "%(asctime)s %(levelname)s %(message)s")
 
 
 def load_flush_state() -> dict:

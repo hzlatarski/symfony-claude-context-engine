@@ -36,13 +36,12 @@ STATE_DIR = SCRIPTS_DIR
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 from flush_cursor import load_cursor  # noqa: E402
+from log_setup import configure as configure_logging  # noqa: E402
 from transcript import extract_conversation_context  # noqa: E402
 
-logging.basicConfig(
-    filename=str(SCRIPTS_DIR / "flush.log"),
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [pre-compact] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+configure_logging(
+    SCRIPTS_DIR / "flush.log",
+    "%(asctime)s %(levelname)s [pre-compact] %(message)s",
 )
 
 MIN_TURNS_TO_FLUSH = 5

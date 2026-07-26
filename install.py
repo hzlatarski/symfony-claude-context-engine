@@ -46,12 +46,19 @@ CLAUDE_DIR = HERE.parent                    # .claude/
 PROJECT_ROOT = HERE.parent.parent           # your Symfony project root
 
 # ── Hook config ───────────────────────────────────────────────────────────────
-HOOKS: dict[str, list] = {
-    "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/session-start.py", "timeout": 15}]}],
-    "PreCompact":   [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/pre-compact.py",    "timeout": 10}]}],
-    "SessionEnd":   [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/session-end.py",    "timeout": 10}]}],
-    "PostToolUse":  [{"matcher": "", "hooks": [{"type": "command", "command": "cd .claude/memory-compiler && uv run python hooks/post-tool-use.py",  "timeout": 5 }]}],
-}
+# (event, script, timeout). The full shell command is built at install time by
+# ``_build_hooks()`` so it can bake in an absolute uv location — see
+# ``_uv_hook_prefix()`` for why a bare ``uv`` is never safe to emit.
+_HOOK_SPECS: tuple[tuple[str, str, int], ...] = (
+    ("SessionStart",     "hooks/session-start.py",      15),
+    # Ships in every install but went unregistered until 2026-07-26, so the
+    # auto-injection feature was simply absent wherever nobody wired it by
+    # hand — 4 of 7 projects. If the hook file ships, the installer registers it.
+    ("UserPromptSubmit", "hooks/user-prompt-submit.py", 12),
+    ("PreCompact",       "hooks/pre-compact.py",        10),
+    ("SessionEnd",       "hooks/session-end.py",        10),
+    ("PostToolUse",      "hooks/post-tool-use.py",       5),
+)
 
 # ── MCP server config ─────────────────────────────────────────────────────────
 # The VS Code Claude Code extension reads user-scope MCP servers from
@@ -118,25 +125,44 @@ def merge_settings_json() -> None:
             _warn("settings.json exists but is not valid JSON — starting fresh")
 
     hooks = data.setdefault("hooks", {})
-    added = 0
-    for event, entries in HOOKS.items():
+    added = repaired = 0
+    for event, script, _timeout in _HOOK_SPECS:
+        entries = _build_hooks()[event]
         bucket = hooks.setdefault(event, [])
         our_cmd: str = entries[0]["hooks"][0]["command"]
-        already_there = any(
-            h.get("hooks", [{}])[0].get("command", "") == our_cmd
-            for h in bucket
+
+        existing = next(
+            (h for h in bucket
+             if any(_is_our_hook(c, script) for c in _hook_commands(h))),
+            None,
         )
-        if not already_there:
+        if existing is None:
             bucket.extend(entries)
             added += 1
+        elif _is_broken_uv_command(_hook_command(existing)):
+            # Repair ONLY the known-broken shape. Matching on the whole command
+            # string (the old behaviour) treats a stale command as a different
+            # hook, so a re-run left it broken — how three projects ended up
+            # with dead bare-uv hooks. But rewriting *any* difference would
+            # instead destroy deliberate customisation (added env vars,
+            # wrappers, redirection), so we touch only commands that are
+            # actually broken. See _uv_hook_prefix().
+            existing["hooks"][0]["command"] = our_cmd
+            repaired += 1
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
+    rel = path.relative_to(PROJECT_ROOT)
     if added:
-        _ok(f"Added {added} hook(s) to {path.relative_to(PROJECT_ROOT)}")
-    else:
-        _skip(f"Hooks already present in {path.relative_to(PROJECT_ROOT)}")
+        _ok(f"Added {added} hook(s) to {rel}")
+    if repaired:
+        _ok(f"Repaired {repaired} stale hook command(s) in {rel}")
+    if not added and not repaired:
+        _skip(f"Hooks already present in {rel}")
+    if not _find_uv():
+        _warn("uv not found on PATH — hooks will fail until uv is installed "
+              "or the hook commands are given an absolute uv path.")
 
 
 # ── Step 2: register MCP servers at User scope ───────────────────────────────
@@ -239,6 +265,134 @@ def _find_uv() -> str | None:
         if resolved:
             return resolved
     return None
+
+
+def _to_bash_path(p: Path) -> str:
+    """``C:\\Users\\me\\Scripts`` → ``/c/Users/me/Scripts`` for Git Bash."""
+    posix = p.as_posix()
+    if len(posix) > 1 and posix[1] == ":":
+        return f"/{posix[0].lower()}{posix[2:]}"
+    return posix
+
+
+def _uv_hook_prefix() -> str:
+    """Shell prefix that makes ``uv`` resolvable from inside a Claude Code hook.
+
+    Hooks execute in a bash shell whose PATH is NOT the one this installer
+    inherited. On Windows, uv installed under ``%APPDATA%\\Python\\Scripts`` is
+    routinely absent from Git Bash's PATH, so a bare ``uv run`` dies with
+    "uv: command not found" — and because a hook's non-zero exit is swallowed,
+    every hook then silently no-ops. The project stops flushing sessions and
+    accumulating knowledge with no visible error at all.
+
+    That is not hypothetical: on 2026-07-26 three projects were found with all
+    four hooks dead this way. CarPro's last captured daily log was 2026-06-23
+    and eintollesfest's 2026-06-24 — roughly a month of lost capture each —
+    while JunkYardPro had never captured a single session. Re-running this
+    installer was itself the trigger, because it rewrote hand-patched commands
+    back to a bare ``uv``.
+
+    So we never emit a bare ``uv``: prepend the resolved binary's own directory
+    to PATH, which is harmless when uv is already there and decisive when it is
+    not. ``unset VIRTUAL_ENV`` rides along because an activated project
+    virtualenv otherwise makes uv resolve the wrong environment.
+    """
+    base = "cd .claude/memory-compiler && unset VIRTUAL_ENV &&"
+    uv_exe = _find_uv()
+    if not uv_exe:
+        # Nothing to bake in. The hook still needs *some* command; a bare uv at
+        # least works for users who do have it on PATH, and step 1 warns.
+        return f"{base} uv run python"
+    uv_dir = _to_bash_path(Path(uv_exe).resolve().parent)
+    return f'{base} PATH="$PATH:{uv_dir}" uv run python'
+
+
+def _hook_commands(entry: object) -> list[str]:
+    """Every ``command`` string inside one settings.json hook entry.
+
+    settings.json is user-editable and may hold shapes we did not write —
+    ``{"hooks": []}``, non-dict members, or several inner hooks grouped under
+    one entry with ours not first. Indexing ``[0]`` blindly raises IndexError
+    and aborts the install, and looking only at ``[0]`` would miss our own hook
+    in a grouped entry and append a duplicate. So: scan them all, defensively.
+    """
+    if not isinstance(entry, dict):
+        return []
+    inner = entry.get("hooks")
+    if not isinstance(inner, list):
+        return []
+    return [
+        h["command"] for h in inner
+        if isinstance(h, dict) and isinstance(h.get("command"), str)
+    ]
+
+
+def _hook_command(entry: object) -> str:
+    """First command in ``entry``, or "" — convenience for reporting."""
+    commands = _hook_commands(entry)
+    return commands[0] if commands else ""
+
+
+def _normalise(command: str) -> str:
+    """Windows backslashes → forward slashes, for path comparison."""
+    return command.replace("\\", "/")
+
+
+def _is_our_hook(command: str, script: str) -> bool:
+    """True only for a command this installer owns.
+
+    A suffix test alone is not ownership: a user's own
+    ``python .claude/my/hooks/session-end.py`` also ends with
+    ``hooks/session-end.py`` and must never be rewritten — so we additionally
+    require the memory-compiler directory.
+
+    Matching is on the script as a *token*, not via ``endswith``: a command may
+    carry arguments or redirection (``… session-end.py 2>>err``) and would
+    otherwise go unrecognised, causing a second copy to be appended so the
+    event fires twice. Backslash spellings are normalised for the same reason.
+    """
+    if not command:
+        return False
+    normalised = _normalise(command)
+    if ".claude/memory-compiler" not in normalised:
+        return False
+    return any(token == script or token.endswith("/" + script)
+               for token in normalised.split())
+
+
+# A real PATH assignment, not an incidental substring. ``MYPATH=…`` (different
+# variable) and ``echo PATH=missing`` (an argument, not an assignment) must not
+# make a genuinely broken hook look repaired, or it never gets fixed and the
+# project silently stops capturing. So the match must sit at the start of a
+# command segment — start of string or just after ``;`` / ``&&`` / ``||`` / ``|``
+# — optionally via ``export``.
+_PATH_ASSIGNMENT = re.compile(r"(?:^|[;&|]\s*)(?:export\s+)?PATH=")
+
+
+def _is_broken_uv_command(command: str) -> bool:
+    """True for the specific dead shape: invokes ``uv`` with no PATH baked in.
+
+    Deliberately narrow — anything else (a wrapper, extra env vars, a different
+    uv path) is treated as intentional and left untouched.
+    """
+    return bool(re.search(r"(?:^|[\s;&])uv\s+run\b", command)) and \
+        not _PATH_ASSIGNMENT.search(command)
+
+
+def _build_hooks() -> dict[str, list]:
+    """Materialise ``_HOOK_SPECS`` into Claude Code's settings.json shape."""
+    prefix = _uv_hook_prefix()
+    return {
+        event: [{
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": f"{prefix} {script}",
+                "timeout": timeout,
+            }],
+        }]
+        for event, script, timeout in _HOOK_SPECS
+    }
 
 
 def _timestamp() -> str:
