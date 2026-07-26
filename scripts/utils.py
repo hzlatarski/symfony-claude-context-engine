@@ -322,11 +322,47 @@ def verify_source_anchor(anchor: str) -> bool:
 
 # ── Wiki content helpers ──────────────────────────────────────────────
 
-def read_wiki_index() -> str:
-    """Read the knowledge base index file."""
-    if INDEX_FILE.exists():
-        return INDEX_FILE.read_text(encoding="utf-8")
-    return "# Knowledge Base Index\n\n| Article | Summary | Compiled From | Updated |\n|---------|---------|---------------|---------|"
+_EMPTY_INDEX = (
+    "# Knowledge Base Index\n\n| Article | Summary | Compiled From | Updated |\n"
+    "|---------|---------|---------------|---------|"
+)
+
+
+def read_wiki_index(compact: bool = False) -> str:
+    """Read the knowledge base index file.
+
+    ``compact=True`` drops the Summary and Compiled-From columns, keeping only
+    the article link and its updated date.
+
+    Why that matters: the full index grows ~530 bytes per article, so at 651
+    articles it reached 338 KB (~86k tokens) — 84% of the ingest prompt, which
+    pushed the whole thing past the model's context window. The CLI then
+    returned "Prompt is too long" and every ingest silently produced nothing
+    (see ingest.ingest_source_file). Callers that only need the *names* of
+    existing articles — to pick wikilink targets and to prefer UPDATE over
+    CREATE — should pass ``compact=True``; the dedup pre-flight already
+    supplies full detail for the handful of genuinely similar articles.
+    """
+    if not INDEX_FILE.exists():
+        return _EMPTY_INDEX
+
+    text = INDEX_FILE.read_text(encoding="utf-8")
+    if not compact:
+        return text
+
+    out: list[str] = []
+    for line in text.splitlines():
+        stripped = line.removeprefix("﻿").strip()
+        # Pull the article link out with a regex rather than splitting the row
+        # on "|": an aliased wikilink ([[slug|Label]]) or a summary containing a
+        # pipe would shift the columns and silently truncate the link.
+        link = re.search(r"\[\[[^\]]+\]\]", stripped)
+        if stripped.startswith("|") and stripped.endswith("|") and link:
+            updated = stripped.rstrip("|").rsplit("|", 1)[-1].strip()
+            out.append(f"| {link.group(0)} | {updated} |")
+            continue
+        out.append(line)
+    return "\n".join(out)
 
 
 def read_all_wiki_content() -> str:

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import os
 import subprocess
 import sys
@@ -44,9 +45,44 @@ import dedup
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
+# A file that can never succeed (permanently oversize, unsupported, corrupt)
+# would otherwise be retried on every run — and each attempt costs a full CLI
+# invocation, up to the 600s timeout. Give up after this many consecutive
+# failures; --all still forces a retry.
+MAX_INGEST_ATTEMPTS = 3
+
+
 def source_state_key(group: SourceGroup, file_path: Path) -> str:
     """Build the state.json key for a source file: '{source_id}/{filename}'."""
     return f"{group.id}/{file_path.name}"
+
+
+def record_failure(state: dict, key: str, current_hash: str) -> None:
+    """Count a failed attempt against ``key``.
+
+    Tracked separately from ``ingested_sources`` on purpose: recording a
+    success hash is what makes a file invisible, so failures must never be
+    written there. The attempt counter resets whenever the source file itself
+    changes — editing a document that failed is an implicit request to retry.
+    """
+    failures = state.setdefault("failed_sources", {})
+    prev = failures.get(key, {})
+    attempts = prev.get("attempts", 0) + 1 if prev.get("hash") == current_hash else 1
+    failures[key] = {
+        "hash": current_hash,
+        "attempts": attempts,
+        "last_failed_at": now_iso(),
+    }
+    save_state(state)
+
+
+def should_skip_after_failures(state: dict, key: str, current_hash: str) -> bool:
+    """True once ``key`` has failed MAX_INGEST_ATTEMPTS times unchanged."""
+    entry = state.get("failed_sources", {}).get(key, {})
+    return (
+        entry.get("hash") == current_hash
+        and entry.get("attempts", 0) >= MAX_INGEST_ATTEMPTS
+    )
 
 
 def collect_files_to_ingest(
@@ -78,6 +114,10 @@ def collect_files_to_ingest(
                     if verbose:
                         print(f"    SKIP (unchanged): {fpath.name}")
                     continue
+                if should_skip_after_failures(state, key, current_hash):
+                    print(f"    SKIP ({MAX_INGEST_ATTEMPTS} failed attempts, "
+                          f"unchanged since): {fpath.name} — use --all to retry")
+                    continue
 
             to_ingest.append((group, fpath))
             if verbose:
@@ -86,20 +126,77 @@ def collect_files_to_ingest(
     return to_ingest
 
 
+def _articles_snapshot() -> dict[str, str]:
+    """sha256 of every article's content, keyed by path.
+
+    Content hashes rather than mtimes: an mtime comparison accepts a bare
+    ``touch`` or an identical rewrite as proof that knowledge was produced, and
+    conversely misses a real same-tick rewrite on a coarse-resolution
+    filesystem. Both directions matter here because this snapshot decides
+    whether a source file's hash gets recorded — and recording it is what makes
+    the file permanently invisible to future runs.
+    """
+    snapshot: dict[str, str] = {}
+    for directory in (CONCEPTS_DIR, CONNECTIONS_DIR):
+        if not directory.exists():
+            continue
+        for path in directory.glob("*.md"):
+            try:
+                snapshot[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                pass
+    return snapshot
+
+
+def _articles_written_for(before: dict[str, str], rel_source: str) -> bool:
+    """True if an article changed *and* credits ``rel_source``.
+
+    "Some article changed" is not enough. The snapshot spans the whole
+    knowledge base, so a concurrent ``compile.py``, a second ingest, or the
+    user editing an article in an editor would all satisfy it — and this run
+    would then record its hash despite having produced nothing, recreating the
+    silent permanent data loss this check exists to prevent.
+
+    So we additionally require a changed article to carry this source's
+    ``[src:...]`` anchor, which the ingest prompt mandates on every extracted
+    claim. That ties the evidence to the file actually being ingested.
+    """
+    after = _articles_snapshot()
+    changed = [p for p, digest in after.items() if before.get(p) != digest]
+    if not changed:
+        return False
+
+    anchor = f"[src:{rel_source}]"
+    for path in changed:
+        try:
+            if anchor in Path(path).read_text(encoding="utf-8", errors="ignore"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 async def ingest_source_file(
     group: SourceGroup,
     file_path: Path,
     state: dict,
-) -> float:
+) -> tuple[float, bool]:
     """Ingest a single source file into the knowledge base.
 
-    Returns the API cost of the ingestion.
+    Returns ``(api_cost, succeeded)``. ``succeeded`` is False whenever no
+    article was produced, so the caller can report the failure instead of
+    printing "Done." over the top of an error.
     """
+    before_snapshot = _articles_snapshot()
+
     handler = get_handler(group.type)
     doc = handler(file_path)
 
     schema = AGENTS_FILE.read_text(encoding="utf-8")
-    wiki_index = read_wiki_index()
+    # Compact: the full index is ~530 bytes/article and blew the context window
+    # at 651 articles. The dedup pre-flight below carries the detail that
+    # matters. See utils.read_wiki_index.
+    wiki_index = read_wiki_index(compact=True)
 
     compiled_truth = ""
     if COMPILED_TRUTH_FILE.exists():
@@ -279,14 +376,32 @@ architectural patterns.
         result = await asyncio.to_thread(_run)
     except subprocess.TimeoutExpired:
         print(f"  Error: claude CLI timed out after 600s")
-        return 0.0
+        return 0.0, False
     except Exception as e:
         print(f"  Error: {e}")
-        return 0.0
+        return 0.0, False
 
-    if result.returncode != 0 and not result.stdout.strip():
-        print(f"  Error: claude CLI exited {result.returncode} — {result.stderr[:200]}")
-        return 0.0
+    # A non-zero exit is a failure even when the CLI explains itself on stdout.
+    # This was previously `returncode != 0 AND not stdout.strip()`, so
+    # "Prompt is too long" — printed to stdout with exit 1 — fell through to the
+    # success path below: the hash was recorded, "Done." was printed, and no
+    # article was ever written. Every subsequent run then SKIPPED the file as
+    # already-ingested. Silent data loss; found 2026-07-26.
+    if result.returncode != 0:
+        detail = (result.stderr.strip() or result.stdout.strip())[:300]
+        print(f"  Error: claude CLI exited {result.returncode} — {detail}",
+              file=sys.stderr)
+        return 0.0, False
+
+    # Exit 0 still isn't proof of work. The contract of this function is that
+    # the source was turned into at least one article, so verify that actually
+    # happened before recording the hash — recording it is what makes the file
+    # invisible to future runs.
+    if not _articles_written_for(before_snapshot, rel_source):
+        print(f"  Error: claude CLI exited 0 but no article credits "
+              f"{rel_source} — not marking {file_path.name} as ingested",
+              file=sys.stderr)
+        return 0.0, False
 
     key = source_state_key(group, file_path)
     state["ingested_sources"][key] = {
@@ -297,7 +412,7 @@ architectural patterns.
     }
     save_state(state)
 
-    return 0.0
+    return 0.0, True
 
 
 def main():
@@ -357,6 +472,7 @@ def main():
 
     total_cost = 0.0
     stopped = False
+    failed: list[str] = []
     for i, (group, fpath) in enumerate(to_ingest, 1):
         if ingest_state.should_stop():
             print(f"\nStop requested — halting after {i - 1}/{total} files.")
@@ -373,8 +489,15 @@ def main():
             total_cost=total_cost,
             started_at=started,
         )
-        cost = asyncio.run(ingest_source_file(group, fpath, state))
+        cost, ok = asyncio.run(ingest_source_file(group, fpath, state))
         total_cost += cost
+        key = source_state_key(group, fpath)
+        if ok:
+            state.get("failed_sources", {}).pop(key, None)
+            save_state(state)
+        else:
+            failed.append(key)
+            record_failure(state, key, file_hash(fpath))
         ingest_state.write_status(
             phase="running",
             current_file=f"{group.id}/{fpath.name}",
@@ -383,7 +506,9 @@ def main():
             total_cost=total_cost,
             started_at=started,
         )
-        print(f"  Done.")
+        # Never print "Done." over the top of an error — that is what made the
+        # 2026-07-26 failures look like successes in the run output.
+        print("  Done." if ok else "  NOT ingested — will retry on the next run.")
 
     final_phase = "stopped" if stopped else "finished"
     # When stopped at iteration i, files 1..i-1 actually completed; iteration
@@ -414,6 +539,15 @@ def main():
 
     regenerate_truth()
     print(f"\nIngestion complete. Total cost: ${total_cost:.2f}")
+    if failed:
+        # Loud and last: an ingest that produced nothing used to be
+        # indistinguishable from a clean run in this summary.
+        print(f"\n{len(failed)} file(s) FAILED and were not ingested:")
+        for name in failed:
+            print(f"  - {name}")
+        print("Their hashes were not recorded, so the next run retries them "
+              f"(up to {MAX_INGEST_ATTEMPTS} attempts, then --all to force).")
+        sys.exit(1)
     print(f"Knowledge base: {len(articles)} articles")
 
 
