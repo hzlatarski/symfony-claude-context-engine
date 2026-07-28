@@ -9,6 +9,7 @@ curated knowledge/ tree as retrieval tools for the agent:
                            and quarantine state.
     search_raw_daily       Semantic search over verbatim daily-log chunks
                            (the "drawer" layer — never summarized).
+    get_raw_daily_chunk    Fetch one complete raw chunk by search-result ID.
     get_article            Fetch one article's full content + frontmatter.
     list_contradictions    Return the current contradiction quarantine list.
 
@@ -42,7 +43,7 @@ import parent_watchdog  # noqa: E402
 import vector_store  # noqa: E402
 from compile_truth import parse_frontmatter  # noqa: E402
 from config import KNOWLEDGE_DIR, MEMORY_TYPES  # noqa: E402
-from utils import load_contradictions  # noqa: E402
+from utils import load_contradictions, resolve_article_path  # noqa: E402
 
 log = logging.getLogger("knowledge_mcp_server")
 
@@ -62,7 +63,17 @@ SNIPPET_CHARS = 220
 # Metadata fields preserved on slim search hits. Everything else in the
 # Chroma metadata blob (slug duplicates, large strings, internal bookkeeping)
 # is dropped to keep search responses tight.
-_SLIM_METADATA_KEYS = ("type", "confidence", "zone", "quarantined", "updated")
+_SLIM_METADATA_KEYS = (
+    "type",
+    "confidence",
+    "zone",
+    "quarantined",
+    "updated",
+    "source_file",
+    "section",
+    "date",
+    "session_id",
+)
 
 # When include_linked is set, we also surface the project tag so the agent
 # can tell at a glance which project a hit came from.
@@ -182,16 +193,36 @@ def _search_raw_daily_impl(
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Semantic search over verbatim daily-log chunks.
-
-    Delegates to ``vector_store.search_daily``. ``date_from`` / ``date_to``
-    are ISO YYYY-MM-DD strings — ``search_daily`` converts them to
-    int-encoded ``date_int`` metadata for Chroma's $gte/$lte filters.
-    """
-    raw = vector_store.search_daily(
+    """Literal-first plus semantic search over verbatim transcript chunks."""
+    exact = vector_store.search_daily_exact(
         query=query, limit=limit, date_from=date_from, date_to=date_to,
     )
-    return [_slim_hit(hit) for hit in raw]
+    semantic = vector_store.search_daily(
+        query=query, limit=limit, date_from=date_from, date_to=date_to,
+    )
+
+    combined: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for hit in exact + semantic:
+        hit_id = hit.get("id")
+        if not hit_id or hit_id in seen:
+            continue
+        seen.add(hit_id)
+        if hit in exact:
+            text = hit.get("text") or ""
+            position = text.find(query)
+            if position >= 0:
+                start = max(0, position - 80)
+                hit = {**hit, "text": text[start : position + len(query) + 80]}
+        combined.append(hit)
+        if len(combined) >= limit:
+            break
+    return [_slim_hit(hit) for hit in combined]
+
+
+def _get_raw_daily_chunk_impl(chunk_id: str) -> dict[str, Any]:
+    """Fetch one complete verbatim chunk by its search-result ID."""
+    return vector_store.get_daily_chunk(chunk_id)
 
 
 def _get_article_impl(slug: str) -> dict[str, Any]:
@@ -204,12 +235,13 @@ def _get_article_impl(slug: str) -> dict[str, Any]:
     """
     import config
 
-    path = config.KNOWLEDGE_DIR / f"{slug}.md"
-    if not path.exists():
-        raise FileNotFoundError(f"No article at slug {slug!r}")
+    normalized = slug.removesuffix(".md")
+    path = resolve_article_path(
+        normalized, config.KNOWLEDGE_DIR, must_exist=True,
+    )
     content = path.read_text(encoding="utf-8")
     return {
-        "slug": slug,
+        "slug": normalized,
         "content": content,
         "frontmatter": parse_frontmatter(content),
     }
@@ -229,8 +261,14 @@ def _get_articles_impl(slugs: list[str]) -> list[dict[str, Any]]:
 
     results: list[dict[str, Any]] = []
     for slug in slugs:
-        path = config.KNOWLEDGE_DIR / f"{slug}.md"
-        if not path.exists():
+        try:
+            path = resolve_article_path(
+                slug, config.KNOWLEDGE_DIR, must_exist=True,
+            )
+        except ValueError:
+            results.append({"slug": slug, "error": "invalid_slug"})
+            continue
+        except FileNotFoundError:
             results.append({"slug": slug, "error": "not_found"})
             continue
         content = path.read_text(encoding="utf-8")
@@ -263,12 +301,13 @@ def _record_retrieval_outcome_impl(
     import retrieval_feedback
 
     normalized = slug.removesuffix(".md")
-    path = config.KNOWLEDGE_DIR / f"{normalized}.md"
-    if not path.exists():
+    try:
+        resolve_article_path(normalized, config.KNOWLEDGE_DIR, must_exist=True)
+    except FileNotFoundError as exc:
         raise FileNotFoundError(
             f"No article at slug {normalized!r} — refusing to record feedback "
             f"for a slug that doesn't resolve to a file."
-        )
+        ) from exc
 
     if outcome not in retrieval_feedback.OUTCOMES:
         raise ValueError(
@@ -625,13 +664,27 @@ def _make_server():
         Returns:
             List of slim hits: ``{id, slug, title, snippet, distance, metadata}``.
             ``snippet`` is a ~220-char preview of the chunk. Slim ``metadata``
-            preserves the core flags; for full chunk text plus the richer
-            ``section`` / ``date`` / ``source_file`` fields, the raw chunks
-            are embedded in ``knowledge/daily/*.md`` and can be read directly.
+            includes ``section`` / ``date`` / ``source_file`` when present.
+            Call ``get_raw_daily_chunk(id)`` for the complete, unclipped text.
         """
         return _search_raw_daily_impl(
             query=query, limit=limit, date_from=date_from, date_to=date_to,
         )
+
+    @server.tool()
+    def get_raw_daily_chunk(chunk_id: str) -> dict[str, Any]:
+        """Fetch one complete raw daily/transcript chunk by ID.
+
+        Use the ``id`` returned by ``search_raw_daily`` when the short snippet
+        is insufficient or contains a clipped URL, identifier, or tool result.
+
+        Returns:
+            ``{id, text, metadata}``, with the full verbatim chunk text.
+
+        Raises:
+            FileNotFoundError: if the chunk ID no longer exists.
+        """
+        return _get_raw_daily_chunk_impl(chunk_id)
 
     @server.tool()
     def get_article(slug: str) -> dict[str, Any]:

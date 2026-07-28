@@ -29,11 +29,12 @@ A long-term memory system for Claude Code, purpose-built for Symfony projects. S
 - 💬 **[Inline rationale nodes](#inline-rationale-nodes)** — the call-graph parser lifts `// WHY:` / `// HACK` / `// TODO` / `/** @deprecated */` comments out of `src/**/*.php` and attaches them to the annotated method/class as first-class `note:` graph nodes. Surfaced via `find_rationale` and in `get_file_deps`. Answers "where are the known hacks / deprecations?" and gives `trace_route` the *why* next to the *what*.
 - 🧭 **`trace_path(A, B)`** — shortest connection between any two unified-graph nodes (BFS, edge-kind-annotated hops). Answers "how is this symbol related to that article?" — the between-two-nodes complement to `get_unified_neighbors`' one-node radius.
 - 🔀 **[Merge-order conflict risk](#merge-order-conflict-risk)** — `merge_order_risk` / `scripts/merge_risk.py`: maps each in-flight branch's changed files into graph communities and flags **direct file conflicts** (git *will* conflict) and **community-overlap coupling** (different files, same semantic cluster) so you know what to merge back-to-back. (Graphify's `prs --conflicts`.)
-- 🛡 **Cross-process locking** — Concurrent writers (the file watcher, a `SessionEnd` flush, a manual `ingest.py`) coordinate via `filelock` against per-collection lock files under `knowledge/chroma/.locks/`. No more SQLite "database is locked" surprises.
+- 🛡 **Cross-process locking** — Concurrent writers (the file watcher, a `SessionEnd` flush, a manual `ingest.py`) coordinate via `filelock` against per-collection lock files under `knowledge/chroma/active/.locks/`. Compiler, state, migration, and per-session flush transactions have dedicated locks as well.
 - ⏸ **Resumable, interruptible ingest** — Per-file content-hash checkpointing makes `ingest.py` crash-safe — re-running skips files whose hash matches the last successful run. Live progress is written to `knowledge/.ingest-status.json` and exposed via the `ingest_status` MCP tool. `ingest_stop` raises a cooperative-cancel flag the next file boundary honors.
 - 🩺 **`kb_health` MCP tool** — One-shot diagnostic: collection sizes, articles by memory type, broken `[src:]` anchors, quarantine count, last ingest timestamp. Replaces six manual scripts when you need to know "is the KB healthy?".
 - 🌳 **AST-aware code chunking** — PHP and JS files chunk on class/method/function boundaries via tree-sitter, so `search_codebase` hits land on whole units instead of mid-method line slices. Twig and YAML fall back to 150-line windows.
 - 📚 **Structured tool drawer** — `PostToolUse` hook writes a JSONL log of every tool call to `knowledge/daily/*.tools.jsonl`. `flush.py` reads it as ground-truth input for Haiku summaries — so daily logs cite real file paths and commands, not reconstructions.
+- 🧾 **Zero-loss transcript archive** — `PreCompact` and `SessionEnd` preserve each original Claude JSONL byte-for-byte under the gitignored `knowledge/daily/transcripts/` directory and index message text, tool inputs, tool results, and exact references independently of the lossy daily summary.
 - 🧪 **Anti-drift hardening** — Source anchors, confidence decay (90-day half-life), contradiction quarantine, canary questions, skeptical compile prompt, observed-vs-synthesized zones.
 - 📉 **O(1) prompt cost** — Priority-scored `compiled-truth.md` keeps session-start context constant from 50 articles to 5,000. Upstream compiler scales linearly.
 - 🆓 **Local embeddings, zero API cost** — Bundled `all-MiniLM-L6-v2` ONNX model, ~90 MB one-time download. Chroma runs fully offline.
@@ -54,7 +55,7 @@ This engine takes a different bet. It **compiles** your sessions into structured
 ### 1. Two-Layer Knowledge Store
 
 - **Curated articles** (`knowledge/concepts/`) — LLM-compiled Truth + Timeline format, one file per concept, with `[[wikilinks]]` forming a full knowledge graph.
-- **Verbatim drawer** (`knowledge/daily/`) — raw session logs, never summarized, semantically indexed so you can always retrieve the exact words that led to a compiled claim.
+- **Session evidence** (`knowledge/daily/`) — readable daily summaries plus byte-for-byte Claude JSONL archives under `knowledge/daily/transcripts/`. The archives, not the summaries, are the authoritative source for exact words, tool payloads, URLs, and identifiers.
 
 ### 2. Symfony Code Intelligence (Dedicated MCP Server)
 
@@ -100,7 +101,8 @@ A **second** MCP server (`knowledge-compiler`) — separate from the code-intel 
 | Tool | What it returns |
 |---|---|
 | `search_knowledge(query, ..., include_linked=False)` | Semantic search over curated articles with filters for memory `type`, `min_confidence`, `zone`, quarantine state. Returns **slim snippets** (~220 chars), not full bodies. Set `include_linked=True` to also search every project listed in `MEMORY_COMPILER_LINKED_PROJECTS` — hits get a `project` tag. |
-| `search_raw_daily(query, date_from, date_to)` | Semantic search over verbatim drawer chunks (daily logs, never summarized). Slim snippets. |
+| `search_raw_daily(query, date_from, date_to)` | Literal-first plus semantic search over readable daily summaries and byte-for-byte raw transcript chunks. Slim snippets. |
+| `get_raw_daily_chunk(chunk_id)` | Fetch the complete unclipped raw chunk returned by `search_raw_daily`. |
 | `search_codebase(query, file_type)` | Hybrid BM25 + vector search over indexed source files. PHP and JS are chunked at class/method/function boundaries via tree-sitter (see below); Twig and YAML use 150-line windows. Returns chunked file excerpts with line ranges, plus the source group's `source_description` so the agent learns *when* to consult that file group. |
 | `get_article(slug)` | Full markdown + parsed frontmatter for one article |
 | `get_articles([slugs])` | Batch-fetch full bodies for multiple slugs in one round trip. Missing slugs return `{slug, error: "not_found"}` so one bad slug doesn't abort the batch. |
@@ -136,7 +138,7 @@ Every article carries a `type:` — one of `fact`, `event`, `discovery`, `prefer
 
 ### 6. Structured Tool Drawer (PostToolUse Capture)
 
-A lossless, machine-readable log of every tool call Claude Code makes during a session, captured live by the `PostToolUse` hook and fed back into the flush pipeline as **ground-truth input for Haiku**.
+A compact, machine-readable digest of every tool call Claude Code makes during a session, captured live by the `PostToolUse` hook and fed back into the flush pipeline as **ground-truth input for Haiku**. The byte-for-byte transcript archive remains the lossless source.
 
 - **Live capture** — `hooks/post-tool-use.py` fires after every tool invocation, writes one JSONL line to `knowledge/daily/YYYY-MM-DD.tools.jsonl` with `{ts, session_id, tool, input_digest, result_size, ok}`. Pure stdlib, broad-exception-wrapped, ~5s timeout — never breaks the session.
 - **Tool-aware digests** — the hook keeps only the load-bearing fields per tool (`file_path` for Edit/Write/Read, `command` for Bash, `pattern`+`path` for Grep, `description`+`subagent_type` for Task, etc.), and caps everything else at 240 chars. The raw transcript still has the full payload if you need it.
@@ -552,6 +554,10 @@ uv run python scripts/reindex.py --all         # force full rebuild
 uv run python scripts/reindex.py --articles-only
 uv run python scripts/reindex.py --daily-only
 
+# Archive/index historical Claude sessions (all, or selected IDs)
+uv run python scripts/backfill_transcripts.py
+uv run python scripts/backfill_transcripts.py --session <session-id> --session <session-id>
+
 # Live watcher (run alongside viewer.py — auto-reindexes on file change, ~2s debounce)
 uv run python scripts/watch.py                 # foreground; Ctrl-C to stop
 uv run python scripts/watch.py --quiet         # WARNING-level logging
@@ -579,7 +585,7 @@ uv run python scripts/canary.py --dry-run      # list canaries without running
 | `MEMORY_COMPILER_MODEL_QUERY` | `claude-sonnet-4-6` | Model for interactive queries |
 | `MEMORY_COMPILER_MODEL_CANARY` | `claude-haiku-4-5-20251001` | Model for drift canary checks |
 | `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | `95` | Set to `50` to compact earlier in long sessions |
-| `MEMORY_COMPILER_LINKED_PROJECTS` | _(unset)_ | Comma-separated absolute paths to other Symfony project roots whose `knowledge/chroma/` collections should be searchable via `search_knowledge(..., include_linked=True)`. Non-existent paths are silently skipped at search time. |
+| `MEMORY_COMPILER_LINKED_PROJECTS` | _(unset)_ | Comma-separated absolute paths to other Symfony project roots whose `knowledge/chroma/active/` collections should be searchable via `search_knowledge(..., include_linked=True)`. A legacy-only `knowledge/chroma/` store is migrated under a lock; ambiguous mixed layouts fail loudly. Non-existent paths are skipped. |
 | `MEMORY_COMPILER_EXTRA_EXTENSIONS` | _(unset)_ | Comma-separated file extensions (each with leading dot — e.g. `.dist,.neon`) that the codebase indexer should also pick up. Each extension becomes its own `file_type`; globs are scoped to `src/`, `assets/`, `templates/`, `config/` so vendor trees aren't walked. Files are indexed as plaintext (no AST chunking). |
 
 ### `sources.yaml`
@@ -890,13 +896,13 @@ uv run python scripts/upgrade.py
 
 ### Migrations
 
-Place per-version migration scripts under `scripts/migrations/v<X>.<Y>.<Z>.{sh,py}`. The upgrader runs every script whose version is strictly greater than the old `VERSION` and ≤ the new one, in semver order. Scripts must be idempotent — failures are non-fatal so a botched migration doesn't strand the user mid-upgrade.
+Place per-version migration scripts under `scripts/migrations/v<X>.<Y>.<Z>.{sh,py}`. The upgrader runs every script whose version is strictly greater than the old `VERSION` and ≤ the new one, in semver order. Scripts must be idempotent. A dependency or migration failure aborts the upgrade, returns non-zero, and does not write the success marker.
 
 ---
 
 ## Cross-process Safety
 
-Concurrent writers — the watcher, a `SessionEnd` flush, a manual `ingest.py`, a `reindex.py --all` — coordinate via per-collection file locks under `knowledge/chroma/.locks/`. Implementation: the [`filelock`](https://py-filelock.readthedocs.io/) library, one lock per Chroma collection (`articles`, `daily_chunks`, `codebase`), held only for the duration of the upsert/delete call. Read paths (queries, counts) are unlocked because Chroma handles concurrent reads safely.
+Concurrent writers — the watcher, a `SessionEnd` flush, a manual `ingest.py`, a `reindex.py --all` — coordinate via per-collection file locks under `knowledge/chroma/active/.locks/`. Compilation has a separate whole-process lock, and each session flush holds a per-session transaction lock from cursor check through cursor advancement. `state.json` changes use a locked read-modify-fsync-atomic-replace operation, so independent writers do not overwrite one another.
 
 Default acquisition timeout is 60s (configurable via `CHROMA_LOCK_TIMEOUT_SECONDS`). If a process crashes mid-write, the OS releases the lock file handle and the next acquirer reclaims it automatically — no manual cleanup required.
 

@@ -21,7 +21,7 @@ import os
 from pathlib import Path
 
 from config import KNOWLEDGE_DIR, MODEL_QUERY, QA_DIR, now_iso
-from utils import load_state, read_wiki_index, save_state
+from utils import read_wiki_index, update_state
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
@@ -180,22 +180,19 @@ Slugs: {selected_slugs}
         answer = f"Error querying knowledge base: {e}"
 
     # Update state
-    state = load_state()
-    state["query_count"] = state.get("query_count", 0) + 1
-    state["total_cost"] = state.get("total_cost", 0.0) + cost
+    def record_query(state: dict) -> None:
+        state["query_count"] = state.get("query_count", 0) + 1
+        state["total_cost"] = state.get("total_cost", 0.0) + cost
 
-    # Increment access counts for every article we pre-selected — they
-    # were the basis of the answer regardless of whether the LLM cited
-    # them explicitly. This gives compile_truth.py better signal about
-    # which articles are load-bearing for real questions.
-    access_counts = state.setdefault("access_counts", {})
-    for result in selected:
-        slug = result["slug"]
-        if slug.startswith("daily/"):
-            continue
-        access_counts[slug] = access_counts.get(slug, 0) + 1
+        # Count every article that informed the answer, not only explicit
+        # citations, without overwriting increments from concurrent queries.
+        access_counts = state.setdefault("access_counts", {})
+        for result in selected:
+            slug = result["slug"]
+            if not slug.startswith("daily/"):
+                access_counts[slug] = access_counts.get(slug, 0) + 1
 
-    save_state(state)
+    update_state(record_query)
 
     return answer
 

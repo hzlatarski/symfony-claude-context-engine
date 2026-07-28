@@ -29,16 +29,20 @@ from __future__ import annotations
 import argparse
 import sys
 
+from filelock import FileLock
+
 from config import KNOWLEDGE_DIR
 from utils import (
     embed_article_file,
     embed_daily_file,
+    daily_file_lock_path,
     file_hash,
     list_raw_files,
+    list_transcript_files,
     list_wiki_articles,
     load_contradictions,
     load_state,
-    save_state,
+    update_state,
 )
 from vector_store import stats as vector_stats
 
@@ -61,9 +65,21 @@ def reindex_articles(force: bool = False) -> tuple[int, int]:
 
     embedded = 0
     skipped = 0
+    hash_updates: dict[str, str] = {}
+
+    articles = list_wiki_articles()
+    current_slugs = {
+        str(article.relative_to(KNOWLEDGE_DIR)).replace("\\", "/").removesuffix(".md")
+        for article in articles
+    }
+    removed = set(vector_hashes) - current_slugs
+    import vector_store
+    for slug in sorted(removed):
+        vector_store.delete_article(slug)
+        vector_hashes.pop(slug, None)
 
     try:
-        for article in list_wiki_articles():
+        for article in articles:
             rel = str(article.relative_to(KNOWLEDGE_DIR)).replace("\\", "/")
             slug = rel.removesuffix(".md")
             h = file_hash(article)
@@ -74,9 +90,16 @@ def reindex_articles(force: bool = False) -> tuple[int, int]:
 
             embed_article_file(article, quarantined=quarantined)
             vector_hashes[slug] = h
+            hash_updates[slug] = h
             embedded += 1
     finally:
-        save_state(state)
+        def persist(current: dict) -> None:
+            hashes = current.setdefault("vector_article_hashes", {})
+            for slug in removed:
+                hashes.pop(slug, None)
+            hashes.update(hash_updates)
+
+        update_state(persist)
 
     if embedded:
         try:
@@ -100,9 +123,21 @@ def reindex_daily(force: bool = False) -> tuple[int, int]:
 
     embedded = 0
     skipped = 0
+    hash_updates: dict[str, str] = {}
+
+    daily_files = list_raw_files() + list_transcript_files()
+    current_sources = {
+        str(daily.relative_to(KNOWLEDGE_DIR)).replace("\\", "/")
+        for daily in daily_files
+    }
+    removed = set(vector_hashes) - current_sources
+    import vector_store
+    for source in sorted(removed):
+        vector_store.delete_chunks_for_daily(source)
+        vector_hashes.pop(source, None)
 
     try:
-        for daily in list_raw_files():
+        for daily in daily_files:
             rel = str(daily.relative_to(KNOWLEDGE_DIR)).replace("\\", "/")
             h = file_hash(daily)
 
@@ -110,11 +145,23 @@ def reindex_daily(force: bool = False) -> tuple[int, int]:
                 skipped += 1
                 continue
 
-            embed_daily_file(daily)
+            if daily.suffix == ".jsonl":
+                from transcript import embed_transcript_file
+                embed_transcript_file(daily)
+            else:
+                with FileLock(str(daily_file_lock_path(daily))):
+                    embed_daily_file(daily)
             vector_hashes[rel] = h
+            hash_updates[rel] = h
             embedded += 1
     finally:
-        save_state(state)
+        def persist(current: dict) -> None:
+            hashes = current.setdefault("vector_daily_hashes", {})
+            for source in removed:
+                hashes.pop(source, None)
+            hashes.update(hash_updates)
+
+        update_state(persist)
 
     return embedded, skipped
 

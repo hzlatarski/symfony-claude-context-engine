@@ -223,6 +223,20 @@ class TestLoaders:
         assert "[concepts/foo](/articles/concepts/foo)" in out
         assert "[the bar](/articles/concepts/bar)" in out
 
+    def test_markdown_escapes_active_html(self):
+        from viewer import _render_markdown
+
+        rendered = _render_markdown(
+            '<script>window.PWNED=1</script>\n'
+            '<iframe src="https://attacker.invalid"></iframe>\n'
+            '<img src=x onerror="window.PWNED=2">'
+        )
+
+        assert "<script>" not in rendered
+        assert "<iframe" not in rendered
+        assert "<img " not in rendered
+        assert "&lt;script&gt;" in rendered
+
 
 class TestRoutes:
     def test_index_ok(self, client):
@@ -238,6 +252,21 @@ class TestRoutes:
         # Memory composition chip row surfaces each type
         assert "fact" in body
         assert "preference" in body
+
+    def test_index_counts_current_ingest_state(self, client, seeded_kb):
+        import config
+
+        config.STATE_FILE.write_text(
+            '{"ingested_daily":{"2026-07-28.md":{}},'
+            '"ingested_sources":{"docs/a.md":{},"docs/b.md":{}}}',
+            encoding="utf-8",
+        )
+
+        resp = client.get("/")
+
+        assert resp.status_code == 200
+        assert "Ingested sources" in resp.text
+        assert '<div class="value">3</div>' in resp.text
 
     def test_articles_list_all(self, client):
         resp = client.get("/articles")
@@ -300,6 +329,24 @@ class TestRoutes:
         resp = client.get("/articles/concepts/does-not-exist")
         assert resp.status_code == 404
 
+    def test_article_detail_rejects_path_traversal(self, client, seeded_kb):
+        secret = seeded_kb.parent / "secret.md"
+        secret.write_text("DO NOT DISCLOSE", encoding="utf-8")
+
+        resp = client.get("/articles/%2E%2E%2Fsecret")
+
+        assert resp.status_code == 404
+        assert "DO NOT DISCLOSE" not in resp.text
+
+    def test_content_security_policy_requires_script_nonce(self, client):
+        resp = client.get("/whisper")
+
+        assert resp.status_code == 200
+        policy = resp.headers["content-security-policy"]
+        assert "script-src 'nonce-" in policy
+        assert "script-src 'unsafe-inline'" not in policy
+        assert "<script nonce=" in resp.text
+
     def test_article_detail_trailing_md_redirects(self, client):
         resp = client.get(
             "/articles/concepts/stimulus-naming.md", follow_redirects=False,
@@ -324,6 +371,15 @@ class TestRoutes:
         resp = client.get("/daily/1999-01-01")
         assert resp.status_code == 404
 
+    def test_daily_detail_rejects_windows_path_traversal(self, client, seeded_kb):
+        secret = seeded_kb / "secret.md"
+        secret.write_text("DAILY SECRET", encoding="utf-8")
+
+        resp = client.get("/daily/..%5Csecret")
+
+        assert resp.status_code == 404
+        assert "DAILY SECRET" not in resp.text
+
     def test_tools_list(self, client):
         resp = client.get("/tools")
         assert resp.status_code == 200
@@ -331,6 +387,18 @@ class TestRoutes:
         assert "2026-04-14" in body
         # Counts visible
         assert "3" in body  # total events
+
+    def test_tools_detail_rejects_windows_path_traversal(self, client, seeded_kb):
+        secret = seeded_kb / "secret.tools.jsonl"
+        secret.write_text(
+            '{"tool":"Read","input":{"file_path":"TOOLS SECRET"}}\n',
+            encoding="utf-8",
+        )
+
+        resp = client.get("/tools/..%5Csecret")
+
+        assert resp.status_code == 404
+        assert "TOOLS SECRET" not in resp.text
 
     def test_tools_detail(self, client):
         resp = client.get("/tools/2026-04-14")

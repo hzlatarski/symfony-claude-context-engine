@@ -17,7 +17,6 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 # Recursion guard
@@ -37,17 +36,24 @@ STATE_DIR = SCRIPTS_DIR
 sys.path.insert(0, str(SCRIPTS_DIR))
 from flush_cursor import load_cursor  # noqa: E402
 from log_setup import configure as configure_logging  # noqa: E402
-from transcript import extract_conversation_context  # noqa: E402
+from pending_flush import create_pending_flush, load_pending_flushes  # noqa: E402
+from transcript import archive_transcript, extract_conversation_context  # noqa: E402
 
 configure_logging(
     SCRIPTS_DIR / "flush.log",
     "%(asctime)s %(levelname)s [pre-compact] %(message)s",
 )
 
-MIN_TURNS_TO_FLUSH = 5
+MIN_TURNS_TO_FLUSH = 1
 
 
-def main() -> None:
+def _failure(message: str, *args) -> int:
+    logging.error(message, *args)
+    print(message % args if args else message, file=sys.stderr)
+    return 1
+
+
+def main() -> int:
     # Read hook input from stdin
     try:
         raw_input = sys.stdin.read()
@@ -57,8 +63,7 @@ def main() -> None:
             fixed_input = re.sub(r'(?<!\\)\\(?!["\\])', r'\\\\', raw_input)
             hook_input = json.loads(fixed_input)
     except (json.JSONDecodeError, ValueError, EOFError) as e:
-        logging.error("Failed to parse stdin: %s", e)
-        return
+        return _failure("Failed to parse stdin: %s", e)
 
     session_id = hook_input.get("session_id", "unknown")
     transcript_path_str = hook_input.get("transcript_path", "")
@@ -67,8 +72,7 @@ def main() -> None:
 
     # transcript_path can be empty (known Claude Code bug #13668)
     if not transcript_path_str or not isinstance(transcript_path_str, str):
-        logging.info("SKIP: no transcript path")
-        return
+        return _failure("No transcript path; pre-compact capture was not scheduled")
 
     transcript_path = Path(transcript_path_str)
     if not transcript_path.exists():
@@ -78,8 +82,15 @@ def main() -> None:
             alt = transcript_path_str[0].swapcase() + transcript_path_str[1:]
             transcript_path = Path(alt)
         if not transcript_path.exists():
-            logging.info("SKIP: transcript missing: %s", transcript_path_str)
-            return
+            return _failure("transcript missing: %s", transcript_path_str)
+
+    try:
+        transcript_archive = archive_transcript(transcript_path, session_id)
+        logging.info("Archived raw transcript: %s", transcript_archive)
+    except (OSError, ValueError) as e:
+        return _failure(
+            "Raw transcript archive failed; refusing to advance cursor: %s", e
+        )
 
     # Only summarize turns this session hasn't flushed yet — a long session can
     # compact several times, and each compaction used to re-summarize the same
@@ -89,60 +100,64 @@ def main() -> None:
     # Extract conversation context in the hook
     try:
         context, total_turns, turn_count = extract_conversation_context(
-            transcript_path, start_turn=cursor
+            transcript_archive, start_turn=cursor
         )
     except Exception as e:
-        logging.error("Context extraction failed: %s", e)
-        return
+        return _failure("Context extraction failed: %s", e)
 
     if not context.strip():
-        logging.info("SKIP: empty context")
-        return
-
-    if turn_count < MIN_TURNS_TO_FLUSH:
+        logging.info("No new text turns; scheduling raw transcript index only")
+    elif turn_count < MIN_TURNS_TO_FLUSH:
         logging.info(
             "SKIP: only %d new turns since cursor %d (min %d)",
             turn_count, cursor, MIN_TURNS_TO_FLUSH,
         )
-        return
+        return 0
 
     # Write context to a temp file for the background process
-    timestamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S")
-    context_file = STATE_DIR / f"flush-context-{session_id}-{timestamp}.md"
-    context_file.write_text(context, encoding="utf-8")
+    try:
+        context_file = create_pending_flush(
+            STATE_DIR,
+            "flush-context",
+            context,
+            session_id,
+            total_turns,
+            transcript_archive,
+        )
+    except OSError as e:
+        return _failure("Failed to persist pending flush: %s", e)
 
     # Spawn flush.py as a background process
     flush_script = SCRIPTS_DIR / "flush.py"
 
-    cmd = [
-        "uv",
-        "run",
-        "--directory",
-        str(ROOT),
-        "python",
-        str(flush_script),
-        str(context_file),
-        session_id,
-        # New cursor — recorded by flush.py only once the flush succeeds.
-        str(total_turns),
-    ]
-
     creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
     try:
-        subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creation_flags,
-        )
+        jobs = load_pending_flushes(STATE_DIR)
+        for _marker, job in jobs:
+            cmd = [
+                sys.executable,
+                str(flush_script),
+                job["context_file"],
+                job["session_id"],
+                str(job["new_cursor"]),
+                job["transcript_archive"],
+            ]
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creation_flags,
+            )
         logging.info(
-            "Spawned flush.py for session %s (%d new turns, cursor %d -> %d, %d chars)",
-            session_id, turn_count, cursor, total_turns, len(context),
+            "Spawned %d pending flush job(s); current session %s has %d new turns "
+            "(cursor %d -> %d, %d chars)",
+            len(jobs), session_id, turn_count, cursor, total_turns, len(context),
         )
     except Exception as e:
-        logging.error("Failed to spawn flush.py: %s", e)
+        return _failure("Failed to spawn pending flush job(s): %s", e)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

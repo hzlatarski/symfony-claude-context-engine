@@ -108,9 +108,10 @@ def expand(transcript: str) -> Expansion:
     except Exception as exc:
         raise ExpansionError(f"claude CLI call failed: {exc}") from exc
 
-    if result.returncode != 0 and not result.stdout.strip():
+    if result.returncode != 0:
+        detail = (result.stderr.strip() or result.stdout.strip())[:200]
         raise ExpansionError(
-            f"claude CLI exited {result.returncode}: {result.stderr[:200]}"
+            f"claude CLI exited {result.returncode}: {detail}"
         )
 
     raw = result.stdout.strip()

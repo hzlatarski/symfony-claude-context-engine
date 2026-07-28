@@ -12,6 +12,8 @@ no API key, ~90 MB one-time download on first instantiation.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 from typing import Any
 
@@ -25,6 +27,7 @@ from typing import Any
 import chromadb
 
 from chroma_lock import chroma_write_lock
+from chroma_path import ensure_configured_chroma_dir
 from config import (
     CHROMA_COLLECTION_ARTICLES,
     CHROMA_COLLECTION_DAILY,
@@ -32,6 +35,7 @@ from config import (
 
 _client: Any = None
 _lock = threading.RLock()
+CHROMA_UPSERT_BATCH_SIZE = 256
 
 
 def _get_client():
@@ -43,8 +47,8 @@ def _get_client():
             return _client
         import config
 
-        config.CHROMA_DB_DIR.mkdir(parents=True, exist_ok=True)
-        _client = chromadb.PersistentClient(path=str(config.CHROMA_DB_DIR))
+        db_dir = ensure_configured_chroma_dir(config.CHROMA_DB_DIR)
+        _client = chromadb.PersistentClient(path=str(db_dir))
     return _client
 
 
@@ -145,6 +149,58 @@ def upsert_article(
         )
 
 
+def replace_article(
+    slug: str,
+    title: str,
+    zones: dict[str, str],
+    metadata: dict[str, Any],
+) -> None:
+    """Replace an article only after its complete new generation is embedded."""
+    prepared: list[tuple[str, str, dict[str, Any]]] = []
+    for zone in ("observed", "synthesized"):
+        text = zones.get(zone, "")
+        if not text.strip():
+            continue
+        flat = _flatten_metadata(metadata)
+        flat.update({"slug": slug, "title": title, "zone": zone})
+        digest_input = (
+            _composite_id(slug, zone)
+            + "\0"
+            + text
+            + "\0"
+            + json.dumps(flat, sort_keys=True, separators=(",", ":"))
+        )
+        digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:16]
+        prepared.append(
+            (f"{_composite_id(slug, zone)}::v{digest}", text, flat)
+        )
+
+    with chroma_write_lock(CHROMA_COLLECTION_ARTICLES):
+        collection = _articles_collection()
+        old = collection.get(
+            where={"slug": {"$eq": slug}},
+            include=[],
+        )
+        old_ids = set(old.get("ids") or [])
+        new_ids = [item[0] for item in prepared]
+        fresh_ids = [item_id for item_id in new_ids if item_id not in old_ids]
+        try:
+            if prepared:
+                collection.upsert(
+                    ids=new_ids,
+                    documents=[item[1] for item in prepared],
+                    metadatas=[item[2] for item in prepared],
+                )
+        except Exception:
+            if fresh_ids:
+                collection.delete(ids=fresh_ids)
+            raise
+
+        stale_ids = [item_id for item_id in old_ids if item_id not in new_ids]
+        if stale_ids:
+            collection.delete(ids=stale_ids)
+
+
 def upsert_chunk(
     chunk_id: str,
     source_file: str,
@@ -170,12 +226,106 @@ def upsert_chunk(
         _daily_collection().upsert(ids=[chunk_id], documents=[text], metadatas=[flat])
 
 
+def upsert_chunks(chunks: list[dict[str, Any]]) -> None:
+    """Insert verbatim chunks in embedding batches."""
+    prepared = _prepare_chunks(chunks)
+    if not prepared:
+        return
+
+    with chroma_write_lock(CHROMA_COLLECTION_DAILY):
+        _upsert_prepared_chunks(prepared)
+
+
+def _prepare_chunks(
+    chunks: list[dict[str, Any]],
+) -> list[tuple[str, str, dict[str, Any]]]:
+    prepared: list[tuple[str, str, dict[str, Any]]] = []
+    for chunk in chunks:
+        text = chunk["text"]
+        if not text.strip():
+            continue
+        flat = _flatten_metadata(chunk["metadata"])
+        flat["source_file"] = chunk["source_file"]
+        date_int = _iso_to_date_int(flat.get("date"))
+        if date_int is not None:
+            flat["date_int"] = date_int
+        prepared.append((chunk["chunk_id"], text, flat))
+    return prepared
+
+
+def _upsert_prepared_chunks(
+    prepared: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    collection = _daily_collection()
+    for start in range(0, len(prepared), CHROMA_UPSERT_BATCH_SIZE):
+        batch = prepared[start : start + CHROMA_UPSERT_BATCH_SIZE]
+        collection.upsert(
+            ids=[item[0] for item in batch],
+            documents=[item[1] for item in batch],
+            metadatas=[item[2] for item in batch],
+        )
+
+
+def _version_prepared_chunks(
+    prepared: list[tuple[str, str, dict[str, Any]]],
+) -> list[tuple[str, str, dict[str, Any]]]:
+    """Give replacement chunks immutable IDs so failed writes cannot overwrite old data."""
+    versioned: list[tuple[str, str, dict[str, Any]]] = []
+    for chunk_id, text, metadata in prepared:
+        digest_input = (
+            chunk_id
+            + "\0"
+            + text
+            + "\0"
+            + json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+        )
+        digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:16]
+        versioned.append((f"{chunk_id}::v{digest}", text, metadata))
+    return versioned
+
+
+def _update_prepared_metadata(
+    prepared: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    collection = _daily_collection()
+    for start in range(0, len(prepared), CHROMA_UPSERT_BATCH_SIZE):
+        batch = prepared[start : start + CHROMA_UPSERT_BATCH_SIZE]
+        collection.update(
+            ids=[item[0] for item in batch],
+            metadatas=[item[2] for item in batch],
+        )
+
+
+def replace_chunks_for_source(
+    source_file: str,
+    chunks: list[dict[str, Any]],
+) -> None:
+    """Loss-safely replace every indexed chunk belonging to one source file.
+
+    New immutable chunk versions are fully staged under a temporary source
+    before stale chunks are removed. Promotion only updates metadata, so even a
+    crash after deletion leaves the complete staged replacement searchable.
+    """
+    prepared = _version_prepared_chunks(_prepare_chunks(chunks))
+    pending_source = f"{source_file}::pending-replacement"
+    staged = [
+        (chunk_id, text, {**metadata, "source_file": pending_source})
+        for chunk_id, text, metadata in prepared
+    ]
+    with chroma_write_lock(CHROMA_COLLECTION_DAILY):
+        collection = _daily_collection()
+        if staged:
+            _upsert_prepared_chunks(staged)
+        collection.delete(where={"source_file": {"$eq": source_file}})
+        if prepared:
+            _update_prepared_metadata(prepared)
+        collection.delete(where={"source_file": {"$eq": pending_source}})
+
+
 def delete_article(slug: str) -> None:
     """Remove both zones of an article, if present."""
     with chroma_write_lock(CHROMA_COLLECTION_ARTICLES):
-        _articles_collection().delete(
-            ids=[_composite_id(slug, "observed"), _composite_id(slug, "synthesized")],
-        )
+        _articles_collection().delete(where={"slug": {"$eq": slug}})
 
 
 def delete_chunks_for_daily(source_file: str) -> None:
@@ -240,6 +390,69 @@ def search_daily(
             where=_and_or_single(conditions),
         )
     return _flatten_results(result)
+
+
+def search_daily_exact(
+    query: str,
+    limit: int = 5,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return chunks containing the literal query text."""
+    if not query.strip():
+        return []
+
+    conditions: list[dict[str, Any]] = []
+    if date_from:
+        lower = _iso_to_date_int(date_from)
+        if lower is not None:
+            conditions.append({"date_int": {"$gte": lower}})
+    if date_to:
+        upper = _iso_to_date_int(date_to)
+        if upper is not None:
+            conditions.append({"date_int": {"$lte": upper}})
+
+    with _lock:
+        result = _daily_collection().get(
+            where=_and_or_single(conditions),
+            where_document={"$contains": query},
+            limit=limit,
+            include=["documents", "metadatas"],
+        )
+
+    ids = result.get("ids") or []
+    docs = result.get("documents") or []
+    metas = result.get("metadatas") or []
+    return [
+        {
+            "id": id_,
+            "slug": (meta or {}).get("slug") or id_,
+            "text": doc,
+            "metadata": meta or {},
+            "distance": 0.0,
+        }
+        for id_, doc, meta in zip(ids, docs, metas)
+    ]
+
+
+def get_daily_chunk(chunk_id: str) -> dict[str, Any]:
+    """Fetch one raw daily/transcript chunk without snippet truncation."""
+    with _lock:
+        result = _daily_collection().get(
+            ids=[chunk_id],
+            include=["documents", "metadatas"],
+        )
+
+    ids = result.get("ids") or []
+    if not ids:
+        raise FileNotFoundError(f"No raw daily chunk with id {chunk_id!r}")
+    documents = result.get("documents") or []
+    metadatas = result.get("metadatas") or []
+    return {
+        "id": ids[0],
+        "text": documents[0] if documents else "",
+        "metadata": metadatas[0] if metadatas else {},
+    }
 
 
 def _flatten_results(result: dict[str, Any]) -> list[dict[str, Any]]:

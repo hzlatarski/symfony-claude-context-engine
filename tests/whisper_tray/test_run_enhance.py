@@ -69,7 +69,7 @@ def test_success_appends_history_injects_and_shows_done():
     history, inject_fn, pill, *_ = _call(enhance)
 
     history.append.assert_called_once()
-    inject_fn.assert_called_once_with("Hello world", {})
+    inject_fn.assert_called_once_with("Hello world", {}, target_hwnd=0)
     pill.show_done.assert_called_once()
 
 
@@ -97,7 +97,8 @@ def test_no_speech_logs_info(caplog):
     enhance = MagicMock(side_effect=_NoSpeech())
     with patch("whisper_tray.main.logger") as mock_logger:
         _call(enhance)
-    mock_logger.info.assert_called_once()
+    assert mock_logger.info.call_count == 2
+    assert mock_logger.info.call_args_list[-1].args == ("No speech detected in audio",)
 
 
 # --- generic Exception path ---

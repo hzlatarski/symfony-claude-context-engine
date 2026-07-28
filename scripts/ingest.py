@@ -33,11 +33,10 @@ from utils import (
     file_hash,
     list_wiki_articles,
     load_sources_config,
-    load_state,
     migrate_state_schema,
     read_wiki_index,
     resolve_source_files,
-    save_state,
+    update_state,
 )
 from compile_truth import compile_truth as regenerate_truth, COMPILED_TRUTH_FILE
 import dedup
@@ -65,15 +64,22 @@ def record_failure(state: dict, key: str, current_hash: str) -> None:
     written there. The attempt counter resets whenever the source file itself
     changes — editing a document that failed is an implicit request to retry.
     """
-    failures = state.setdefault("failed_sources", {})
-    prev = failures.get(key, {})
-    attempts = prev.get("attempts", 0) + 1 if prev.get("hash") == current_hash else 1
-    failures[key] = {
-        "hash": current_hash,
-        "attempts": attempts,
-        "last_failed_at": now_iso(),
-    }
-    save_state(state)
+    def apply_failure(current: dict) -> None:
+        failures = current.setdefault("failed_sources", {})
+        prev = failures.get(key, {})
+        attempts = (
+            prev.get("attempts", 0) + 1
+            if prev.get("hash") == current_hash
+            else 1
+        )
+        failures[key] = {
+            "hash": current_hash,
+            "attempts": attempts,
+            "last_failed_at": now_iso(),
+        }
+
+    apply_failure(state)
+    update_state(apply_failure)
 
 
 def should_skip_after_failures(state: dict, key: str, current_hash: str) -> bool:
@@ -404,13 +410,18 @@ architectural patterns.
         return 0.0, False
 
     key = source_state_key(group, file_path)
-    state["ingested_sources"][key] = {
+    entry = {
         "hash": file_hash(file_path),
         "ingested_at": now_iso(),
         "cost_usd": 0.0,
         "source_id": group.id,
     }
-    save_state(state)
+    state["ingested_sources"][key] = entry
+    update_state(
+        lambda current: current.setdefault("ingested_sources", {}).__setitem__(
+            key, entry
+        )
+    )
 
     return 0.0, True
 
@@ -423,9 +434,12 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Print per-file decisions")
     args = parser.parse_args()
 
-    state = load_state()
-    state = migrate_state_schema(state)
-    save_state(state)
+    def migrate(current: dict) -> None:
+        migrated = migrate_state_schema(current)
+        current.clear()
+        current.update(migrated)
+
+    state = update_state(migrate)
 
     groups = load_sources_config()
     if not groups:
@@ -494,7 +508,11 @@ def main():
         key = source_state_key(group, fpath)
         if ok:
             state.get("failed_sources", {}).pop(key, None)
-            save_state(state)
+            update_state(
+                lambda current: current.setdefault(
+                    "failed_sources", {}
+                ).pop(key, None)
+            )
         else:
             failed.append(key)
             record_failure(state, key, file_hash(fpath))

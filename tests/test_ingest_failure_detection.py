@@ -168,15 +168,15 @@ def test_same_tick_content_change_is_detected(tmp_path, monkeypatch) -> None:
 
 @pytest.fixture
 def isolated_state(monkeypatch):
-    """Stub save_state.
+    """Stub update_state.
 
-    record_failure persists through ingest.save_state, which writes the REAL
+    record_failure persists through ingest.update_state, which writes the REAL
     scripts/state.json. Without this stub these tests overwrite it with their
     own throwaway dict — which is exactly what happened on 2026-07-26,
     destroying 494 ingested-source records and 2197 codebase hashes.
     """
     import ingest
-    monkeypatch.setattr(ingest, "save_state", lambda *_a, **_k: None)
+    monkeypatch.setattr(ingest, "update_state", lambda *_a, **_k: None)
     return ingest
 
 
@@ -240,7 +240,7 @@ def _drive_ingest(tmp_path, monkeypatch, *, returncode, stdout, write_article):
                                    stdout=stdout, stderr="")
 
     monkeypatch.setattr(ingest.subprocess, "run", fake_run)
-    monkeypatch.setattr(ingest, "save_state", lambda *_a, **_k: None)
+    monkeypatch.setattr(ingest, "update_state", lambda *_a, **_k: None)
     monkeypatch.setattr(ingest.dedup, "similar_to_text", lambda *a, **k: [])
     monkeypatch.setattr(ingest.dedup, "format_preflight_block", lambda *a, **k: "")
 

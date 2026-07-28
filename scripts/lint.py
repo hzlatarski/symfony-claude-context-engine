@@ -29,7 +29,7 @@ from utils import (
     load_state,
     read_all_wiki_content,
     save_contradictions,
-    save_state,
+    update_state,
     wiki_article_exists,
 )
 
@@ -703,9 +703,7 @@ def main():
     print(f"\nReport saved to: {report_path}")
 
     # Update state
-    state = load_state()
-    state["last_lint"] = now_iso()
-    save_state(state)
+    update_state(lambda state: state.__setitem__("last_lint", now_iso()))
 
     # Summary
     errors = sum(1 for i in all_issues if i["severity"] == "error")

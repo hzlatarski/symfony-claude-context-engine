@@ -369,6 +369,19 @@ class TestGetArticlesImpl:
         from knowledge_mcp_server import _get_articles_impl
         assert _get_articles_impl([]) == []
 
+    def test_batch_rejects_path_traversal(self, tmp_path, monkeypatch):
+        import config
+
+        knowledge = tmp_path / "knowledge"
+        knowledge.mkdir()
+        (tmp_path / "secret.md").write_text("DO NOT DISCLOSE", encoding="utf-8")
+        monkeypatch.setattr(config, "KNOWLEDGE_DIR", knowledge)
+
+        from knowledge_mcp_server import _get_articles_impl
+        assert _get_articles_impl(["../secret"]) == [
+            {"slug": "../secret", "error": "invalid_slug"},
+        ]
+
 
 class TestSearchRawDailyImpl:
     def test_returns_chunks(self, seeded_store):
@@ -402,6 +415,66 @@ class TestSearchRawDailyImpl:
         assert "daily/2026-04-11.md#new" in ids
         assert "daily/2026-04-01.md#old" not in ids
 
+    def test_literal_hits_are_returned_before_semantic_hits(self, monkeypatch):
+        import vector_store
+
+        exact = {
+            "id": "transcript#exact",
+            "text": ("unrelated prefix " * 30)
+            + "https://claude.ai/code/artifact/exact-id",
+            "metadata": {"source_file": "daily/transcripts/s1.jsonl"},
+            "distance": 0.0,
+        }
+        semantic = {
+            "id": "daily#semantic",
+            "text": "A loosely related design discussion",
+            "metadata": {"source_file": "daily/2026-07-28.md"},
+            "distance": 0.2,
+        }
+        monkeypatch.setattr(vector_store, "search_daily_exact", lambda **kwargs: [exact])
+        monkeypatch.setattr(vector_store, "search_daily", lambda **kwargs: [semantic])
+
+        from knowledge_mcp_server import _search_raw_daily_impl
+        results = _search_raw_daily_impl(
+            "https://claude.ai/code/artifact/exact-id",
+            limit=2,
+        )
+
+        assert [result["id"] for result in results] == [
+            "transcript#exact",
+            "daily#semantic",
+        ]
+        assert "https://claude.ai/code/artifact/exact-id" in results[0]["snippet"]
+        assert (
+            results[0]["metadata"]["source_file"]
+            == "daily/transcripts/s1.jsonl"
+        )
+
+    def test_get_raw_daily_chunk_returns_unclipped_long_reference(self, monkeypatch):
+        import vector_store
+
+        url = "https://example.test/artifact/" + ("a" * 700)
+        monkeypatch.setattr(
+            vector_store,
+            "get_daily_chunk",
+            lambda chunk_id: {
+                "id": chunk_id,
+                "text": f'{{"text": "Open {url} for the design."}}',
+                "metadata": {
+                    "source_file": "daily/transcripts/s1.jsonl",
+                    "section": "assistant record",
+                    "date": "2026-07-28",
+                },
+            },
+            raising=False,
+        )
+
+        from knowledge_mcp_server import _get_raw_daily_chunk_impl
+        result = _get_raw_daily_chunk_impl("daily/transcripts/s1.jsonl#long-url")
+
+        assert url in result["text"]
+        assert result["metadata"]["source_file"] == "daily/transcripts/s1.jsonl"
+
 
 class TestGetArticleImpl:
     def test_reads_article_by_slug(self, tmp_path, monkeypatch):
@@ -421,6 +494,24 @@ class TestGetArticleImpl:
         assert result["frontmatter"]["type"] == "fact"
         assert result["frontmatter"]["title"] == "Foo"
         assert result["frontmatter"]["confidence"] == 0.8
+
+    @pytest.mark.parametrize(
+        "slug",
+        ["../secret", "..\\secret", "/absolute/secret", "daily/2026-07-28"],
+    )
+    def test_rejects_slugs_outside_article_roots(
+        self, tmp_path, monkeypatch, slug,
+    ):
+        import config
+
+        knowledge = tmp_path / "knowledge"
+        knowledge.mkdir()
+        (tmp_path / "secret.md").write_text("DO NOT DISCLOSE", encoding="utf-8")
+        monkeypatch.setattr(config, "KNOWLEDGE_DIR", knowledge)
+
+        from knowledge_mcp_server import _get_article_impl
+        with pytest.raises(ValueError, match="Invalid article slug"):
+            _get_article_impl(slug)
 
     def test_missing_article_raises(self, tmp_path, monkeypatch):
         import config

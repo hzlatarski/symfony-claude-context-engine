@@ -7,8 +7,10 @@ daily log, so a bug here is silent, unrecoverable knowledge loss.
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
+from filelock import FileLock
 
 from scripts import flush_cursor
 from scripts.transcript import extract_conversation_context
@@ -43,12 +45,68 @@ class TestCursorStore:
         flush_cursor.save_cursor("s1", 40, sf)
         assert flush_cursor.load_cursor("s1", sf) == 100
 
+    def test_cursor_is_fsynced_before_atomic_publish(self, tmp_path, monkeypatch):
+        events = []
+        real_replace = flush_cursor.os.replace
+        monkeypatch.setattr(
+            flush_cursor.os,
+            "fsync",
+            lambda _fd: events.append("fsync"),
+        )
+
+        def recording_replace(source, target):
+            events.append("replace")
+            real_replace(source, target)
+
+        monkeypatch.setattr(flush_cursor.os, "replace", recording_replace)
+
+        flush_cursor.save_cursor("s1", 10, tmp_path / "cursors.json")
+
+        assert events == ["fsync", "replace"]
+
     def test_sessions_are_independent(self, tmp_path):
         sf = tmp_path / "cursors.json"
         flush_cursor.save_cursor("a", 10, sf)
         flush_cursor.save_cursor("b", 20, sf)
         assert flush_cursor.load_cursor("a", sf) == 10
         assert flush_cursor.load_cursor("b", sf) == 20
+
+    def test_save_waits_for_cross_process_lock(self, tmp_path):
+        sf = tmp_path / "cursors.json"
+        lock = FileLock(str(sf.with_suffix(".json.lock")))
+        finished = threading.Event()
+
+        with lock:
+            worker = threading.Thread(
+                target=lambda: (
+                    flush_cursor.save_cursor("s1", 42, sf),
+                    finished.set(),
+                ),
+            )
+            worker.start()
+            assert not finished.wait(0.1), "cursor write ignored the process lock"
+
+        worker.join(timeout=2)
+        assert finished.is_set()
+        assert flush_cursor.load_cursor("s1", sf) == 42
+
+    def test_whole_flush_lock_serializes_same_session(self, tmp_path):
+        assert hasattr(flush_cursor, "session_flush_lock")
+        sf = tmp_path / "cursors.json"
+        entered = threading.Event()
+
+        with flush_cursor.session_flush_lock("same-session", sf):
+            worker = threading.Thread(
+                target=lambda: (
+                    flush_cursor.session_flush_lock("same-session", sf).__enter__(),
+                    entered.set(),
+                ),
+            )
+            worker.start()
+            assert not entered.wait(0.1)
+
+        worker.join(timeout=2)
+        assert entered.is_set()
 
     def test_corrupt_file_reads_as_zero_instead_of_crashing(self, tmp_path):
         sf = tmp_path / "cursors.json"
@@ -87,12 +145,7 @@ class TestCursorStore:
         assert len(data["turn_cursors"]) <= flush_cursor.MAX_TRACKED_SESSIONS
 
     def test_cursors_live_outside_last_flush_json(self):
-        """Cursors must NOT share last-flush.json.
-
-        flush.py's save_flush_state() does a non-atomic read-modify-write of
-        last-flush.json. Sharing the file lets a concurrent flush drop a cursor
-        another process just committed, or catch a torn write and wipe them all.
-        """
+        """Correctness-critical cursors stay separate from cost/dedup history."""
         assert flush_cursor.STATE_FILE.name != "last-flush.json"
 
 
@@ -128,16 +181,29 @@ class TestTranscriptWindow:
         _, total, window = extract_conversation_context(t, start_turn=-3)
         assert (total, window) == (5, 5)
 
-    def test_window_overflow_is_logged_not_silent(self, tmp_path, caplog):
-        """Turns beyond the window get marked flushed but never summarized.
-
-        That gap is real; it must at least be visible in flush.log.
-        """
+    def test_default_window_preserves_every_fresh_turn(self, tmp_path):
         t = _write_transcript(tmp_path / "t.jsonl", 50)
-        with caplog.at_level("WARNING"):
-            _, total, window = extract_conversation_context(t, start_turn=0, max_turns=30)
-        assert (total, window) == (50, 30)
-        assert any("overflow" in r.message.lower() for r in caplog.records)
+        ctx, cursor, window = extract_conversation_context(t, start_turn=0)
+        assert (cursor, window) == (50, 50)
+        assert "turn 0" in ctx and "turn 49" in ctx
+
+    def test_bounded_window_consumes_oldest_turns_and_advances_only_past_them(self, tmp_path):
+        t = _write_transcript(tmp_path / "t.jsonl", 50)
+        ctx, cursor, window = extract_conversation_context(t, start_turn=0, max_turns=30)
+        assert (cursor, window) == (30, 30)
+        assert "turn 0" in ctx and "turn 29" in ctx
+        assert "turn 30" not in ctx and "turn 49" not in ctx
+
+    def test_character_budget_never_partially_consumes_a_turn(self, tmp_path):
+        t = _write_transcript(tmp_path / "t.jsonl", 3)
+        first, _, _ = extract_conversation_context(t, max_turns=1)
+        ctx, cursor, window = extract_conversation_context(
+            t,
+            max_context_chars=len(first) + 1,
+        )
+        assert (cursor, window) == (1, 1)
+        assert "turn 0" in ctx
+        assert "turn 1" not in ctx
 
     def test_total_turns_is_the_cursor_to_record(self, tmp_path):
         t = _write_transcript(tmp_path / "t.jsonl", 12)

@@ -21,9 +21,12 @@ import logging
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+from filelock import FileLock
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT / "scripts"
@@ -39,8 +42,10 @@ WIP_FILE = ROOT / "wip.md"
 # pipeline never saw.
 sys.path.insert(0, str(SCRIPTS_DIR))
 from config import CLAUDE_BIN, DAILY_DIR  # noqa: E402
-from flush_cursor import load_cursor, save_cursor  # noqa: E402
+from flush_cursor import load_cursor, save_cursor, session_flush_lock  # noqa: E402
 from log_setup import configure as configure_logging  # noqa: E402
+from pending_flush import remove_pending_flush  # noqa: E402
+from utils import daily_file_lock_path  # noqa: E402
 
 # Set up file-based logging so we can verify the background process ran.
 # The parent process sends stdout/stderr to DEVNULL (to avoid the inherited
@@ -57,8 +62,26 @@ def load_flush_state() -> dict:
     return {}
 
 
-def save_flush_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+def update_flush_state(mutator) -> dict:
+    """Atomically update cross-session flush metadata without lost costs."""
+    lock = FileLock(str(STATE_FILE.with_suffix(".json.lock")))
+    with lock:
+        state = load_flush_state()
+        mutator(state)
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_name(
+            f".{STATE_FILE.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(state, handle)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, STATE_FILE)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return state
 
 
 # -----------------------------------------------------------------------------
@@ -225,29 +248,37 @@ def append_to_daily_log(content: str, section: str = "Session") -> None:
     """
     today = datetime.now(timezone.utc).astimezone()
     log_path = DAILY_DIR / f"{today.strftime('%Y-%m-%d')}.md"
+    DAILY_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = daily_file_lock_path(log_path)
+    with FileLock(str(lock_path)):
+        if not log_path.exists():
+            log_path.write_text(
+                f"# Daily Log: {today.strftime('%Y-%m-%d')}\n\n"
+                "## Sessions\n\n## Memory Maintenance\n\n",
+                encoding="utf-8",
+            )
 
-    if not log_path.exists():
-        DAILY_DIR.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(
-            f"# Daily Log: {today.strftime('%Y-%m-%d')}\n\n## Sessions\n\n## Memory Maintenance\n\n",
-            encoding="utf-8",
-        )
+        time_str = today.strftime("%H:%M")
+        entry = f"### {section} ({time_str})\n\n{content}\n\n"
 
-    time_str = today.strftime("%H:%M")
-    entry = f"### {section} ({time_str})\n\n{content}\n\n"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(entry)
+            f.flush()
+            os.fsync(f.fileno())
 
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(entry)
-
-    # Vector re-embed (verbatim drawer layer — MemPalace steal item).
-    # Non-fatal: logs and continues so flush never aborts on a Chroma
-    # or ONNX hiccup.
-    try:
-        from utils import embed_daily_file
-        count = embed_daily_file(log_path)
-        logging.info("Embedded %d daily chunks into vector store for %s", count, log_path.name)
-    except Exception as exc:
-        logging.warning("Vector embed skipped for %s: %s", log_path.name, exc)
+        # Keep append and replacement indexing in one date-wide transaction.
+        # Otherwise an older snapshot can win the Chroma write after a newer
+        # session has already appended to the shared daily file.
+        try:
+            from utils import embed_daily_file
+            count = embed_daily_file(log_path)
+            logging.info(
+                "Embedded %d daily chunks into vector store for %s",
+                count,
+                log_path.name,
+            )
+        except Exception as exc:
+            logging.warning("Vector embed skipped for %s: %s", log_path.name, exc)
 
 
 # Matches a **Heading:** bold section at the start of a line. Used to scope
@@ -259,6 +290,22 @@ _WIP_SECTION_RE = re.compile(
 )
 
 _WIP_EMPTY_MARKERS = {"", "(none)", "none", "n/a", "-", "—"}
+_URL_RE = re.compile(r"https?://[^\s<>\"']+")
+
+
+def append_exact_references(summary: str, source_text: str) -> str:
+    """Append source URLs deterministically instead of trusting summarization."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in _URL_RE.finditer(source_text):
+        url = match.group(0).rstrip(".,;:!?)]}")
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    if not urls:
+        return summary
+    references = "\n".join(f"- {url}" for url in urls)
+    return f"{summary.rstrip()}\n\n**Exact References:**\n{references}"
 
 
 def extract_wip_section(response: str) -> str | None:
@@ -393,8 +440,11 @@ respond with exactly: FLUSH_OK
         logging.error("claude CLI error: %s\n%s", e, traceback.format_exc())
         return f"FLUSH_ERROR: {type(e).__name__}: {e}", 0.0
 
-    if result.returncode != 0 and not result.stdout.strip():
-        logging.error("claude CLI exited %d — stderr: %s", result.returncode, result.stderr[:500])
+    if result.returncode != 0:
+        detail = (result.stderr.strip() or result.stdout.strip())[:500]
+        logging.error(
+            "claude CLI exited %d — %s", result.returncode, detail,
+        )
         return f"FLUSH_ERROR: claude CLI exited {result.returncode}", 0.0
 
     return result.stdout.strip(), 0.0
@@ -417,7 +467,11 @@ def maybe_trigger_compilation() -> None:
     if compile_state_file.exists():
         try:
             compile_state = json.loads(compile_state_file.read_text(encoding="utf-8"))
-            ingested = compile_state.get("ingested", {})
+            ingested = (
+                compile_state.get("ingested_daily")
+                or compile_state.get("ingested")
+                or {}
+            )
             if today_log in ingested:
                 # Already compiled today - check if the log has changed since
                 from hashlib import sha256
@@ -435,7 +489,7 @@ def maybe_trigger_compilation() -> None:
 
     logging.info("End-of-day compilation triggered (after %d:00)", COMPILE_AFTER_HOUR)
 
-    cmd = ["uv", "run", "--directory", str(ROOT), "python", str(compile_script)]
+    cmd = [sys.executable, str(compile_script)]
 
     kwargs: dict = {}
     if sys.platform == "win32":
@@ -462,10 +516,21 @@ def _today_flush_total(state: dict) -> float:
     )
 
 
+def _serialized_session_flush(func):
+    """Decorator holding the per-session lock across the complete transaction."""
+    def wrapped():
+        if len(sys.argv) < 3:
+            return func()
+        with session_flush_lock(sys.argv[2]):
+            return func()
+    return wrapped
+
+
+@_serialized_session_flush
 def main():
     if len(sys.argv) < 3:
         logging.error("Usage: %s <context_file.md> <session_id>", sys.argv[0])
-        sys.exit(1)
+        return 1
 
     context_file = Path(sys.argv[1])
     session_id = sys.argv[2]
@@ -480,11 +545,30 @@ def main():
         except ValueError:
             logging.warning("Ignoring non-integer turn cursor: %r", sys.argv[3])
 
+    transcript_archive = Path(sys.argv[4]) if len(sys.argv) > 4 else None
+
     logging.info("flush.py started for session %s, context: %s", session_id, context_file)
 
     if not context_file.exists():
         logging.error("Context file not found: %s", context_file)
-        return
+        return 1
+
+    if transcript_archive is not None:
+        try:
+            from transcript import embed_transcript_file
+            raw_count = embed_transcript_file(transcript_archive)
+            logging.info(
+                "Embedded %d raw transcript chunks for session %s",
+                raw_count,
+                session_id,
+            )
+        except Exception as exc:
+            logging.error(
+                "Raw transcript embed failed for %s; refusing to advance cursor: %s",
+                session_id,
+                exc,
+            )
+            return 1
 
     # Deduplication.
     #
@@ -507,7 +591,8 @@ def main():
                 session_id, already, new_cursor,
             )
             context_file.unlink(missing_ok=True)
-            return
+            remove_pending_flush(context_file)
+            return 0
     elif (
         # Legacy path: a caller that passed no cursor gets the old time throttle,
         # which is the best we can do without knowing what the window covers.
@@ -516,14 +601,16 @@ def main():
     ):
         logging.info("Skipping duplicate flush for session %s", session_id)
         context_file.unlink(missing_ok=True)
-        return
+        remove_pending_flush(context_file)
+        return 0
 
     # Read pre-extracted context
     context = context_file.read_text(encoding="utf-8").strip()
     if not context:
         logging.info("Context file is empty, skipping")
         context_file.unlink(missing_ok=True)
-        return
+        remove_pending_flush(context_file)
+        return 0
 
     logging.info("Flushing session %s: %d chars", session_id, len(context))
 
@@ -567,6 +654,10 @@ def main():
         logging.error("Result: %s", response)
         append_to_daily_log(response, "Memory Flush")
     else:
+        response = append_exact_references(
+            response,
+            context + "\n" + tool_events_text,
+        )
         logging.info("Result: saved to daily log (%d chars)", len(response))
         append_to_daily_log(response, "Session")
 
@@ -583,18 +674,29 @@ def main():
                 logging.error("Failed to write wip.md: %s", e)
 
     # Update dedup state + cost tracking
-    state = load_flush_state()
-    state["session_id"] = session_id
-    state["timestamp"] = time.time()
-    flush_costs = state.get("flush_costs", [])
-    flush_costs.append({
-        "session_id": session_id,
-        "timestamp": time.time(),
-        "cost_usd": flush_cost,
-        "result": "FLUSH_OK" if is_flush_ok else ("error" if is_flush_error else "saved"),
-    })
-    state["flush_costs"] = flush_costs
-    save_flush_state(state)
+    recorded_at = time.time()
+
+    def record_flush(state: dict) -> None:
+        state["session_id"] = session_id
+        state["timestamp"] = recorded_at
+        state.setdefault("flush_costs", []).append({
+            "session_id": session_id,
+            "timestamp": recorded_at,
+            "cost_usd": flush_cost,
+            "result": (
+                "FLUSH_OK"
+                if is_flush_ok
+                else ("error" if is_flush_error else "saved")
+            ),
+        })
+
+    update_flush_state(record_flush)
+
+    if is_flush_error:
+        logging.error(
+            "Flush failed for %s; pending context retained for retry", session_id
+        )
+        return 1
 
     # Advance the transcript cursor so the next flush of this session starts
     # after these turns. Skipped on FLUSH_ERROR: the window was never actually
@@ -605,10 +707,12 @@ def main():
             logging.info("Advanced turn cursor for %s to %d", session_id, new_cursor)
         except OSError as e:
             logging.error("Failed to save turn cursor: %s", e)
+            return 1
 
 
     # Clean up context file
     context_file.unlink(missing_ok=True)
+    remove_pending_flush(context_file)
 
     # End-of-day auto-compilation: if it's past the compile hour and today's
     # log hasn't been compiled yet, trigger compile.py in the background.
@@ -616,7 +720,8 @@ def main():
     maybe_trigger_compilation()
 
     logging.info("Flush complete for session %s", session_id)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

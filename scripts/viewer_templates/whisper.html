@@ -89,7 +89,7 @@
   <div class="timings" id="timings" hidden></div>
 </div>
 
-<script>
+<script nonce="{{ request.state.csp_nonce }}">
 (function () {
   const recBtn = document.getElementById('rec-btn');
   const stepRow = document.getElementById('step-row');

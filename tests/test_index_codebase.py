@@ -10,9 +10,11 @@ def isolated(tmp_path, monkeypatch):
     """Isolated ChromaDB + project root for indexer tests."""
     import config
     import codebase_store
+    import utils
 
     monkeypatch.setattr(config, "CHROMA_DB_DIR", tmp_path / "chroma")
     monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(utils, "STATE_FILE", tmp_path / "state.json")
     (tmp_path / "project").mkdir()
     try:
         from chromadb.api.shared_system_client import SharedSystemClient
@@ -95,14 +97,50 @@ class TestIndexFile:
 
     def test_skips_empty_file(self, isolated):
         import config
+        import codebase_store
         from index_codebase import index_file
 
         src_dir = config.PROJECT_ROOT / "src"
         src_dir.mkdir(parents=True)
         empty = src_dir / "Empty.php"
+        codebase_store.upsert_chunk(
+            chunk_id="src/Empty.php::old",
+            rel_path="src/Empty.php",
+            text="stale content",
+            metadata={"file_type": "php", "start_line": 1, "end_line": 1},
+        )
         empty.write_text("", encoding="utf-8")
         n = index_file(empty)
         assert n == 0
+        rows = codebase_store._codebase_collection().get(
+            where={"rel_path": {"$eq": "src/Empty.php"}},
+            include=[],
+        )
+        assert rows["ids"] == []
+
+    def test_full_reindex_prunes_deleted_files(self, isolated):
+        import config
+        import codebase_store
+        import utils
+        from index_codebase import reindex_all
+
+        rel = "src/Deleted.php"
+        codebase_store.upsert_chunk(
+            chunk_id=f"{rel}::old",
+            rel_path=rel,
+            text="class Deleted {}",
+            metadata={"file_type": "php", "start_line": 1, "end_line": 1},
+        )
+        utils.save_state({"codebase_hashes": {rel: "old"}})
+
+        reindex_all()
+
+        rows = codebase_store._codebase_collection().get(
+            where={"rel_path": {"$eq": rel}},
+            include=[],
+        )
+        assert rows["ids"] == []
+        assert rel not in utils.load_state().get("codebase_hashes", {})
 
 
 class TestReindexSingle:

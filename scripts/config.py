@@ -34,7 +34,9 @@ STATE_FILE = SCRIPTS_DIR / "state.json"
 SOURCES_FILE = ROOT_DIR / "sources.yaml"
 
 # ── Vector store ─────────────────────────────────────────────────────
-CHROMA_DB_DIR = KNOWLEDGE_DIR / "chroma"
+# Keep the active database in a replaceable child directory so a verified
+# rebuild can be switched in without deleting the previous recovery copy.
+CHROMA_DB_DIR = KNOWLEDGE_DIR / "chroma" / "active"
 CHROMA_COLLECTION_ARTICLES = "articles"
 CHROMA_COLLECTION_DAILY = "daily_chunks"
 CHROMA_COLLECTION_CODEBASE = "codebase"

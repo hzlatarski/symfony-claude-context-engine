@@ -1,145 +1,111 @@
-"""Unit tests for whisper.expand_query.
+"""Tests for query expansion at the Claude CLI subprocess boundary."""
 
-The Anthropic SDK call is mocked — we test our wrapper's parsing,
-validation, and fallback behavior, not the LLM itself.
-"""
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+import subprocess
 
 import pytest
 
 
-def _mock_anthropic_response(text: str):
-    """Shape a Messages API response to match what expand_query reads."""
-    return SimpleNamespace(content=[SimpleNamespace(text=text, type="text")])
+def _fake_cli(monkeypatch, payload, *, returncode=0, stderr=""):
+    import whisper.expand_query as expand_query
+
+    stdout = payload if isinstance(payload, str) else json.dumps(payload)
+    calls: list[dict] = []
+
+    def run(command, **kwargs):
+        calls.append({"command": command, **kwargs})
+        return subprocess.CompletedProcess(
+            command, returncode, stdout=stdout, stderr=stderr,
+        )
+
+    monkeypatch.setattr(expand_query.subprocess, "run", run)
+    return expand_query, calls
 
 
-@pytest.fixture
-def mock_client(monkeypatch):
-    client = MagicMock()
-    import whisper.expand_query as eq
-    monkeypatch.setattr(eq, "_get_client", lambda: client)
-    return client
+def test_expand_parses_valid_json_and_cli_contract(monkeypatch):
+    eq, calls = _fake_cli(monkeypatch, {
+        "queries": ["S3 migration", "event_locations Twig function"],
+        "intent": "audit",
+        "scope": ["articles", "code", "daily"],
+    })
+    import config
+    from whisper.prompts import QUERY_EXPANSION_SYSTEM_PROMPT
 
-
-def test_expand_parses_clean_json_response(mock_client):
-    mock_client.messages.create.return_value = _mock_anthropic_response(
-        json.dumps({
-            "queries": ["S3 migration", "event_locations Twig function"],
-            "intent": "audit",
-            "scope": ["articles", "code", "daily"],
-        })
-    )
-    from whisper.expand_query import expand
-
-    result = expand("audit the S3 event location migration")
+    result = eq.expand("audit the S3 migration")
 
     assert result.queries == ["S3 migration", "event_locations Twig function"]
     assert result.intent == "audit"
     assert result.scope == ["articles", "code", "daily"]
-
-
-def test_expand_strips_markdown_code_fences(mock_client):
-    mock_client.messages.create.return_value = _mock_anthropic_response(
-        "```json\n"
-        + json.dumps({"queries": ["q1"], "intent": "explain", "scope": ["articles"]})
-        + "\n```"
+    call = calls[0]
+    assert call["input"] == "audit the S3 migration"
+    assert call["command"][call["command"].index("--model") + 1] == config.MODEL_EXPAND
+    assert (
+        call["command"][call["command"].index("--system-prompt") + 1]
+        == QUERY_EXPANSION_SYSTEM_PROMPT
     )
-    from whisper.expand_query import expand
-
-    result = expand("explain the tailwind rebuild")
-
-    assert result.queries == ["q1"]
 
 
-def test_expand_invalid_intent_falls_back_to_generic(mock_client):
-    mock_client.messages.create.return_value = _mock_anthropic_response(
-        json.dumps({
-            "queries": ["q1"],
-            "intent": "invent-intent",
-            "scope": ["articles"],
-        })
+def test_expand_strips_markdown_fences(monkeypatch):
+    eq, _ = _fake_cli(
+        monkeypatch,
+        '```json\n{"queries":["q1"],"intent":"explain","scope":["articles"]}\n```',
     )
-    from whisper.expand_query import expand
 
-    result = expand("something")
+    assert eq.expand("explain").queries == ["q1"]
+
+
+def test_expand_validates_intent_and_scope(monkeypatch):
+    eq, _ = _fake_cli(monkeypatch, {
+        "queries": ["q1"],
+        "intent": "invented",
+        "scope": ["articles", "bogus", "code"],
+    })
+
+    result = eq.expand("anything")
 
     assert result.intent == "generic"
-
-
-def test_expand_invalid_scope_item_is_dropped(mock_client):
-    mock_client.messages.create.return_value = _mock_anthropic_response(
-        json.dumps({
-            "queries": ["q1"],
-            "intent": "audit",
-            "scope": ["articles", "bogus-channel", "code"],
-        })
-    )
-    from whisper.expand_query import expand
-
-    result = expand("audit X")
-
     assert result.scope == ["articles", "code"]
 
 
-def test_expand_empty_queries_raises(mock_client):
-    mock_client.messages.create.return_value = _mock_anthropic_response(
-        json.dumps({"queries": [], "intent": "audit", "scope": ["articles"]})
-    )
-    from whisper.expand_query import expand, ExpansionError
+@pytest.mark.parametrize(
+    "payload, message",
+    [
+        ({"queries": []}, "missing 'queries' list"),
+        ({"queries": "q1"}, "missing 'queries' list"),
+        ({"queries": [1, None, " "]}, "contained no valid strings"),
+        ("not json", "non-JSON"),
+    ],
+)
+def test_expand_rejects_unusable_output(monkeypatch, payload, message):
+    eq, _ = _fake_cli(monkeypatch, payload)
 
-    with pytest.raises(ExpansionError):
-        expand("transcript")
-
-
-def test_expand_queries_field_non_list_raises(mock_client):
-    mock_client.messages.create.return_value = _mock_anthropic_response(
-        json.dumps({"queries": "just a string not a list", "intent": "audit", "scope": ["articles"]})
-    )
-    from whisper.expand_query import expand, ExpansionError
-
-    with pytest.raises(ExpansionError):
-        expand("transcript")
+    with pytest.raises(eq.ExpansionError, match=message):
+        eq.expand("transcript")
 
 
-def test_expand_malformed_json_raises(mock_client):
-    mock_client.messages.create.return_value = _mock_anthropic_response(
-        "not valid json at all { queries: hi"
-    )
-    from whisper.expand_query import expand, ExpansionError
+def test_expand_defaults_invalid_scope_and_caps_queries(monkeypatch):
+    long = "a" * 1000
+    eq, _ = _fake_cli(monkeypatch, {
+        "queries": [f"q{i}-{long}" for i in range(20)],
+        "intent": "audit",
+        "scope": ["invalid"],
+    })
 
-    with pytest.raises(ExpansionError):
-        expand("transcript")
-
-
-def test_expand_scope_defaults_to_articles_if_all_items_invalid(mock_client):
-    mock_client.messages.create.return_value = _mock_anthropic_response(
-        json.dumps({"queries": ["q"], "intent": "audit", "scope": ["nonsense"]})
-    )
-    from whisper.expand_query import expand
-
-    result = expand("transcript")
+    result = eq.expand("transcript")
 
     assert result.scope == ["articles"]
+    assert len(result.queries) == eq.MAX_QUERIES
+    assert all(len(query) <= eq.MAX_QUERY_LENGTH for query in result.queries)
 
 
-def test_expand_caps_query_count_and_length(mock_client):
-    """Defense against Haiku returning a runaway list or giant strings."""
-    # 20 queries, each 1000 chars — both caps should engage
-    long = "a" * 1000
-    mock_client.messages.create.return_value = _mock_anthropic_response(
-        json.dumps({
-            "queries": [f"q{i}-{long}" for i in range(20)],
-            "intent": "audit",
-            "scope": ["articles"],
-        })
+def test_expand_nonzero_exit_with_stdout_raises(monkeypatch):
+    eq, _ = _fake_cli(
+        monkeypatch,
+        {"queries": ["looks-valid"]},
+        returncode=1,
     )
-    from whisper.expand_query import expand, MAX_QUERIES, MAX_QUERY_LENGTH
 
-    result = expand("transcript")
-
-    assert len(result.queries) == MAX_QUERIES
-    assert all(len(q) <= MAX_QUERY_LENGTH for q in result.queries)
+    with pytest.raises(eq.ExpansionError, match="exited 1"):
+        eq.expand("transcript")

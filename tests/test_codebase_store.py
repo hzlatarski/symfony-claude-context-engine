@@ -67,3 +67,186 @@ class TestCodebaseStore:
         )
         s = store.stats()
         assert s["codebase_chunks"] >= 1
+
+    def test_failed_replacement_keeps_previous_complete_file(
+        self, store, monkeypatch,
+    ):
+        rel = "src/Foo.php"
+        store.upsert_chunk(
+            chunk_id=f"{rel}::old",
+            rel_path=rel,
+            text="class FooOldImplementation {}",
+            metadata={"file_type": "php", "start_line": 1, "end_line": 1},
+        )
+        collection = store._codebase_collection()
+
+        def fail_during_stage(prepared):
+            chunk_id, text, metadata = prepared[0]
+            collection.upsert(
+                ids=[chunk_id], documents=[text], metadatas=[metadata],
+            )
+            raise RuntimeError("embedding failed")
+
+        monkeypatch.setattr(
+            store, "_upsert_prepared_chunks", fail_during_stage, raising=False,
+        )
+
+        with pytest.raises(RuntimeError, match="embedding failed"):
+            store.replace_chunks_for_file(
+                rel,
+                [{
+                    "chunk_id": f"{rel}::0",
+                    "text": "class FooNewImplementation {}",
+                    "metadata": {
+                        "file_type": "php",
+                        "start_line": 1,
+                        "end_line": 1,
+                    },
+                }],
+            )
+
+        rows = collection.get(
+            where={"rel_path": {"$eq": rel}},
+            include=["documents"],
+        )
+        assert rows["documents"] == ["class FooOldImplementation {}"]
+
+    def test_successful_replacement_removes_previous_generation(self, store):
+        rel = "src/Foo.php"
+        store.upsert_chunk(
+            chunk_id=f"{rel}::old",
+            rel_path=rel,
+            text="class FooOldImplementation {}",
+            metadata={"file_type": "php", "start_line": 1, "end_line": 1},
+        )
+
+        store.replace_chunks_for_file(
+            rel,
+            [{
+                "chunk_id": f"{rel}::0",
+                "text": "class FooNewImplementation {}",
+                "metadata": {
+                    "file_type": "php",
+                    "start_line": 1,
+                    "end_line": 1,
+                },
+            }],
+        )
+
+        rows = store._codebase_collection().get(
+            where={"rel_path": {"$eq": rel}},
+            include=["documents"],
+        )
+        assert rows["documents"] == ["class FooNewImplementation {}"]
+
+    def test_identical_replacement_keeps_the_promoted_generation(self, store):
+        rel = "src/Idempotent.php"
+        chunks = [{
+            "chunk_id": f"{rel}::0",
+            "text": "class Idempotent {}",
+            "metadata": {
+                "file_type": "php",
+                "start_line": 1,
+                "end_line": 1,
+            },
+        }]
+
+        store.replace_chunks_for_file(rel, chunks)
+        store.replace_chunks_for_file(rel, chunks)
+
+        rows = store._codebase_collection().get(
+            where={"rel_path": {"$eq": rel}},
+            include=["documents"],
+        )
+        assert rows["documents"] == ["class Idempotent {}"]
+
+    def test_failed_identical_replacement_restores_existing_generation(
+        self, store, monkeypatch,
+    ):
+        rel = "src/Retry.php"
+        chunks = [{
+            "chunk_id": f"{rel}::0",
+            "text": "class Retry {}",
+            "metadata": {
+                "file_type": "php",
+                "start_line": 1,
+                "end_line": 1,
+            },
+        }]
+        store.replace_chunks_for_file(rel, chunks)
+        collection = store._codebase_collection()
+
+        def fail_after_overwriting_metadata(prepared):
+            chunk_id, text, metadata = prepared[0]
+            collection.upsert(
+                ids=[chunk_id],
+                documents=[text],
+                metadatas=[metadata],
+            )
+            raise RuntimeError("stage interrupted")
+
+        monkeypatch.setattr(
+            store, "_upsert_prepared_chunks", fail_after_overwriting_metadata,
+        )
+
+        with pytest.raises(RuntimeError, match="stage interrupted"):
+            store.replace_chunks_for_file(rel, chunks)
+
+        rows = collection.get(
+            where={"rel_path": {"$eq": rel}},
+            include=["documents"],
+        )
+        assert rows["documents"] == ["class Retry {}"]
+
+    def test_cleanup_failure_never_deletes_the_only_existing_generation(
+        self, store, monkeypatch,
+    ):
+        rel = "src/CleanupRetry.php"
+        chunks = [{
+            "chunk_id": f"{rel}::0",
+            "text": "class CleanupRetry {}",
+            "metadata": {
+                "file_type": "php",
+                "start_line": 1,
+                "end_line": 1,
+            },
+        }]
+        store.replace_chunks_for_file(rel, chunks)
+        collection = store._codebase_collection()
+        existing = collection.get(
+            where={"rel_path": {"$eq": rel}},
+            include=[],
+        )
+        existing_id = existing["ids"][0]
+
+        def fail_after_overwriting_metadata(prepared):
+            chunk_id, text, metadata = prepared[0]
+            collection.upsert(
+                ids=[chunk_id],
+                documents=[text],
+                metadatas=[metadata],
+            )
+            raise RuntimeError("stage interrupted")
+
+        class CleanupFailingCollection:
+            def get(self, *args, **kwargs):
+                return collection.get(*args, **kwargs)
+
+            def delete(self, *args, **kwargs):
+                return collection.delete(*args, **kwargs)
+
+            def update(self, *args, **kwargs):
+                raise RuntimeError("metadata restore failed")
+
+        monkeypatch.setattr(
+            store, "_upsert_prepared_chunks", fail_after_overwriting_metadata,
+        )
+        monkeypatch.setattr(
+            store, "_codebase_collection", CleanupFailingCollection,
+        )
+
+        with pytest.raises(RuntimeError, match="metadata restore failed"):
+            store.replace_chunks_for_file(rel, chunks)
+
+        retained = collection.get(ids=[existing_id], include=["documents"])
+        assert retained["documents"] == ["class CleanupRetry {}"]

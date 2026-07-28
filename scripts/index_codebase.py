@@ -36,8 +36,8 @@ for _p in (str(_ROOT), str(_HERE)):
         sys.path.insert(0, _p)
 
 import config  # noqa: E402
-from codebase_store import delete_chunks_for_file, upsert_chunk  # noqa: E402
-from utils import load_state, save_state  # noqa: E402
+from codebase_store import delete_chunks_for_file, replace_chunks_for_file  # noqa: E402
+from utils import load_state, update_state  # noqa: E402
 
 CHUNK_SIZE = 150
 CHUNK_OVERLAP = 30
@@ -172,7 +172,7 @@ def _chunk_lines(text: str) -> list[tuple[int, int, str]]:
 
 
 def index_file(path: Path) -> int:
-    """Chunk and upsert one file. Deletes old chunks first.
+    """Loss-safely replace the indexed chunks for one file.
 
     Returns number of chunks written. Returns 0 for empty files.
     """
@@ -188,15 +188,12 @@ def index_file(path: Path) -> int:
     except OSError:
         return 0
 
-    if not text.strip():
-        return 0
-
     symbols = _extract_symbols(text, file_type)
-    delete_chunks_for_file(rel)
 
     description = _description_for_file_type(file_type)
 
     chunks = chunk_file(text, file_type)
+    replacement: list[dict] = []
     for idx, (start, end, chunk_text) in enumerate(chunks):
         chunk_id = f"{rel}::{idx}"
         metadata: dict = {
@@ -211,7 +208,13 @@ def index_file(path: Path) -> int:
             # group. SocratiCode's context-artifact pattern: "check this
             # before writing migrations" beats undirected file reading.
             metadata["source_description"] = description
-        upsert_chunk(chunk_id, rel, chunk_text, metadata)
+        replacement.append({
+            "chunk_id": chunk_id,
+            "text": chunk_text,
+            "metadata": metadata,
+        })
+
+    replace_chunks_for_file(rel, replacement)
 
     return len(chunks)
 
@@ -296,9 +299,19 @@ def reindex_all(force: bool = False, progress_callback=None) -> tuple[int, int]:
     hashes: dict[str, str] = state.setdefault("codebase_hashes", {})
 
     files = list_source_files()
+    current_paths = {
+        str(path.relative_to(config.PROJECT_ROOT)).replace("\\", "/")
+        for _file_type, path in files
+    }
+    removed = set(hashes) - current_paths
+    for rel in sorted(removed):
+        delete_chunks_for_file(rel)
+        hashes.pop(rel, None)
+
     total = len(files)
     indexed = 0
     skipped = 0
+    hash_updates: dict[str, str] = {}
     try:
         for scanned, (_ftype, path) in enumerate(files, 1):
             rel = str(path.relative_to(config.PROJECT_ROOT)).replace("\\", "/")
@@ -310,13 +323,20 @@ def reindex_all(force: bool = False, progress_callback=None) -> tuple[int, int]:
                 continue
             n = index_file(path)
             hashes[rel] = h
+            hash_updates[rel] = h
             indexed += 1
             if progress_callback:
                 progress_callback(scanned, total, rel)
             else:
                 print(f"  [{indexed}] {n} chunks  {rel}")
     finally:
-        save_state(state)
+        def persist(current: dict) -> None:
+            current_hashes = current.setdefault("codebase_hashes", {})
+            for rel in removed:
+                current_hashes.pop(rel, None)
+            current_hashes.update(hash_updates)
+
+        update_state(persist)
 
     return indexed, skipped
 
@@ -329,25 +349,35 @@ def reindex_single(path_str: str) -> int:
     """
     path = Path(path_str).resolve()
     if not path.exists():
+        try:
+            rel = str(path.relative_to(config.PROJECT_ROOT)).replace("\\", "/")
+        except ValueError:
+            rel = ""
+        if rel and path.suffix.lower() in _supported_extensions():
+            delete_chunks_for_file(rel)
+
+            def remove_hash(current: dict) -> None:
+                current.setdefault("codebase_hashes", {}).pop(rel, None)
+
+            update_state(remove_hash)
         print(f"  skip (not found): {path_str}", file=sys.stderr)
         return 0
 
     if path.suffix.lower() not in _supported_extensions():
         return 0
 
-    state = load_state()
-    hashes: dict[str, str] = state.setdefault("codebase_hashes", {})
+    n = index_file(path)
     try:
-        n = index_file(path)
-        try:
-            rel = str(path.relative_to(config.PROJECT_ROOT)).replace("\\", "/")
-        except ValueError:
-            rel = path.name
-        if n > 0:
-            hashes[rel] = _file_hash(path)
-            print(f"  indexed {n} chunks: {rel}")
-    finally:
-        save_state(state)
+        rel = str(path.relative_to(config.PROJECT_ROOT)).replace("\\", "/")
+    except ValueError:
+        rel = path.name
+    digest = _file_hash(path)
+
+    def persist_hash(current: dict) -> None:
+        current.setdefault("codebase_hashes", {})[rel] = digest
+
+    update_state(persist_hash)
+    print(f"  indexed {n} chunks: {rel}")
 
     return n
 

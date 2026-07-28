@@ -29,6 +29,7 @@ from typing import Any
 import chromadb
 
 import hybrid_search
+from chroma_path import ensure_active_chroma_dir
 from config import CHROMA_COLLECTION_ARTICLES, LINKED_PROJECTS
 
 # RRF constant — must match hybrid_search._RRF_K so local hits and linked
@@ -46,13 +47,14 @@ def _client_for(project_root: Path) -> Any:
     None means the project has no Chroma store yet — silently skipped at
     search time so a misconfigured path doesn't break the local search.
     """
-    chroma_path = project_root / "knowledge" / "chroma"
+    chroma_root = project_root / "knowledge" / "chroma"
+    if not chroma_root.exists():
+        return None
+    chroma_path = ensure_active_chroma_dir(chroma_root)
     key = str(chroma_path.resolve())
     cached = _client_cache.get(key)
     if cached is not None:
         return cached
-    if not chroma_path.exists():
-        return None
     client = chromadb.PersistentClient(path=str(chroma_path))
     _client_cache[key] = client
     return client

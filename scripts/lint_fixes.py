@@ -52,7 +52,7 @@ from utils import (
     file_hash,
     list_wiki_articles,
     load_state,
-    save_state,
+    update_state,
 )
 
 # Fuzzy-match threshold for broken-link repair. difflib's SequenceMatcher
@@ -323,9 +323,15 @@ def fix_stale_article(issue: dict) -> bool:
         return False
 
     # Clear the hash so next compile detects the file as changed.
-    ingested[daily_name]["hash"] = ""
-    state["ingested_daily"] = ingested
-    save_state(state)
+    def clear_hash(current: dict) -> None:
+        current_ingested = (
+            current.get("ingested_daily") or current.get("ingested") or {}
+        )
+        if daily_name in current_ingested:
+            current_ingested[daily_name]["hash"] = ""
+            current["ingested_daily"] = current_ingested
+
+    update_state(clear_hash)
 
     _append_audit(
         "stale_article",

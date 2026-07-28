@@ -6,10 +6,10 @@ This document describes the retrieval pipeline, the four-store data model, and h
 
 | Store | Location | Contents | Mutation point |
 |---|---|---|---|
-| **Daily logs (raw)** | `knowledge/daily/*.md` | Verbatim session transcripts, never summarized | `flush.py` (automatic, session-end) |
+| **Session evidence** | `knowledge/daily/*.md`, `knowledge/daily/transcripts/*.jsonl` | Readable lossy summaries plus byte-for-byte raw Claude transcripts | `flush.py` and transcript hooks |
 | **Concept articles (curated)** | `knowledge/concepts/*.md`, `knowledge/connections/*.md`, `knowledge/qa/*.md` | LLM-compiled Truth + Timeline articles with source anchors | `compile.py`, `ingest.py` |
 | **Compiled truth (excerpt)** | `knowledge/compiled-truth.md` | Priority-scored top-N articles, always injected into sessions | `compile_truth.py` (pure Python, zero cost) |
-| **Vector index** | `knowledge/chroma/` | ChromaDB: `articles` collection (by zone) + `daily_chunks` collection (by section) | `vector_store.upsert_*` called from compile / ingest / flush |
+| **Vector index** | `knowledge/chroma/active/` | ChromaDB: `articles`, `daily_chunks`, and `codebase` collections | staged replacements called from compile / ingest / flush / reindex |
 
 ## Retrieval Routing
 
@@ -29,7 +29,8 @@ Claude picks these when Level 0 doesn't answer the question.
 **Knowledge surface (`knowledge-compiler` server):**
 
 - `search_knowledge(query, type, min_confidence, zone, include_quarantined)` — semantic search over curated articles
-- `search_raw_daily(query, date_from, date_to)` — semantic search over verbatim drawer chunks
+- `search_raw_daily(query, date_from, date_to)` — literal-first plus semantic search over daily and raw-transcript chunks
+- `get_raw_daily_chunk(chunk_id)` — fetch the complete, unclipped source chunk
 - `get_article(slug)` — fetch full article by slug
 - `list_contradictions()` — current quarantine list
 
@@ -59,7 +60,7 @@ Mixing them forces one cache strategy onto both, and one failure mode (e.g. a ba
 
 ### `articles` collection
 
-- **Document granularity:** one per `(slug, zone)` pair. The composite id is `{slug}::{zone}` so `delete_article(slug)` can wipe both zones in a single call.
+- **Document granularity:** one per `(slug, zone)` pair. Replacement IDs include a content version; `delete_article(slug)` removes every version by `slug` metadata.
 - **Metadata:** `type`, `confidence`, `quarantined`, `updated`, `pinned`, `zone`, `slug`, `title`.
 - **Filters:** `type_filter`, `min_confidence`, `zone_filter`, `include_quarantined` — all exposed through `search_knowledge`.
 - **Purpose:** curated semantic search — "what have I decided about X?"
@@ -82,11 +83,11 @@ The two collections are split because the datasets have wildly different durabil
 
 ## State & Idempotency
 
-- `scripts/state.json` tracks per-file hashes for source ingestion **and** vector index state (`vector_article_hashes`, `vector_daily_hashes`). `reindex.py` uses these for incremental updates.
-- `vector_store.upsert_*` is idempotent by `(slug, zone)` / `chunk_id`. Safe to call repeatedly.
-- `embed_article_file` always calls `delete_article` before upserting both zones, so stale zones from an older version of the article can't linger after the article shrinks.
+- `scripts/state.json` tracks per-file hashes for source ingestion **and** vector index state (`vector_article_hashes`, `vector_daily_hashes`). Every mutation reloads the current file under a cross-process lock, updates only its section, fsyncs a temporary file, and atomically replaces the destination.
+- Article, daily/transcript, and codebase replacement stages a complete content-versioned generation before deleting stale chunks. Promotion is idempotent even when old and new IDs overlap, and a failed replacement retains the last complete searchable generation.
+- Full reindex reconciles stored sources against disk, removing hashes and chunks for deleted or emptied files.
 - `reindex_articles` / `reindex_daily` wrap their loops in `try/finally` so a mid-run failure persists the hash cache for everything embedded up to that point, preventing drift between Chroma and the cache.
-- Failures in the vector layer never block the compile / ingest / flush pipelines — they're logged to stderr (or `flush.log` for the detached background flush) and skipped, because a missing vector index is recoverable (run `reindex.py`) while a broken compile is not.
+- Curated-vector refresh failures remain recoverable through `reindex.py`. Raw transcript archive/index failure is stricter: it blocks cursor advancement so source information can never be marked consumed before it is durable and searchable.
 
 ## Compile-Time Flow
 
@@ -112,6 +113,10 @@ daily/YYYY-MM-DD.md ──► compile.py
 ```
 Claude Code ──► SessionEnd / PreCompact hook ──► flush.py (detached bg proc)
                                                      │
+                                                     ├──► archive original JSONL
+                                                     │    + index every raw record
+                                                     │    (failure leaves cursor unchanged)
+                                                     │
                                                      ├──► Haiku extracts WIP
                                                      │    + session facts
                                                      │
@@ -125,6 +130,11 @@ Claude Code ──► SessionEnd / PreCompact hook ──► flush.py (detached 
                                                      └──► update_wip_file() (if non-empty)
                                                           writes wip.md
 ```
+
+The cursor window is extracted from the immutable archived snapshot, not the
+still-growing live transcript. Per-session locks prevent duplicate cursor
+windows, while a separate per-date lock serializes daily-file creation,
+append, and replacement indexing across different sessions.
 
 ## Cost Model
 
@@ -140,9 +150,9 @@ Vector store operations are free (local ONNX embeddings — never touches the ne
 
 | Failure | Impact | Recovery |
 |---|---|---|
-| ChromaDB file corruption | Search returns nothing | `rm -rf knowledge/chroma/` + `reindex.py --all` |
+| ChromaDB file corruption | Search fails or returns nothing | Stop writers, rename `knowledge/chroma/active` to a uniquely named recovery directory under `knowledge/chroma/`, then run `reindex.py --all`; verify the rebuild before deleting any retained recovery store |
 | Hash cache drift (Chroma has data the cache doesn't know about, or vice versa) | Re-embeds look "clean" but aren't | Delete `state.json["vector_*_hashes"]` + `reindex.py --all` |
 | Flush can't reach Chroma (background fail) | That session's daily chunks are missing from the store | Next flush catches up via `embed_daily_file` re-chunking the whole file |
-| compile.py crashes mid-run | State partially advanced, some articles embedded, others not | `try/finally` in `reindex_articles` preserves the cache; subsequent compile re-embeds what's missing |
+| compile.py crashes mid-run | The current daily source remains unacknowledged unless its article mutation completed | The serialized next compile retries the unacknowledged source; staged vector replacement retains the last complete searchable article generation |
 | An article's LLM compile generates a CONTRADICTION marker | Article gets quarantined via `lint.py` and excluded from search + compiled-truth | Human review, then `lint.py --resolve` to clear |
 | Canary questions start failing | Early warning for compiler drift | Investigate the failing canary(s); typically indicates a regression in compile.py or the knowledge it references |

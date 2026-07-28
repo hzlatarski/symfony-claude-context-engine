@@ -15,20 +15,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+from filelock import FileLock
 
 from config import AGENTS_FILE, CLAUDE_BIN, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, MODEL_COMPILE, NO_WINDOW_CREATIONFLAGS, now_iso
 from utils import (
     file_hash,
     list_raw_files,
     list_wiki_articles,
-    load_state,
     migrate_state_schema,
     read_wiki_index,
-    save_state,
+    update_state,
 )
 from compile_truth import compile_truth as regenerate_truth, COMPILED_TRUTH_FILE
 import dedup
@@ -38,14 +40,14 @@ import dedup
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
-async def compile_daily_log(log_path: Path, state: dict) -> float:
+async def compile_daily_log(log_path: Path, state: dict) -> bool:
     """Compile a single daily log into knowledge articles.
 
-    Returns the API cost of the compilation.
+    Returns whether the external compile completed and produced credited output.
     """
     log_content = log_path.read_text(encoding="utf-8")
     schema = AGENTS_FILE.read_text(encoding="utf-8")
-    wiki_index = read_wiki_index()
+    wiki_index = read_wiki_index(compact=True)
 
     # Read compiled truth — dense summary of all current knowledge (zero-cost artifact)
     compiled_truth = ""
@@ -66,6 +68,7 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
         print(f"  Duplicate pre-flight failed (continuing): {exc}", file=sys.stderr)
 
     timestamp = now_iso()
+    before = _articles_snapshot()
 
     prompt = f"""You are a knowledge compiler. Your job is to read a daily conversation log
 and extract knowledge into structured wiki articles.
@@ -215,35 +218,94 @@ Read the daily log above and compile it into wiki articles following the schema 
         result = await asyncio.to_thread(_run)
     except subprocess.TimeoutExpired:
         print(f"  Error: claude CLI timed out after 600s")
-        return 0.0
+        return False
     except Exception as e:
         print(f"  Error: {e}")
-        return 0.0
+        return False
 
-    if result.returncode != 0 and not result.stdout.strip():
-        print(f"  Error: claude CLI exited {result.returncode} — {result.stderr[:200]}")
-        return 0.0
+    if result.returncode != 0:
+        detail = (result.stderr.strip() or result.stdout.strip())[:300]
+        print(
+            f"  Error: claude CLI exited {result.returncode} — {detail}",
+            file=sys.stderr,
+        )
+        return False
+
+    rel_source = f"daily/{log_path.name}"
+    if not _articles_written_for(before, rel_source):
+        print(
+            f"  Error: claude CLI exited 0 but wrote no article credited to "
+            f"{rel_source}",
+            file=sys.stderr,
+        )
+        return False
 
     # Update state (cost is 0.0 — subscription billing, not API credits)
     rel_path = log_path.name
-    state.setdefault("ingested_daily", {})[rel_path] = {
+    entry = {
         "hash": file_hash(log_path),
         "compiled_at": now_iso(),
         "cost_usd": 0.0,
     }
+    state.setdefault("ingested_daily", {})[rel_path] = entry
+    update_state(
+        lambda current: current.setdefault("ingested_daily", {}).__setitem__(
+            rel_path, entry
+        )
+    )
 
-    return 0.0
+    return True
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Compile daily logs into knowledge articles")
-    parser.add_argument("--all", action="store_true", help="Force recompile all logs")
-    parser.add_argument("--file", type=str, help="Compile a specific daily log file")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be compiled")
-    args = parser.parse_args()
+def _articles_snapshot() -> dict[str, str]:
+    """Return content hashes for compiler-managed knowledge articles."""
+    snapshot: dict[str, str] = {}
+    for directory in (CONCEPTS_DIR, CONNECTIONS_DIR):
+        if not directory.exists():
+            continue
+        for path in directory.rglob("*.md"):
+            try:
+                snapshot[str(path.resolve())] = hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+            except OSError:
+                continue
+    return snapshot
 
-    state = load_state()
-    state = migrate_state_schema(state)
+
+def _articles_written_for(before: dict[str, str], rel_source: str) -> bool:
+    """Return whether a changed article explicitly credits this daily source."""
+    for directory in (CONCEPTS_DIR, CONNECTIONS_DIR):
+        if not directory.exists():
+            continue
+        for path in directory.rglob("*.md"):
+            try:
+                content = path.read_text(encoding="utf-8")
+                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            except OSError:
+                continue
+            if before.get(str(path.resolve())) == digest:
+                continue
+            if f"[src:{rel_source}]" in content:
+                return True
+    return False
+
+
+async def compile_logs(logs: list[Path], state: dict) -> list[bool]:
+    """Compile logs oldest-first with exactly one knowledge writer."""
+    results: list[bool] = []
+    for log in sorted(logs, key=lambda path: path.name):
+        results.append(await compile_daily_log(log, state))
+    return results
+
+
+def _main_unlocked(args: argparse.Namespace) -> int:
+    def migrate(current: dict) -> None:
+        migrated = migrate_state_schema(current)
+        current.clear()
+        current.update(migrated)
+
+    state = update_state(migrate)
 
     # Determine which files to compile
     if args.file:
@@ -255,7 +317,7 @@ def main():
             target = ROOT_DIR / args.file
         if not target.exists():
             print(f"Error: {args.file} not found")
-            sys.exit(1)
+            return 2
         to_compile = [target]
     else:
         all_logs = list_raw_files()
@@ -271,29 +333,21 @@ def main():
 
     if not to_compile:
         print("Nothing to compile - all daily logs are up to date.")
-        return
+        return 0
 
     print(f"{'[DRY RUN] ' if args.dry_run else ''}Files to compile ({len(to_compile)}):")
     for f in to_compile:
         print(f"  - {f.name}")
 
     if args.dry_run:
-        return
+        return 0
 
-    # Compile each file concurrently
-    print(f"\nCompiling {len(to_compile)} logs concurrently...")
+    print(f"\nCompiling {len(to_compile)} logs oldest-first...")
+    results = asyncio.run(compile_logs(to_compile, state))
+    failed_count = results.count(False)
+    succeeded_count = results.count(True)
+    print(f"  Completed {succeeded_count}/{len(results)} daily logs.")
     
-    async def process_all():
-        tasks = [compile_daily_log(log, state) for log in to_compile]
-        return await asyncio.gather(*tasks)
-
-    costs = asyncio.run(process_all())
-    total_cost = sum(costs)
-    print("  Done.")
-    
-    # Save aggregated state safely to disk after concurrent batch finishes
-    save_state(state)
-
     articles = list_wiki_articles()
 
     # Incremental vector re-embed of anything the LLM just touched.
@@ -309,10 +363,29 @@ def main():
         print(f"  Vector embed skipped: {exc}", file=sys.stderr)
 
     regenerate_truth()
-    print(f"\nCompilation complete. Total cost: ${total_cost:.2f}")
+    print("\nCompilation pass complete. Total cost: $0.00")
     print(f"Knowledge base: {len(articles)} articles")
+    if failed_count:
+        print(
+            f"{failed_count} daily log(s) failed and remain eligible for retry.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Compile daily logs into knowledge articles")
+    parser.add_argument("--all", action="store_true", help="Force recompile all logs")
+    parser.add_argument("--file", type=str, help="Compile a specific daily log file")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be compiled")
+    args = parser.parse_args()
+
+    lock_path = ROOT_DIR / "scripts" / "compile.lock"
+    with FileLock(str(lock_path)):
+        return _main_unlocked(args)
 
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

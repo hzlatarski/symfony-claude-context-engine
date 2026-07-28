@@ -77,11 +77,15 @@ def _run_claude(
         raise EnhanceError(f"{error_prefix} timed out after {timeout}s") from exc
     except Exception as exc:
         raise EnhanceError(f"{error_prefix} call failed: {exc}") from exc
-    if result.returncode != 0 and not result.stdout.strip():
+    if result.returncode != 0:
+        detail = (result.stderr.strip() or result.stdout.strip())[:200]
         raise EnhanceError(
-            f"{error_prefix} exited {result.returncode}: {result.stderr[:200]}"
+            f"{error_prefix} exited {result.returncode}: {detail}"
         )
-    return result.stdout.strip()
+    output = result.stdout.strip()
+    if not output:
+        raise EnhanceError(f"{error_prefix} returned empty response")
+    return output
 
 
 def enhance_verbatim(

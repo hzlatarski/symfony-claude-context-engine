@@ -74,10 +74,10 @@ def test_enhance_verbatim_mode_skips_rewrite(mocked_steps):
 
     result = enhance_from_audio(audio=b"x", mode="verbatim", language="en")
 
-    assert result.enhanced_prompt == "VERBATIM OUT"
+    assert result.enhanced_prompt == "audit the S3 migration"
     assert result.mode == "verbatim"
     assert mocked_steps["rewrite"].called is False
-    assert mocked_steps["verbatim"].called is True
+    assert mocked_steps["verbatim"].called is False
 
 
 def test_enhance_clean_mode_skips_retrieval_and_expansion(mocked_steps):

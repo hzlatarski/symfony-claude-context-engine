@@ -1,72 +1,69 @@
-"""Unit tests for whisper.enhance.enhance_clean (Haiku cleanup mode)."""
+"""Tests for clean enhancement at the Claude CLI subprocess boundary."""
+
 from __future__ import annotations
 
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+import subprocess
 
 import pytest
 
 
-def _mock_response(text: str):
-    return SimpleNamespace(content=[SimpleNamespace(text=text, type="text")])
+def _fake_cli(monkeypatch, *, returncode=0, stdout="cleaned", stderr=""):
+    import whisper.enhance as enhance
+
+    calls: list[dict] = []
+
+    def run(command, **kwargs):
+        calls.append({"command": command, **kwargs})
+        return subprocess.CompletedProcess(
+            command, returncode, stdout=stdout, stderr=stderr,
+        )
+
+    monkeypatch.setattr(enhance.subprocess, "run", run)
+    return enhance, calls
 
 
-@pytest.fixture
-def mock_client(monkeypatch):
-    client = MagicMock()
-    import whisper.enhance as e
-    # Reset cached client via lru_cache clear
-    e._get_client.cache_clear()
-    monkeypatch.setattr(e, "_get_client", lambda: client)
-    return client
-
-
-def test_clean_returns_haiku_output_stripped(mock_client):
-    mock_client.messages.create.return_value = _mock_response(
-        "  Hello world, how are you?\n"
+def test_clean_returns_cli_output_stripped(monkeypatch):
+    enhance, _ = _fake_cli(
+        monkeypatch, stdout="  Hello world, how are you?\n",
     )
-    from whisper.enhance import enhance_clean
 
-    out = enhance_clean("uh hello world um how how are you")
-
-    assert out == "Hello world, how are you?"
+    assert enhance.enhance_clean("uh hello world um") == "Hello world, how are you?"
 
 
-def test_clean_uses_haiku_model_from_config(mock_client):
-    mock_client.messages.create.return_value = _mock_response("hello")
+def test_clean_passes_model_prompt_and_transcript(monkeypatch):
+    enhance, calls = _fake_cli(monkeypatch, stdout="hello")
     import config
-    from whisper.enhance import enhance_clean
+    from whisper.prompts import CLEAN_SYSTEM_PROMPT
 
-    enhance_clean("hello")
+    enhance.enhance_clean("raw voice transcript")
 
-    _args, kwargs = mock_client.messages.create.call_args
-    assert kwargs["model"] == config.MODEL_CLEAN
-
-
-def test_clean_passes_transcript_as_user_message(mock_client):
-    mock_client.messages.create.return_value = _mock_response("x")
-    from whisper.enhance import enhance_clean
-
-    enhance_clean("raw voice transcript")
-
-    _args, kwargs = mock_client.messages.create.call_args
-    assert kwargs["messages"] == [{"role": "user", "content": "raw voice transcript"}]
+    call = calls[0]
+    assert call["input"] == "raw voice transcript"
+    assert call["command"][call["command"].index("--model") + 1] == config.MODEL_CLEAN
+    assert (
+        call["command"][call["command"].index("--system-prompt") + 1]
+        == CLEAN_SYSTEM_PROMPT
+    )
 
 
-def test_clean_raises_on_empty_response(mock_client):
-    mock_client.messages.create.return_value = SimpleNamespace(content=[])
-    from whisper.enhance import enhance_clean, EnhanceError
+def test_clean_nonzero_exit_with_stdout_raises(monkeypatch):
+    enhance, _ = _fake_cli(
+        monkeypatch, returncode=1, stdout="Prompt is too long",
+    )
 
-    with pytest.raises(EnhanceError):
-        enhance_clean("hello")
+    with pytest.raises(enhance.EnhanceError, match="exited 1"):
+        enhance.enhance_clean("hello")
 
 
-def test_clean_uses_clean_system_prompt(mock_client):
-    mock_client.messages.create.return_value = _mock_response("ok")
-    from whisper.enhance import enhance_clean
-    import whisper.prompts as p
+def test_clean_empty_success_response_raises(monkeypatch):
+    enhance, _ = _fake_cli(monkeypatch, returncode=0, stdout="  ")
 
-    enhance_clean("hello")
+    with pytest.raises(enhance.EnhanceError, match="empty response"):
+        enhance.enhance_clean("hello")
 
-    _args, kwargs = mock_client.messages.create.call_args
-    assert kwargs["system"] == p.CLEAN_SYSTEM_PROMPT
+
+def test_empty_transcript_skips_cli(monkeypatch):
+    enhance, calls = _fake_cli(monkeypatch, stdout="unused")
+
+    assert enhance.enhance_clean("  ") == "  "
+    assert calls == []

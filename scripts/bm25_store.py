@@ -35,8 +35,6 @@ from typing import Any
 # loaded the module is cached in sys.modules, so we never pay it twice.
 from rank_bm25 import BM25Okapi
 
-from config import KNOWLEDGE_DIR, STATE_FILE
-
 _index: Any = None                             # BM25Okapi | None
 _docs: list[dict[str, Any]] = []               # parallel to the corpus
 _last_sentinel_mtime: float | None = None
@@ -65,8 +63,10 @@ def tokenize(text: str) -> list[str]:
 
 def _sentinel_mtime() -> float:
     """Return state.json's mtime or 0.0 if the file does not yet exist."""
+    import config
+
     try:
-        return STATE_FILE.stat().st_mtime
+        return config.STATE_FILE.stat().st_mtime
     except FileNotFoundError:
         return 0.0
 
@@ -83,18 +83,28 @@ def _iter_article_zones() -> list[dict[str, Any]]:
         extract_zones,
         parse_frontmatter,
     )
-    from utils import list_wiki_articles, load_contradictions
+    import config
+    from utils import load_contradictions
 
-    quarantined = load_contradictions()
+    knowledge_dir = config.KNOWLEDGE_DIR
+    articles: list[Path] = []
+    for subdir in ("concepts", "connections", "qa"):
+        root = knowledge_dir / subdir
+        if root.exists():
+            articles.extend(sorted(root.glob("*.md")))
+
+    quarantined = load_contradictions(
+        knowledge_dir / "contradictions.json"
+    )
     records: list[dict[str, Any]] = []
 
-    for article in list_wiki_articles():
+    for article in articles:
         try:
             content = article.read_text(encoding="utf-8")
         except OSError:
             continue
 
-        rel = str(article.relative_to(KNOWLEDGE_DIR)).replace("\\", "/")
+        rel = str(article.relative_to(knowledge_dir)).replace("\\", "/")
         slug = rel.removesuffix(".md")
         fm = parse_frontmatter(content)
         zones = extract_zones(content)

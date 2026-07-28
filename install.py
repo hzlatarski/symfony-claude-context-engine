@@ -259,11 +259,27 @@ def _project_slug(name: str) -> str:
 
 
 def _find_uv() -> str | None:
-    """Resolve absolute path to uv/uv.exe; fall back to bare 'uv' if on PATH."""
+    """Resolve uv from PATH or common user-install directories."""
     for candidate in ("uv", "uv.exe"):
         resolved = shutil.which(candidate)
         if resolved:
             return resolved
+    home = Path.home()
+    candidates = [
+        home / ".local" / "bin" / ("uv.exe" if platform.system() == "Windows" else "uv"),
+        home / "AppData" / "Roaming" / "Python" / "Scripts" / "uv.exe",
+    ]
+    python_root = home / "AppData" / "Roaming" / "Python"
+    if python_root.exists():
+        candidates.extend(
+            sorted(
+                python_root.glob("Python*/Scripts/uv.exe"),
+                reverse=True,
+            )
+        )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
     return None
 
 
@@ -276,7 +292,7 @@ def _to_bash_path(p: Path) -> str:
 
 
 def _uv_hook_prefix() -> str:
-    """Shell prefix that makes ``uv`` resolvable from inside a Claude Code hook.
+    """Return a hook prefix using the project environment's Python directly.
 
     Hooks execute in a bash shell whose PATH is NOT the one this installer
     inherited. On Windows, uv installed under ``%APPDATA%\\Python\\Scripts`` is
@@ -297,14 +313,15 @@ def _uv_hook_prefix() -> str:
     not. ``unset VIRTUAL_ENV`` rides along because an activated project
     virtualenv otherwise makes uv resolve the wrong environment.
     """
-    base = "cd .claude/memory-compiler && unset VIRTUAL_ENV &&"
-    uv_exe = _find_uv()
-    if not uv_exe:
-        # Nothing to bake in. The hook still needs *some* command; a bare uv at
-        # least works for users who do have it on PATH, and step 1 warns.
-        return f"{base} uv run python"
-    uv_dir = _to_bash_path(Path(uv_exe).resolve().parent)
-    return f'{base} PATH="$PATH:{uv_dir}" uv run python'
+    python_rel = (
+        ".venv/Scripts/python.exe"
+        if platform.system() == "Windows"
+        else ".venv/bin/python"
+    )
+    return (
+        "cd .claude/memory-compiler && unset VIRTUAL_ENV && "
+        f'"{python_rel}"'
+    )
 
 
 def _hook_commands(entry: object) -> list[str]:
@@ -658,7 +675,14 @@ def setup_memory_symlink() -> None:
 # ── Step 5: ingest + reindex ──────────────────────────────────────────────────
 def run_ingest_and_reindex() -> None:
     _h1("Running initial ingest + ChromaDB vector reindex (articles, daily, codebase)")
-    uv_prefix = ["uv", "run", "--directory", str(HERE)]
+    uv_exe = _find_uv()
+    if not uv_exe:
+        _fail(
+            "uv was not found on PATH or in a known user install directory; "
+            "cannot build the project environment."
+        )
+        sys.exit(1)
+    uv_prefix = [uv_exe, "run", "--directory", str(HERE)]
 
     print("  ingest.py …")
     r = subprocess.run([*uv_prefix, "python", "scripts/ingest.py"], cwd=HERE)

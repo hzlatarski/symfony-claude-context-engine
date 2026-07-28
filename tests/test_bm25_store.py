@@ -63,10 +63,8 @@ def _write_article(
 def kb(tmp_path, monkeypatch):
     """Redirect the knowledge tree, state file, and quarantine to tmp_path.
 
-    Monkeypatches the already-imported names in both ``config`` and
-    ``utils`` (which copies the path constants at import time) so both
-    ``list_wiki_articles`` and ``bm25_store`` see the tmp tree instead
-    of the real one.
+    Monkeypatches ``config`` and legacy path copies in ``utils`` so every
+    reader sees the temporary tree instead of the real one.
     """
     import bm25_store
     import config
@@ -88,9 +86,6 @@ def kb(tmp_path, monkeypatch):
     monkeypatch.setattr(
         utils, "CONTRADICTIONS_FILE", knowledge_dir / "contradictions.json"
     )
-    monkeypatch.setattr(bm25_store, "KNOWLEDGE_DIR", knowledge_dir)
-    monkeypatch.setattr(bm25_store, "STATE_FILE", state_file)
-
     bm25_store.invalidate()
     yield concepts_dir
     bm25_store.invalidate()

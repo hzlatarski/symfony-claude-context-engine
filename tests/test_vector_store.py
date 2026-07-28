@@ -121,6 +121,80 @@ class TestVectorStoreBasics:
         stats = store.stats()
         assert stats["articles"] == 1
 
+    def test_failed_article_replacement_retains_last_complete_generation(
+        self, store, monkeypatch
+    ):
+        store.upsert_article(
+            slug="concepts/durable",
+            title="Durable",
+            zone="observed",
+            text="last complete generation",
+            metadata={
+                "type": "fact",
+                "confidence": 0.9,
+                "quarantined": False,
+                "updated": "2026-07-28",
+            },
+        )
+        collection = store._articles_collection()
+
+        class FailingCollection:
+            def get(self, *args, **kwargs):
+                return collection.get(*args, **kwargs)
+
+            def upsert(self, *args, **kwargs):
+                raise RuntimeError("embedding failed")
+
+            def delete(self, *args, **kwargs):
+                return collection.delete(*args, **kwargs)
+
+        monkeypatch.setattr(store, "_articles_collection", FailingCollection)
+        with pytest.raises(RuntimeError, match="embedding failed"):
+            store.replace_article(
+                "concepts/durable",
+                "Durable",
+                {"observed": "incomplete replacement"},
+                {
+                    "type": "fact",
+                    "confidence": 0.9,
+                    "quarantined": False,
+                    "updated": "2026-07-28",
+                },
+            )
+
+        result = collection.get(
+            where={"slug": {"$eq": "concepts/durable"}},
+            include=["documents"],
+        )
+        assert result["documents"] == ["last complete generation"]
+
+    def test_article_replacement_removes_a_zone_that_no_longer_exists(self, store):
+        metadata = {
+            "type": "fact",
+            "confidence": 0.9,
+            "quarantined": False,
+            "updated": "2026-07-28",
+        }
+        store.replace_article(
+            "concepts/shrinking",
+            "Shrinking",
+            {"observed": "observed facts", "synthesized": "old inference"},
+            metadata,
+        )
+        store.replace_article(
+            "concepts/shrinking",
+            "Shrinking",
+            {"observed": "new observed facts"},
+            metadata,
+        )
+
+        result = store._articles_collection().get(
+            where={"slug": {"$eq": "concepts/shrinking"}},
+            include=["documents", "metadatas"],
+        )
+        assert result["documents"] == ["new observed facts"]
+        assert [item["zone"] for item in result["metadatas"]] == ["observed"]
+
     def test_stats_reports_collection_sizes(self, store):
         store.upsert_article(
             slug="concepts/a", title="A", zone="observed",
@@ -178,6 +252,38 @@ class TestVectorStoreBasics:
         assert "daily/2026-04-11.md#section-b" in ids
         assert "daily/2026-04-10.md#section-a" not in ids
 
+    def test_daily_embedding_uses_loss_safe_source_replacement(
+        self, tmp_path, monkeypatch,
+    ):
+        import utils
+        import vector_store
+
+        knowledge = tmp_path / "knowledge"
+        daily = knowledge / "daily" / "2026-07-28.md"
+        daily.parent.mkdir(parents=True)
+        daily.write_text(
+            "# Daily Log\n\n## Sessions\n\n### Session\n\nKeep this.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(utils, "KNOWLEDGE_DIR", knowledge)
+        replacements = []
+        monkeypatch.setattr(
+            vector_store,
+            "replace_chunks_for_source",
+            lambda source, chunks: replacements.append((source, chunks)),
+        )
+        monkeypatch.setattr(
+            vector_store,
+            "delete_chunks_for_daily",
+            lambda *_args: pytest.fail("daily embedding deleted the live generation first"),
+        )
+
+        count = utils.embed_daily_file(daily)
+
+        assert count > 0
+        assert replacements[0][0] == "daily/2026-07-28.md"
+        assert len(replacements[0][1]) == count
+
     def test_search_daily_date_range(self, store):
         for date_str, section in [("2026-04-01", "old"), ("2026-04-10", "mid"), ("2026-04-15", "new")]:
             store.upsert_chunk(
@@ -205,6 +311,139 @@ class TestVectorStoreBasics:
         results = store.search_daily("chunk with tags", limit=5)
         assert len(results) >= 1
         assert results[0]["metadata"].get("tags") == "foo,bar"
+
+    def test_upsert_chunks_indexes_a_batch(self, store):
+        store.upsert_chunks([
+            {
+                "chunk_id": "daily/transcripts/s1.jsonl#1",
+                "source_file": "daily/transcripts/s1.jsonl",
+                "text": "first unique transcript payload",
+                "metadata": {"section": "record 1", "date": "2026-07-28"},
+            },
+            {
+                "chunk_id": "daily/transcripts/s1.jsonl#2",
+                "source_file": "daily/transcripts/s1.jsonl",
+                "text": "second unique transcript payload",
+                "metadata": {"section": "record 2", "date": "2026-07-28"},
+            },
+        ])
+
+        assert store.stats()["daily_chunks"] == 2
+        results = store.search_daily("second unique transcript payload", limit=2)
+        assert {result["id"] for result in results} == {
+            "daily/transcripts/s1.jsonl#1",
+            "daily/transcripts/s1.jsonl#2",
+        }
+
+    def test_search_daily_exact_finds_literal_url(self, store):
+        url = "https://claude.ai/code/artifact/exact-identifier"
+        store.upsert_chunk(
+            chunk_id="daily/transcripts/s1.jsonl#url",
+            source_file="daily/transcripts/s1.jsonl",
+            text=f'{{"text": "Open {url} for the design."}}',
+            metadata={"section": "assistant record", "date": "2026-07-28"},
+        )
+
+        results = store.search_daily_exact(url, limit=5)
+
+        assert [result["id"] for result in results] == [
+            "daily/transcripts/s1.jsonl#url"
+        ]
+        assert url in results[0]["text"]
+
+    def test_get_daily_chunk_returns_full_long_reference(self, store):
+        url = "https://example.test/artifact/" + ("a" * 700)
+        chunk_id = "daily/transcripts/s1.jsonl#long-url"
+        store.upsert_chunk(
+            chunk_id=chunk_id,
+            source_file="daily/transcripts/s1.jsonl",
+            text=f'{{"text": "Open {url} for the design."}}',
+            metadata={"section": "assistant record", "date": "2026-07-28"},
+        )
+
+        result = store.get_daily_chunk(chunk_id)
+
+        assert url in result["text"]
+        assert result["metadata"]["source_file"] == "daily/transcripts/s1.jsonl"
+
+    def test_replace_chunks_for_source_removes_stale_chunks(self, store):
+        source = "daily/transcripts/s1.jsonl"
+        store.upsert_chunk(
+            chunk_id="stale",
+            source_file=source,
+            text="obsolete payload",
+            metadata={"section": "old", "date": "2026-07-28"},
+        )
+
+        store.replace_chunks_for_source(source, [{
+            "chunk_id": "current",
+            "source_file": source,
+            "text": "current payload",
+            "metadata": {"section": "new", "date": "2026-07-28"},
+        }])
+
+        assert store.search_daily_exact("obsolete payload") == []
+        current = store.search_daily_exact("current payload")
+        assert len(current) == 1
+        assert current[0]["text"] == "current payload"
+
+    def test_failed_source_replacement_keeps_previous_chunks_searchable(
+        self,
+        store,
+        monkeypatch,
+    ):
+        source = "daily/transcripts/s1.jsonl"
+        store.upsert_chunk(
+            chunk_id="existing",
+            source_file=source,
+            text="irreplaceable previous payload",
+            metadata={"section": "old", "date": "2026-07-28"},
+        )
+        monkeypatch.setattr(
+            store,
+            "_upsert_prepared_chunks",
+            lambda prepared: (_ for _ in ()).throw(RuntimeError("embedding failed")),
+        )
+
+        with pytest.raises(RuntimeError, match="embedding failed"):
+            store.replace_chunks_for_source(source, [{
+                "chunk_id": "replacement",
+                "source_file": source,
+                "text": "new payload",
+                "metadata": {"section": "new", "date": "2026-07-28"},
+            }])
+
+        assert store.search_daily_exact("irreplaceable previous payload")
+        assert store.search_daily_exact("new payload") == []
+
+    def test_failed_replacement_promotion_keeps_complete_new_chunks_searchable(
+        self,
+        store,
+        monkeypatch,
+    ):
+        source = "daily/transcripts/s1.jsonl"
+        store.upsert_chunk(
+            chunk_id="existing",
+            source_file=source,
+            text="previous payload",
+            metadata={"section": "old", "date": "2026-07-28"},
+        )
+        monkeypatch.setattr(
+            store,
+            "_update_prepared_metadata",
+            lambda prepared: (_ for _ in ()).throw(RuntimeError("promotion failed")),
+            raising=False,
+        )
+
+        with pytest.raises(RuntimeError, match="promotion failed"):
+            store.replace_chunks_for_source(source, [{
+                "chunk_id": "replacement",
+                "source_file": source,
+                "text": "complete staged replacement",
+                "metadata": {"section": "new", "date": "2026-07-28"},
+            }])
+
+        assert store.search_daily_exact("complete staged replacement")
 
     def test_upsert_article_rejects_invalid_zone(self, store):
         with pytest.raises(ValueError, match="zone"):

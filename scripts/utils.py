@@ -2,10 +2,15 @@
 
 import hashlib
 import json
+import os
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import Callable
+
+from filelock import FileLock
 
 from config import (
     CONCEPTS_DIR,
@@ -22,10 +27,7 @@ from config import (
 
 # ── State management ──────────────────────────────────────────────────
 
-def load_state() -> dict:
-    """Load persistent state from state.json."""
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+def _default_state() -> dict:
     return {
         "ingested_daily": {},
         "ingested_sources": {},
@@ -36,9 +38,65 @@ def load_state() -> dict:
     }
 
 
-def save_state(state: dict) -> None:
-    """Save state to state.json."""
-    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+def load_state(state_file: Path | None = None) -> dict:
+    """Load persistent state from state.json."""
+    path = state_file or STATE_FILE
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return _default_state()
+
+
+def _merge_state(current: dict, incoming: dict) -> dict:
+    """Recursively merge a stale snapshot without discarding current mappings."""
+    merged = dict(current)
+    for key, value in incoming.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_state(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _atomic_write_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(state, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def update_state(
+    mutator: Callable[[dict], object],
+    state_file: Path | None = None,
+) -> dict:
+    """Atomically mutate current state under a cross-process lock."""
+    path = state_file or STATE_FILE
+    lock = FileLock(str(path.with_suffix(f"{path.suffix}.lock")))
+    with lock:
+        state = load_state(path)
+        mutator(state)
+        _atomic_write_state(path, state)
+        return state
+
+
+def save_state(state: dict, state_file: Path | None = None) -> None:
+    """Merge and atomically save a possibly stale state snapshot."""
+    path = state_file or STATE_FILE
+
+    def merge(current: dict) -> None:
+        merged = _merge_state(current, state)
+        current.clear()
+        current.update(merged)
+
+    update_state(merge, path)
 
 
 # ── Contradiction quarantine ──────────────────────────────────────────
@@ -144,6 +202,40 @@ def slugify_chunk_id(source_rel: str, section_title: str) -> str:
     """
     slug = re.sub(r"[^a-z0-9]+", "-", section_title.lower()).strip("-") or "section"
     return f"{source_rel}#{slug}"
+
+
+ARTICLE_ROOTS = frozenset({"concepts", "connections", "qa"})
+
+
+def resolve_article_path(
+    slug: str,
+    knowledge_dir: Path | None = None,
+    *,
+    must_exist: bool = False,
+) -> Path:
+    """Resolve a canonical article slug without allowing path traversal."""
+    root = (knowledge_dir or KNOWLEDGE_DIR).resolve()
+    if not isinstance(slug, str) or not slug or "\\" in slug or "\x00" in slug:
+        raise ValueError(f"Invalid article slug: {slug!r}")
+
+    normalized = slug.removesuffix(".md")
+    pure = PurePosixPath(normalized)
+    parts = pure.parts
+    if (
+        pure.is_absolute()
+        or len(parts) < 2
+        or parts[0] not in ARTICLE_ROOTS
+        or any(part in {"", ".", ".."} for part in parts)
+        or normalized != normalized.strip()
+    ):
+        raise ValueError(f"Invalid article slug: {slug!r}")
+
+    candidate = (root / f"{normalized}.md").resolve()
+    if not candidate.is_relative_to(root):
+        raise ValueError(f"Invalid article slug: {slug!r}")
+    if must_exist and not candidate.is_file():
+        raise FileNotFoundError(f"No article at slug {normalized!r}")
+    return candidate
 
 
 # ── Source config ─────────────────────────────────────────────────────
@@ -396,6 +488,19 @@ def list_raw_files() -> list[Path]:
     return sorted(DAILY_DIR.glob("*.md"))
 
 
+def list_transcript_files() -> list[Path]:
+    """List byte-for-byte raw session transcripts retained for retrieval."""
+    transcript_dir = DAILY_DIR / "transcripts"
+    if not transcript_dir.exists():
+        return []
+    return sorted(transcript_dir.glob("*.jsonl"))
+
+
+def daily_file_lock_path(daily_path: Path) -> Path:
+    """Return the shared lock for one daily file's append/index transaction."""
+    return daily_path.parent / f".{daily_path.name}.write.lock"
+
+
 # ── Vector-store embedding helpers ────────────────────────────────────
 
 def embed_article_file(
@@ -429,7 +534,7 @@ def embed_article_file(
         extract_zones,
         parse_frontmatter,
     )
-    from vector_store import delete_article, upsert_article
+    from vector_store import replace_article
 
     if quarantined is None:
         quarantined = load_contradictions()
@@ -460,19 +565,12 @@ def embed_article_file(
     }
     title = fm.get("title") or slug.split("/")[-1]
 
-    # Wipe both zones before upsert so stale zones from an older version
-    # of the article don't linger after it shrinks.
-    delete_article(slug)
-
-    embedded_any = False
-    if zones.observed:
-        upsert_article(slug, title, "observed", zones.observed, metadata)
-        embedded_any = True
-    if zones.synthesized:
-        upsert_article(slug, title, "synthesized", zones.synthesized, metadata)
-        embedded_any = True
-
-    return embedded_any
+    zone_documents = {
+        "observed": zones.observed,
+        "synthesized": zones.synthesized,
+    }
+    replace_article(slug, title, zone_documents, metadata)
+    return any(text.strip() for text in zone_documents.values())
 
 
 def embed_daily_file(daily_path: Path) -> int:
@@ -491,23 +589,22 @@ def embed_daily_file(daily_path: Path) -> int:
         return 0
 
     from chunk_daily import chunk_daily_log
-    from vector_store import delete_chunks_for_daily, upsert_chunk
+    from vector_store import replace_chunks_for_source
 
     rel = str(daily_path.relative_to(KNOWLEDGE_DIR)).replace("\\", "/")
     date_str = daily_path.stem  # YYYY-MM-DD
 
-    delete_chunks_for_daily(rel)
     content = daily_path.read_text(encoding="utf-8")
-    count = 0
+    chunks: list[dict] = []
     for chunk in chunk_daily_log(content, source_rel=rel):
-        upsert_chunk(
-            chunk_id=chunk.id,
-            source_file=rel,
-            text=chunk.text,
-            metadata={"section": chunk.section, "date": date_str},
-        )
-        count += 1
-    return count
+        chunks.append({
+            "chunk_id": chunk.id,
+            "source_file": rel,
+            "text": chunk.text,
+            "metadata": {"section": chunk.section, "date": date_str},
+        })
+    replace_chunks_for_source(rel, chunks)
+    return len(chunks)
 
 
 # ── Index helpers ─────────────────────────────────────────────────────

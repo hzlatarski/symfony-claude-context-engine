@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -58,10 +59,11 @@ import logging  # noqa: E402
 
 import config  # noqa: E402
 from compile_truth import strip_frontmatter  # noqa: E402
-from utils import load_contradictions  # noqa: E402
+from utils import load_contradictions, resolve_article_path  # noqa: E402
 
 
 logger = logging.getLogger(__name__)
+_DAILY_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 # Request model for the /api/whisper/re-enhance endpoint.
@@ -113,7 +115,7 @@ TEMPLATES_DIR = _HERE / "viewer_templates"
 # Markdown renderer used for article bodies and daily logs. ``commonmark``
 # is enough — no tables, no footnotes, no strikethrough — which keeps the
 # rendered output close to what Obsidian shows.
-_md = MarkdownIt("commonmark")
+_md = MarkdownIt("commonmark", {"html": False})
 
 # Wikilinks ``[[foo]]`` aren't CommonMark; pre-process them into ordinary
 # markdown links pointing at our own routes before handing to the renderer.
@@ -268,6 +270,8 @@ def load_tool_drawer(daily_dir: Path, date: str) -> list[dict[str, Any]]:
     malformed lines are skipped. Returns events in the order they were
     written (chronological within a session).
     """
+    if not _DAILY_DATE_RE.fullmatch(date):
+        return []
     path = daily_dir / f"{date}.tools.jsonl"
     if not path.exists():
         return []
@@ -328,6 +332,16 @@ def load_ingest_state() -> dict[str, Any]:
         return {}
 
 
+def _ingest_file_count(state: dict[str, Any]) -> int:
+    """Count current daily and configured-source ingestion records."""
+    daily = state.get("ingested_daily")
+    sources = state.get("ingested_sources")
+    if isinstance(daily, dict) or isinstance(sources, dict):
+        return len(daily or {}) + len(sources or {})
+    legacy = state.get("ingested")
+    return len(legacy) if isinstance(legacy, dict) else 0
+
+
 def _today_iso() -> str:
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
 
@@ -385,6 +399,24 @@ def create_app(knowledge_dir: Path | None = None) -> FastAPI:
     app = FastAPI(title="memory-compiler viewer", docs_url=None, redoc_url=None, lifespan=_lifespan)
     kb = knowledge_dir or config.KNOWLEDGE_DIR
 
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        nonce = secrets.token_urlsafe(18)
+        request.state.csp_nonce = nonce
+        response = await call_next(request)
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; "
+            f"script-src 'nonce-{nonce}'; "
+            "style-src 'unsafe-inline'; "
+            "img-src 'self' data:; "
+            "connect-src 'self'; "
+            "media-src 'self' blob:; "
+            "form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     # Memory-type palette — matches the type-tinted card borders borrowed
     # from claude-mem's viewer-template.html. Exposed to all templates via
@@ -440,7 +472,7 @@ def create_app(knowledge_dir: Path | None = None) -> FastAPI:
                 "chroma_articles": chroma.get("articles", 0),
                 "chroma_daily_chunks": chroma.get("daily_chunks", 0),
                 "chroma_codebase_chunks": chroma.get("codebase_chunks", 0),
-                "ingest_files_count": len(ingest_state.get("ingested", {})),
+                "ingest_files_count": _ingest_file_count(ingest_state),
                 "contradictions": contradictions[:10],
                 "total_contradictions": len(contradictions),
             },
@@ -483,11 +515,13 @@ def create_app(knowledge_dir: Path | None = None) -> FastAPI:
 
     @app.get("/articles/{slug:path}", response_class=HTMLResponse)
     def article_detail(request: Request, slug: str) -> HTMLResponse:
-        if slug.endswith(".md"):
-            return RedirectResponse(url=f"/articles/{slug[:-3]}", status_code=302)
-        path = kb / f"{slug}.md"
-        if not path.exists():
+        normalized = slug.removesuffix(".md")
+        try:
+            path = resolve_article_path(normalized, kb, must_exist=True)
+        except (ValueError, FileNotFoundError):
             raise HTTPException(status_code=404, detail=f"Article {slug!r} not found")
+        if slug.endswith(".md"):
+            return RedirectResponse(url=f"/articles/{normalized}", status_code=302)
         content = path.read_text(encoding="utf-8", errors="replace")
         frontmatter = parse_frontmatter(content) or {}
         rendered_html = _render_markdown(content)
@@ -512,6 +546,8 @@ def create_app(knowledge_dir: Path | None = None) -> FastAPI:
 
     @app.get("/daily/{date}", response_class=HTMLResponse)
     def daily_detail(request: Request, date: str) -> HTMLResponse:
+        if not _DAILY_DATE_RE.fullmatch(date):
+            raise HTTPException(status_code=404, detail="Daily log not found")
         path = config.DAILY_DIR / f"{date}.md"
         if not path.exists():
             raise HTTPException(status_code=404, detail=f"Daily log {date} not found")
@@ -572,8 +608,11 @@ def create_app(knowledge_dir: Path | None = None) -> FastAPI:
         slugs = sorted(load_contradictions())
         rows = []
         for slug in slugs:
-            path = kb / f"{slug}.md"
-            if path.exists():
+            try:
+                path = resolve_article_path(slug, kb, must_exist=True)
+            except (ValueError, FileNotFoundError):
+                path = None
+            if path is not None:
                 summary = _summarize_article(path, kb)
                 rows.append({"slug": slug, "article": summary, "exists": True})
             else:
@@ -670,7 +709,7 @@ def create_app(knowledge_dir: Path | None = None) -> FastAPI:
                 "chroma": chroma,
                 "flush_costs": flush_costs,
                 "today_flush_cost": _today_flush_total(flush_state),
-                "ingest_files_count": len(ingest_state.get("ingested", {})),
+                "ingest_files_count": _ingest_file_count(ingest_state),
                 "total_flushes_tracked": len(flush_state.get("flush_costs", [])),
             },
         )

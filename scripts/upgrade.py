@@ -145,7 +145,7 @@ def _run_migrations(old: str, new: str) -> None:
         else:
             rc, _, _ = _run([sys.executable, str(script)], cwd=_ROOT, check=False)
         if rc != 0:
-            print(f"    Warning: migration {script.name} exited {rc} (non-fatal)")
+            raise RuntimeError(f"migration {script.name} exited {rc}")
 
 
 def main() -> int:
@@ -204,11 +204,17 @@ def main() -> int:
         )
         if proc.returncode != 0:
             sys.stderr.write(
-                "uv sync exited non-zero — dependencies may be stale. "
-                "Run `uv sync` manually inside .claude/memory-compiler/ to recover.\n"
+                "uv sync exited non-zero — upgrade is incomplete. "
+                "Run `uv sync` manually inside .claude/memory-compiler/ "
+                "before retrying.\n"
             )
+            return 3
 
-    _run_migrations(old_version, new_version)
+    try:
+        _run_migrations(old_version, new_version)
+    except (RuntimeError, SystemExit) as exc:
+        sys.stderr.write(f"Migration failed — upgrade is incomplete: {exc}\n")
+        return 4
 
     # State markers — JUST_UPGRADED on next probe + clear cache & snooze.
     state = _state_dir()

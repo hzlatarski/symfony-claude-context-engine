@@ -37,22 +37,28 @@ BARE = "cd .claude/memory-compiler && uv run python hooks/session-end.py"
 
 # ── command construction ─────────────────────────────────────────────────────
 
-def test_generated_hooks_bake_uv_path_when_uv_is_found(inst, monkeypatch) -> None:
-    # Pin _find_uv so this asserts the real contract rather than passing merely
-    # because the machine running the tests happens to have uv on PATH.
+def test_generated_hooks_do_not_depend_on_uv_path(inst, monkeypatch) -> None:
     monkeypatch.setattr(inst, "_find_uv", lambda: "C:\\tools\\uv\\uv.exe")
     for entries in inst._build_hooks().values():
         command = entries[0]["hooks"][0]["command"]
-        assert "/c/tools/uv" in command
+        assert ".venv/Scripts/python.exe" in command
+        assert "uv run" not in command
         assert not inst._is_broken_uv_command(command), command
 
 
-def test_prefix_degrades_to_bare_uv_when_uv_is_absent(inst, monkeypatch) -> None:
-    """Documented fallback: nothing better exists, and the installer warns."""
+def test_generated_hooks_execute_project_virtualenv_python(inst) -> None:
+    for entries in inst._build_hooks().values():
+        command = entries[0]["hooks"][0]["command"]
+        assert "uv run" not in command
+        assert ".venv/" in command
+        assert "python" in command.lower()
+
+
+def test_prefix_never_degrades_to_bare_uv_when_uv_is_absent(inst, monkeypatch) -> None:
     monkeypatch.setattr(inst, "_find_uv", lambda: None)
     prefix = inst._uv_hook_prefix()
-    assert prefix.endswith("uv run python")
-    assert 'PATH="$PATH:' not in prefix
+    assert "uv run" not in prefix
+    assert ".venv/Scripts/python.exe" in prefix
 
 
 def test_prefix_unsets_virtualenv(inst) -> None:

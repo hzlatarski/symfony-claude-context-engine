@@ -9,7 +9,7 @@ yield "database is locked" SQLite errors that surface as opaque MCP
 failures.
 
 Each Chroma collection gets its own lock file under
-``knowledge/chroma/.locks/<collection>.lock``. Locks are advisory:
+``knowledge/chroma/active/.locks/<collection>.lock``. Locks are advisory:
 read-only operations (queries, counts) are NOT locked, since Chroma
 handles concurrent reads safely. Only the upsert/delete paths take the
 lock, and only for the duration of the single Chroma call — held just
