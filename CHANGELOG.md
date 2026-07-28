@@ -4,6 +4,35 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [0.6.0] — 2026-07-28
+
+Sessions can now be recovered and searched without relying on a fixed-size summary window. The original transcript remains authoritative, while summaries continue to provide a readable daily history.
+
+### Added
+
+- **Zero-loss transcript archive and search.** `PreCompact` and `SessionEnd` archive the original Claude JSONL byte-for-byte and independently index message text, tool inputs, tool results, URLs, identifiers, and exact references.
+- **Historical transcript backfill.** `scripts/backfill_transcripts.py` discovers and indexes previous Claude sessions, with support for selecting individual session IDs.
+- **Durable flush retries.** Detached flush work is recorded before launch, survives process and power failures, and is retried without advancing the transcript cursor until every required stage succeeds.
+
+### Changed
+
+- **Transcript extraction no longer defaults to 30 turns.** Fresh turns are consumed oldest-first without a fixed limit; explicitly bounded windows advance only through complete included turns.
+- **Chroma storage uses a guarded active layout.** Legacy stores migrate under a lock with crash-resume markers, while ambiguous mixed layouts fail instead of silently selecting incomplete data.
+- **Raw retrieval exposes complete evidence.** Search results can be expanded through `get_raw_daily_chunk` to retrieve the full unclipped indexed record.
+
+### Fixed
+
+- Prevented cursor advancement when transcript archiving, raw indexing, summary persistence, or durable cursor storage fails.
+- Replaced delete-before-write vector updates with staged source replacement for code, articles, daily logs, and transcripts, preserving the last searchable generation on failure.
+- Serialized compiler, state, daily-log, and per-session writers so concurrent hooks and reindex processes cannot clobber each other.
+- Made ingestion, compilation, Whisper, upgrade, and child-process commands report non-zero exits honestly instead of recording failed work as successful.
+- Reconciled deleted and emptied sources so stale code, article, daily, and transcript chunks no longer remain searchable.
+- Blocked viewer and MCP path traversal, disabled executable raw Markdown HTML, and added a restrictive nonce-based Content Security Policy.
+
+### Tests
+
+- Added regression coverage for transcript completeness, archive integrity, cursor concurrency, durable retries, staged replacement, migration recovery, stale-source reconciliation, subprocess failures, traversal, and stored XSS. The complete suite passes 850 tests.
+
 ## [0.5.0] — 2026-07-12
 
 Fixes for defects found while comparing this engine against [TencentDB Agent Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory), plus the duplicate-detection mechanism it had and this one lacked. Its layered-memory half is largely what this engine already does; its context-offload half needs host hooks that rewrite the live message array, which Claude Code does not expose. What transferred is the *principle* that a lossy summary must ship a handle back to the full text — applied here to compiled-truth excerpts.
