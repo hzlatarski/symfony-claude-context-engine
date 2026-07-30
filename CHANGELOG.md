@@ -4,6 +4,27 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [0.6.1] — 2026-07-30
+
+Hardening from a post-release verification pass over 0.6.0. That release's own suite reproduced cleanly (850 passed) and its core zero-loss mechanism verified correct — both extraction limits are `None`, the cursor advances only through included turns, and raw-index failure still blocks it. But nine claims in its two design documents were not fully satisfied by the code. Each is now fixed with a regression test; the suite is 879 passed.
+
+The fixes were themselves put through two adversarial review rounds, which caught a self-inflicted data-loss risk in the first retry-ceiling design and a false-accept in the first compile gate. Both were corrected before release; `MEMORY-COMPILER-REVIEW-AND-REMEDIATION-PLAN.md` records the reasoning inline (PR01–PR09).
+
+### Fixed
+
+- **The authoritative transcript archive is now fsynced before publication.** 0.6.0 fsynced the daily log and the cursor but published the archive with a plain write plus rename — so a power loss could leave a cursor that had consumed turns the archive no longer contained. The one file the design treats as authoritative was the only one without the guarantee.
+- **A corrupt pending-flush marker no longer halts every future capture.** The loader raised on any unusable record and both hooks spawn nothing when it does, so a single bad file stopped all raw indexing and summarization for every session indefinitely. Unusable records are quarantined as `.corrupt` and the queue keeps draining.
+- **Flush retries are bounded.** `MAX_FLUSH_ATTEMPTS` retires a hopeless job as `.exhausted` instead of letting every capture hook relaunch it forever, and jobs carry an explicit `created_at` so the documented oldest-first order is real rather than a sort over random UUIDs. Attempts are counted by the worker that actually ran and failed — on a non-zero exit or an unhandled exception — never when the hook hands the job out. A job whose process was never created keeps its full budget, so a hook crash or a failed spawn cannot silently exhaust and discard work that never ran once.
+- **Duplicate flush workers are suppressed by a soft lease.** `SessionEnd` and `PreCompact` firing back to back for one session could each launch a worker for the same job. A handed-out job now records `spawned_at` and is skipped while the lease is live. The marker is never renamed or hidden, so an expired lease always re-offers the job and a confirmed failure releases it immediately — a worker that never started costs a delayed retry, never a lost one.
+- **A transient I/O error no longer looks like corruption.** An unreadable pending marker is left in place for the next run, and a failed quarantine rename never falls back to deleting it. The marker is the only record of the session, cursor, and archive path, so destroying it on a sharing violation would lose the job outright.
+- **Set-aside daily logs are no longer reported as "up to date".** Once every remaining source hit the retry ceiling, the compiler printed a success message and exited 0 for logs it had never compiled. They are now named on stderr and the command exits non-zero while any exist — without re-attempting them, so the repeated LLM cost stays gone.
+- **The Chroma active-store migration marker is fsynced.** Without it a crash could make the artifact moves durable while the marker was still cached, leaving a mixed layout that the next run refuses as ambiguous — permanently wedging the store the crash-resume logic existed to recover.
+- **A legitimate no-op compile no longer retries forever.** The mutation gate accepted only a source-anchored article change, so a daily log already covered by existing articles never recorded its hash: it recompiled every run at LLM cost while the command stayed permanently red. A credited `knowledge/log.md` entry now also counts, and `MAX_COMPILE_ATTEMPTS` bounds retries the way `ingest.py` already did.
+- **A failed daily embed leaves a repair record.** The per-date lock provides mutual exclusion, not atomicity, so the Markdown can land while indexing fails. That stays non-fatal by design, but it now records `stale_daily_index` for `reindex.py --daily` instead of only writing a log line.
+- **Two distinct session IDs can no longer share one archive.** Unsafe IDs were collapsed character-by-character, so a second session mapping to the same name was rejected as divergent and could never be archived. Safe IDs (Claude's UUIDs) still pass through verbatim, so no existing archive is renamed.
+- **Bounded transcript extraction honors its ceiling for the first turn.** A limit smaller than the first turn returned that whole turn and advanced the cursor past it. Unreachable in production — no caller passes a limit — but it contradicted the documented contract.
+- **The session-start update check no longer depends on bare `uv`.** F11 removed that dependency from the capture path but not from here, where the failure is swallowed, so update checks simply stopped happening in restricted shells.
+
 ## [0.6.0] — 2026-07-28
 
 Sessions can now be recovered and searched without relying on a fixed-size summary window. The original transcript remains authoritative, while summaries continue to provide a readable daily history.
