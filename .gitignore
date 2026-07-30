@@ -8,12 +8,23 @@ __pycache__/
 
 # Runtime state
 scripts/state.json
+scripts/state.json.*
 scripts/last-flush.json
+scripts/flush-cursors.json
 scripts/flush.log
 scripts/flush.log.*
 scripts/compile.log
 scripts/session-flush-*
 scripts/flush-context-*
+
+# Cross-process lock files and the durable pending-flush queue. These carry
+# session IDs, cursors, and local paths — never commit them. Scoped to
+# scripts/ so the tracked root uv.lock is unaffected.
+scripts/*.lock
+scripts/.pending-queue.lock
+scripts/*.pending.json
+scripts/*.pending.json.corrupt
+scripts/*.pending.json.exhausted
 
 # Reports
 reports/

@@ -42,9 +42,14 @@ retrievable without relying on summarization.
 The transcript archive and raw-index implementation enforces these rules:
 
 - The original Claude transcript is archived byte-for-byte before a flush can
-  advance its cursor.
+  advance its cursor, and the archive is fsynced before the rename publishes
+  it — so a cursor can never acknowledge turns that only reached the page
+  cache.
 - A stale, shorter snapshot cannot truncate an existing longer archive.
 - A divergent snapshot is rejected instead of silently overwriting history.
+- Two distinct session IDs can never share one archive path. Safe IDs (Claude's
+  own UUIDs) are used verbatim; anything else carries a digest, so an unsafe ID
+  cannot collide with another session and be rejected as divergent.
 - Every non-empty JSONL record is indexed, including tool inputs, tool results,
   and records without user/assistant text.
 - Default summary extraction has no turn or character limit.
@@ -56,6 +61,21 @@ The transcript archive and raw-index implementation enforces these rules:
   its complete context, cursor, and archive arguments. A missing materialized
   context file is reconstructed from that self-contained record. Failed jobs
   return non-zero, remain queued, and are retried by the next capture hook.
+- Retries are bounded, and only real failures count. An attempt is recorded by
+  the worker that ran and failed — on a non-zero exit or an unhandled
+  exception — never when a hook hands the job out, so a job whose process was
+  never created keeps its full budget. After `MAX_FLUSH_ATTEMPTS` genuine
+  failures the job is retired as `.exhausted` rather than relaunched forever,
+  and its complete payload stays readable in that marker.
+- A handed-out job is leased, not owned. `spawned_at` suppresses a second
+  worker for the same job while the lease is live, but the marker is never
+  renamed or hidden: an expired lease always re-offers the job, and a confirmed
+  failure releases the lease immediately.
+- A structurally unusable record is moved aside as `.corrupt` instead of
+  raising, because one bad file must never stop every future capture for every
+  session. A record that is merely unreadable right now is left alone for the
+  next run, and a failed quarantine never deletes it — the marker is the only
+  copy of the session, cursor, and archive path.
 - Runtime filenames use a digest of the untrusted session ID plus a UUID, so
   hook input cannot redirect pending writes outside the state directory.
 - Concurrent cursor writers merge monotonically under a file lock.
@@ -267,6 +287,25 @@ remediation completed on 2026-07-28 addressed each one:
 
 The full finding-by-finding record, test plan, and final evidence are in
 `MEMORY-COMPILER-REVIEW-AND-REMEDIATION-PLAN.md`.
+
+## Post-Release Verification (2026-07-30)
+
+A later pass re-derived these claims from the shipped code instead of the
+checklists. The core guarantee held: both extraction limits are `None`, the
+cursor advances only through included turns, and raw-index failure still blocks
+it. Nine defects were found in the surrounding claims and fixed — most
+importantly the archive itself was the one artifact published without an fsync,
+and one corrupt pending marker could permanently halt every future capture.
+Retries are now bounded, the Chroma migration marker is durable, and a
+legitimate no-op compile no longer retries forever.
+
+Those fixes were then reviewed with the same adversarial pass, which caught a
+self-inflicted loss risk in the first attempt at the retry ceiling (counting an
+attempt when the job was handed out, so an un-spawned job could be discarded
+without ever running) and a false-accept in the first attempt at the compile
+gate. Both were corrected before release. See the **Post-Release Verification
+Round** section of `MEMORY-COMPILER-REVIEW-AND-REMEDIATION-PLAN.md`
+(PR01–PR09) for the finding-by-finding record and evidence.
 
 ## Operations
 

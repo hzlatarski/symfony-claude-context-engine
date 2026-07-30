@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import hashlib
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +39,9 @@ import dedup
 
 # ── Paths for the LLM to use ──────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent.parent
+
+# How many times an unchanged daily log may fail before it is set aside.
+MAX_COMPILE_ATTEMPTS = 3
 
 
 async def compile_daily_log(log_path: Path, state: dict) -> bool:
@@ -69,6 +73,7 @@ async def compile_daily_log(log_path: Path, state: dict) -> bool:
 
     timestamp = now_iso()
     before = _articles_snapshot()
+    before_log = _read_compile_log()
 
     prompt = f"""You are a knowledge compiler. Your job is to read a daily conversation log
 and extract knowledge into structured wiki articles.
@@ -218,9 +223,11 @@ Read the daily log above and compile it into wiki articles following the schema 
         result = await asyncio.to_thread(_run)
     except subprocess.TimeoutExpired:
         print(f"  Error: claude CLI timed out after 600s")
+        _record_compile_failure(log_path)
         return False
     except Exception as e:
         print(f"  Error: {e}")
+        _record_compile_failure(log_path)
         return False
 
     if result.returncode != 0:
@@ -229,15 +236,19 @@ Read the daily log above and compile it into wiki articles following the schema 
             f"  Error: claude CLI exited {result.returncode} — {detail}",
             file=sys.stderr,
         )
+        _record_compile_failure(log_path)
         return False
 
     rel_source = f"daily/{log_path.name}"
-    if not _articles_written_for(before, rel_source):
+    if not _knowledge_credited_source(
+        before, before_log, rel_source, log_path.name
+    ):
         print(
-            f"  Error: claude CLI exited 0 but wrote no article credited to "
-            f"{rel_source}",
+            f"  Error: claude CLI exited 0 but recorded no knowledge credited "
+            f"to {rel_source}",
             file=sys.stderr,
         )
+        _record_compile_failure(log_path)
         return False
 
     # Update state (cost is 0.0 — subscription billing, not API credits)
@@ -253,6 +264,7 @@ Read the daily log above and compile it into wiki articles following the schema 
             rel_path, entry
         )
     )
+    _clear_compile_failure(log_path)
 
     return True
 
@@ -271,6 +283,124 @@ def _articles_snapshot() -> dict[str, str]:
             except OSError:
                 continue
     return snapshot
+
+
+def _read_compile_log() -> str:
+    """Return knowledge/log.md, which every compile is told to append to."""
+    try:
+        return (KNOWLEDGE_DIR / "log.md").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _log_credits_source(before_log: str, rel_source: str, log_name: str) -> bool:
+    """Return whether log.md gained a compile entry for this daily source.
+
+    Only a strict append counts. If the file was rewritten or truncated the
+    result is rejected outright, because scanning the whole file would let a
+    pre-existing entry from an earlier run satisfy the gate. The appended text
+    must also look like the instructed compile entry rather than merely
+    mentioning the filename in passing.
+    """
+    after_log = _read_compile_log()
+    if after_log == before_log or not after_log.startswith(before_log):
+        return False
+    added = after_log[len(before_log):]
+    # Require the instructed compile heading specifically. A lone
+    # ``- Source: daily/x.md`` line can appear in other kinds of entry, so
+    # accepting it would let a partial or unrelated append satisfy the gate.
+    # The ``daily/`` prefix is tolerated because both spellings occur.
+    credit = re.compile(
+        rf"compile\s*\|\s*(?:daily/)?{re.escape(log_name)}"
+    )
+    return credit.search(added) is not None
+
+
+def _knowledge_credited_source(
+    before: dict[str, str],
+    before_log: str,
+    rel_source: str,
+    log_name: str,
+) -> bool:
+    """Return whether this compile produced credited, observable knowledge.
+
+    A changed article carrying the source anchor is the strong signal. The
+    compile log is accepted as well, because a daily log whose content is
+    already fully covered by existing articles can legitimately produce no
+    article change — and rejecting that forever would recompile the same source
+    on every run, at LLM cost, while the command stayed permanently red. Both
+    forms still require the source to be *named*, so a failed CLI that merely
+    printed an error cannot satisfy either one.
+    """
+    if _articles_written_for(before, rel_source):
+        return True
+    return _log_credits_source(before_log, rel_source, log_name)
+
+
+def _record_compile_failure(log_path: Path) -> None:
+    """Count a failed attempt so a broken source stops retrying forever.
+
+    Deliberately separate from ``ingested_daily``: recording a success hash is
+    what makes a source invisible, so a failure must never be written there.
+    The counter is keyed to the file's current hash, so editing the daily log
+    is an implicit request to retry. Mirrors ``ingest.record_failure``.
+    """
+    name = log_path.name
+    digest = file_hash(log_path)
+
+    def apply_failure(current: dict) -> None:
+        failures = current.setdefault("failed_daily", {})
+        previous = failures.get(name, {})
+        attempts = (
+            previous.get("attempts", 0) + 1
+            if previous.get("hash") == digest
+            else 1
+        )
+        failures[name] = {
+            "hash": digest,
+            "attempts": attempts,
+            "last_failed_at": now_iso(),
+        }
+
+    update_state(apply_failure)
+
+
+def _clear_compile_failure(log_path: Path) -> None:
+    name = log_path.name
+
+    def drop(current: dict) -> None:
+        current.get("failed_daily", {}).pop(name, None)
+
+    update_state(drop)
+
+
+def partition_logs(
+    all_logs: list[Path], state: dict
+) -> tuple[list[Path], list[Path]]:
+    """Split sources into (worth compiling now, set aside after repeated failure)."""
+    ingested = state.get("ingested_daily", {})
+    failures = state.get("failed_daily", {})
+    selected: list[Path] = []
+    exhausted: list[Path] = []
+    for log_path in all_logs:
+        name = log_path.name
+        digest = file_hash(log_path)
+        if ingested.get(name, {}).get("hash") == digest:
+            continue
+        failure = failures.get(name, {})
+        if (
+            failure.get("hash") == digest
+            and failure.get("attempts", 0) >= MAX_COMPILE_ATTEMPTS
+        ):
+            exhausted.append(log_path)
+            continue
+        selected.append(log_path)
+    return selected, exhausted
+
+
+def select_logs_to_compile(all_logs: list[Path], state: dict) -> list[Path]:
+    """Filter to sources that are new, changed, or still worth retrying."""
+    return partition_logs(all_logs, state)[0]
 
 
 def _articles_written_for(before: dict[str, str], rel_source: str) -> bool:
@@ -319,19 +449,30 @@ def _main_unlocked(args: argparse.Namespace) -> int:
             print(f"Error: {args.file} not found")
             return 2
         to_compile = [target]
+        exhausted: list[Path] = []
     else:
         all_logs = list_raw_files()
         if args.all:
-            to_compile = all_logs
+            to_compile, exhausted = all_logs, []
         else:
-            to_compile = []
-            for log_path in all_logs:
-                rel = log_path.name
-                prev = state.get("ingested_daily", {}).get(rel, {})
-                if not prev or prev.get("hash") != file_hash(log_path):
-                    to_compile.append(log_path)
+            to_compile, exhausted = partition_logs(all_logs, state)
+
+    if exhausted:
+        # Never call these "up to date". They were never compiled; they were
+        # set aside after repeated failure, and saying otherwise would hide a
+        # real gap in the knowledge base behind a success message.
+        print(
+            f"{len(exhausted)} daily log(s) set aside after "
+            f"{MAX_COMPILE_ATTEMPTS} failed attempts — not compiled. "
+            f"Fix the cause or rerun with --all to retry:",
+            file=sys.stderr,
+        )
+        for log_path in exhausted:
+            print(f"  - {log_path.name}", file=sys.stderr)
 
     if not to_compile:
+        if exhausted:
+            return 1
         print("Nothing to compile - all daily logs are up to date.")
         return 0
 
@@ -371,7 +512,7 @@ def _main_unlocked(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    return 0
+    return 1 if exhausted else 0
 
 
 def main() -> int:

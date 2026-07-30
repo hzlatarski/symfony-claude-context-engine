@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -28,6 +29,21 @@ def _legacy_artifacts(root: Path) -> list[Path]:
     return sorted(artifacts, key=lambda path: path.name)
 
 
+def _write_marker_durably(marker: Path) -> None:
+    """Persist the migration marker before the first artifact moves.
+
+    The marker is the only thing that distinguishes a resumable interrupted
+    migration from a genuinely ambiguous mixed store. If it is still sitting in
+    the page cache when a move becomes durable, a crash leaves a mixed layout
+    with no marker — which this module then refuses to touch, wedging the store
+    permanently. Ordinary ``write_text`` is not sufficient here.
+    """
+    with marker.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write("legacy-to-active\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def ensure_active_chroma_dir(root: Path) -> Path:
     """Migrate an unambiguous legacy store and return ``root/active``."""
     root = root.resolve()
@@ -47,7 +63,7 @@ def ensure_active_chroma_dir(root: Path) -> Path:
             )
         if legacy or resuming:
             if not resuming:
-                marker.write_text("legacy-to-active\n", encoding="utf-8")
+                _write_marker_durably(marker)
             active.mkdir(exist_ok=True)
             moved: list[tuple[Path, Path]] = []
             try:

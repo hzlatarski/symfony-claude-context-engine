@@ -250,10 +250,13 @@ def get_update_notice() -> str | None:
     if not check_script.exists():
         return None
     try:
-        # ``uv run python`` is the canonical invocation; the hook runs
-        # from ``.claude/memory-compiler/`` so a relative path works.
+        # Use the interpreter already running this hook rather than a bare
+        # ``uv``. ``uv`` is routinely absent from the PATH a restricted shell
+        # hands the hook, and the failure is swallowed below — so the update
+        # check simply stopped happening. sys.executable is the venv Python
+        # that `uv run` would have selected anyway. Same fix as F11.
         proc = subprocess.run(
-            ["uv", "run", "python", str(check_script)],
+            [sys.executable, str(check_script)],
             cwd=str(ROOT),
             capture_output=True,
             text=True,

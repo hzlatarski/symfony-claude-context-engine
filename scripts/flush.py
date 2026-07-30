@@ -44,7 +44,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from config import CLAUDE_BIN, DAILY_DIR  # noqa: E402
 from flush_cursor import load_cursor, save_cursor, session_flush_lock  # noqa: E402
 from log_setup import configure as configure_logging  # noqa: E402
-from pending_flush import remove_pending_flush  # noqa: E402
+from pending_flush import record_failed_attempt, remove_pending_flush  # noqa: E402
 from utils import daily_file_lock_path  # noqa: E402
 
 # Set up file-based logging so we can verify the background process ran.
@@ -237,6 +237,50 @@ def format_tool_events(events: list[dict], max_notable: int = 40) -> str:
     return "\n".join(lines)
 
 
+def _record_stale_daily_index(daily_name: str, exc: BaseException) -> None:
+    """Record that a daily file is on disk but missing from the vector index.
+
+    ``reindex.py --daily`` repairs these. Without the record the only evidence
+    is a log line in a file nobody reads, so the search index stays quietly
+    wrong after a transient Chroma failure.
+    """
+    from config import now_iso
+    from utils import update_state
+
+    def mark(current: dict) -> None:
+        current.setdefault("stale_daily_index", {})[daily_name] = {
+            "failed_at": now_iso(),
+            "error": str(exc)[:300],
+        }
+
+    try:
+        update_state(mark)
+    except Exception as state_exc:  # never let bookkeeping break the flush
+        logging.warning("Could not record stale daily index: %s", state_exc)
+
+
+def _clear_stale_daily_index(daily_name: str) -> None:
+    from utils import load_state, update_state
+
+    def drop(current: dict) -> None:
+        stale = current.get("stale_daily_index")
+        if isinstance(stale, dict):
+            stale.pop(daily_name, None)
+            if not stale:
+                current.pop("stale_daily_index", None)
+
+    try:
+        # Read before writing: the overwhelmingly common case is "nothing to
+        # clear", and taking the state lock plus an fsync on every successful
+        # append would add a needless write to the hot path.
+        current = load_state()
+        if daily_name not in (current.get("stale_daily_index") or {}):
+            return
+        update_state(drop)
+    except Exception as state_exc:
+        logging.warning("Could not clear stale daily index: %s", state_exc)
+
+
 def append_to_daily_log(content: str, section: str = "Session") -> None:
     """Append content to today's daily log.
 
@@ -266,9 +310,14 @@ def append_to_daily_log(content: str, section: str = "Session") -> None:
             f.flush()
             os.fsync(f.fileno())
 
-        # Keep append and replacement indexing in one date-wide transaction.
-        # Otherwise an older snapshot can win the Chroma write after a newer
-        # session has already appended to the shared daily file.
+        # The date-wide lock keeps append and replacement indexing mutually
+        # exclusive, so an older snapshot cannot win the Chroma write after a
+        # newer session has appended. It does NOT make the pair atomic: the
+        # Markdown can land while the embed fails. That stays non-fatal on
+        # purpose — the raw transcript archive is the authoritative copy and is
+        # indexed separately, and this summary is reindexable — but the failure
+        # must leave a durable record, otherwise the cursor advances and the
+        # daily search index is silently stale until someone reindexes by hand.
         try:
             from utils import embed_daily_file
             count = embed_daily_file(log_path)
@@ -279,6 +328,9 @@ def append_to_daily_log(content: str, section: str = "Session") -> None:
             )
         except Exception as exc:
             logging.warning("Vector embed skipped for %s: %s", log_path.name, exc)
+            _record_stale_daily_index(log_path.name, exc)
+        else:
+            _clear_stale_daily_index(log_path.name)
 
 
 # Matches a **Heading:** bold section at the start of a line. Used to scope
@@ -723,5 +775,40 @@ def main():
     return 0
 
 
+def _main_with_attempt_accounting() -> int:
+    """Count a failed run against the durable job, so retries stay bounded.
+
+    Recorded here rather than when the hook hands the job out: only a worker
+    that actually ran and failed has consumed an attempt. A job whose process
+    was never created keeps its full budget and is retried intact.
+    """
+    try:
+        status = main()
+    except BaseException:
+        # An unhandled crash is a real failure and must consume an attempt.
+        # Counting only non-zero *returns* would leave the most likely failure
+        # mode — an exception before any return — with a budget that never
+        # moves, so the job would be respawned by every capture hook forever.
+        logging.exception("Flush failed with an unhandled exception")
+        _count_failed_attempt()
+        raise
+    if status != 0:
+        _count_failed_attempt()
+    return status
+
+
+def _count_failed_attempt() -> None:
+    if len(sys.argv) <= 1:
+        return
+    try:
+        attempts = record_failed_attempt(Path(sys.argv[1]))
+        if attempts:
+            logging.warning(
+                "Recorded failed flush attempt %d for %s", attempts, sys.argv[1]
+            )
+    except Exception as exc:  # bookkeeping must not mask the real failure
+        logging.warning("Could not record failed flush attempt: %s", exc)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_main_with_attempt_accounting())

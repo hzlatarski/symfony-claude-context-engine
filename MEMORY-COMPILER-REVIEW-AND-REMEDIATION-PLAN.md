@@ -520,3 +520,200 @@ Reconciliation added IR07. Follow-up reviews then found two staged-replacement
 P1 failures (IR08–IR09) and six capture durability/security P2 failures
 (IR10–IR15). Every finding was reproduced by control-flow inspection and fixed;
 the final follow-up reviewer reported **no unresolved P1/P2 findings**.
+
+## Post-Release Verification Round (2026-07-30)
+
+A verification pass re-derived every claim above from the shipped code rather
+than from the checklists. The suite result reproduced exactly (**850 passed**),
+and F01–F16 and IR01–IR15 were each traced to concrete implementations. The
+core zero-loss mechanism verified clean: both extraction limits are `None` and
+`next_cursor = start + len(selected)`, so the cursor cannot outrun the content.
+
+Nine defects were found in the *claims*, not in the core guarantee. All are now
+fixed with regression tests (`tests/test_review_fix_hardening.py`).
+
+The fixes themselves were then put through the same adversarial review, twice.
+The first pass found six problems in them — including a genuine self-inflicted
+data-loss risk (PR03's original hand-out claim) and a false-accept path (PR05's
+original log gate). The second pass, run against the reconciled result, found
+three more: attempts not counted when a worker raised rather than returned, a
+lone `Source:` line still satisfying the compile gate, and duplicate spawns
+still possible because the queue lock guards only the scan. All were fixed
+before this document was finalized; the details are recorded inline with the
+finding they belong to.
+
+### PR01 — The authoritative archive was the only artifact never fsynced (P1)
+
+IR15 fsynced the daily append and the cursor so a successful exit could not
+acknowledge cache state, but `archive_transcript()` published via
+`write_bytes()` + rename. A power loss after cursor publication could leave a
+cursor that consumed turns the archive no longer held — the exact failure IR15
+existed to prevent, on the one file the design calls authoritative.
+
+**Fix:** write, flush, and `os.fsync()` the archive before the rename, then
+best-effort fsync the containing directory so the new entry is durably
+published too. Directory fsync is a no-op on Windows, which has no equivalent;
+the file-content fsync is the portable part of the guarantee.
+
+### PR02 — One corrupt marker permanently halted every future capture (P2)
+
+`load_pending_flushes()` raised on any unusable record, and both hooks call it
+inside a handler that spawns nothing on error. A single bad marker therefore
+stopped all raw indexing and summarization, for every session, forever —
+falsifying IR11's automatic-retry claim. Archives still survived on disk, so
+this was availability, not loss.
+
+**Fix:** structurally unusable markers are moved aside as `.corrupt` and
+reported on stderr; the queue keeps draining. An I/O error is deliberately not
+treated as corruption — a briefly unreadable marker (antivirus, sharing
+violation, permissions) is left untouched for the next run — and a failed
+quarantine rename never falls back to deleting the marker, because the marker
+is the only record of the session, cursor, and archive path.
+
+### PR03 — Pending jobs had no retry ceiling or real ordering (P2)
+
+Hooks spawned one process per marker with no backoff, so a permanently-failing
+job was relaunched by every capture hook indefinitely and piled up processes
+blocked on the session lease. Separately, the loader's documented "oldest-first"
+order sorted filenames built from a session digest and a random UUID (IR13's own
+scheme), making the order effectively random.
+
+**Fix:** `MAX_FLUSH_ATTEMPTS` retires a hopeless job as `.exhausted`, and an
+explicit `created_at` provides the real ordering.
+
+Attempts are counted by the **worker that actually ran and failed**
+(`flush.py` records one on a non-zero exit *and* on an unhandled exception),
+never at hand-out time. The first implementation of this fix claimed an attempt
+when the hook loaded the job, which the adversarial reviewer correctly
+rejected: a job whose process was never created — hook crash, `Popen` failure,
+resource exhaustion — would burn its whole budget without executing once and
+then be discarded as exhausted. That would have made the durable queue lose
+exactly the work it exists to protect. Counting real failures keeps the ceiling
+meaningful while an un-spawned job retains its full budget.
+
+The second round of review caught the matching gap: counting only non-zero
+*returns* left the most likely failure mode — an exception raised before any
+return — with a budget that never moved, so the job would be respawned forever.
+The accounting now wraps the whole run, records the attempt, and re-raises so
+the traceback and non-zero exit are preserved.
+
+Duplicate spawns are suppressed by a **soft lease**. `SessionEnd` and
+`PreCompact` can fire back to back for the same session, and the queue lock only
+guards the scan, so both could previously launch a worker for one job. A
+handed-out job records `spawned_at` and is skipped while the lease is live. This
+is deliberately not an ownership transfer: the marker is never renamed or
+hidden, an expired lease always re-offers the job, and a confirmed failure
+releases the lease immediately. The cost of a worker that never started is a
+delayed retry, never a lost one — the failure mode a claim-and-hide design would
+have reintroduced.
+
+### PR04 — The Chroma migration marker was not durable (P2)
+
+IR05 promised crash-resume, but the marker used `write_text()` with no fsync
+while the artifact moves could become durable first. A crash in that window
+leaves a mixed layout with no marker, which the same function then refuses as
+ambiguous — wedging the store permanently.
+
+**Fix:** `_write_marker_durably()` fsyncs the marker before the first move.
+
+### PR05 — A legitimate no-op compile could be rejected forever (P2)
+
+F01's gate accepted a run only if a `concepts/`/`connections/` article changed
+*and* carried the source anchor. A daily log already fully covered by existing
+articles legitimately produces no article change, so its hash was never
+recorded: it recompiled on every run at LLM cost while the command stayed
+permanently red.
+
+**Fix:** a credited `knowledge/log.md` entry also counts as observable
+knowledge — both forms still require the source to be *named*, so a failed CLI
+that only printed an error satisfies neither. `MAX_COMPILE_ATTEMPTS` and
+`failed_daily` bound the retries, mirroring `ingest.record_failure`.
+
+The log credit is deliberately narrow, after the reviewer showed a looser
+version could false-accept. Only a **strict append** counts: if `log.md` was
+rewritten or truncated the result is rejected outright, so a pre-existing entry
+from an earlier run cannot satisfy the gate. The appended text must also carry
+the instructed compile heading (`compile | <file>`, with or without the
+`daily/` prefix). An earlier revision also accepted a lone
+`- Source: daily/<file>` line; the reviewer showed that line can appear in
+other kinds of entry, so it no longer suffices on its own.
+
+### PR09 — Set-aside sources were reported as "up to date" (P2)
+
+Once every remaining source was set aside by PR05's ceiling, the command
+printed "Nothing to compile - all daily logs are up to date" and exited 0 — a
+never-compiled daily log silently reported as success.
+
+**Fix:** exhausted sources are named on stderr and the command returns 1 while
+any exist. They are still not re-attempted, so the repeated LLM cost PR05
+removed does not come back. This is honest rather than permanently red: with
+the gate broadened, a source only reaches the ceiling after three genuine
+failures, so a red exit now means something is really wrong.
+
+### PR06 — A swallowed daily-index failure left no repair record (P3)
+
+The per-date lock gives mutual exclusion, not atomicity, so the Markdown can
+land while the embed fails. The failure was logged and discarded and the cursor
+advanced, leaving the daily search index quietly stale. Not a zero-loss
+violation — the raw archive is authoritative and separately indexed — but the
+comment claimed a transaction it did not provide.
+
+**Fix:** failures record `stale_daily_index` in state for `reindex.py --daily`
+to repair, success clears it, and the comment now states the real guarantee.
+The clear path reads before writing so the hot path takes no extra locked write.
+
+### PR07 — Distinct session IDs could share one archive (P3)
+
+IR13 hardened pending-job filenames against untrusted session IDs but
+`archive_transcript()` still collapsed every unsafe character to `_`, so two
+distinct IDs mapped to one archive and the second was rejected as divergent —
+unable to be archived at all.
+
+**Fix:** `_archive_stem()` passes safe IDs through unchanged (so all seven
+existing archives keep their names) and appends a SHA-256 digest otherwise.
+
+### PR08 — Bounded extraction ignored its own ceiling for the first turn (P3)
+
+The overflow check only applied once a turn had been admitted, so a limit
+smaller than the first turn returned that whole turn *and* advanced the cursor
+past it. Unreachable in production — both defaults are `None` and no caller
+passes a limit — but it contradicted the documented bounded-batch contract.
+
+**Fix:** the ceiling is checked before admitting any turn, including the first.
+
+### Post-release verification evidence
+
+- Independent rerun of the shipped suite before any change: **850 passed**.
+- Red baseline for the new regressions: **15 failed, 3 passed** (the 3 are
+  guard tests pinning behavior that must not change).
+- Full suite after the first round of fixes: **868 passed**.
+- After reconciling the first adversarial review of those fixes: **874 passed**.
+- After reconciling the second: **879 passed in 66.30s**. No test was weakened
+  or skipped to accommodate an implementation.
+- Two tests were rewritten because the *implementation* changed underneath
+  them, not to make a failure go away: both had pinned the hand-out attempt
+  claim that the review overturned. They now assert the replacement invariants
+  (a hand-out never consumes budget; an expired lease always re-offers the job).
+- One regression surfaced during the work and was fixed at the source rather
+  than in the test: bookkeeping on the daily-append success path added a second
+  global `fsync`, breaking `test_daily_append_is_fsynced_before_success`. The
+  clear path now reads before writing, which removes a needless locked write
+  from the hot path and restores the original assertion untouched.
+- `python -m compileall -q scripts hooks install.py`: passed.
+- Real-behavior smoke runs (no mocks, all three rounds): archive
+  fsync/idempotence/growth-append and divergence rejection; corrupt-marker
+  quarantine with a valid neighbour still served; a loaded job never consuming
+  budget; the lease suppressing an immediate duplicate while expiry reclaims the
+  job; a confirmed failure counting and releasing the lease at once; the ceiling
+  reached only through real worker failures, with the retired job's payload
+  still intact in its `.exhausted` marker; `created_at` ordering beating
+  filename order; context recovery from a self-contained marker; end-to-end
+  legacy Chroma migration preserving `.recovery-*` directories and cleaning its
+  marker; and the **live 545 MB store** resolving as a no-op with no stray
+  marker.
+- All seven existing transcript archives are UUID-named, so PR07 orphans none.
+
+One earlier claim was checked and found overstated rather than wrong: the store
+runs `journal_mode=delete`, not WAL, so migration has no `-wal`/`-shm` sidecar
+to drop — only a transient hot journal, which is a far narrower window than a
+WAL would be.

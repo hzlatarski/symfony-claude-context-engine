@@ -8,6 +8,7 @@ turn cursor while the other kept re-reading from turn zero. One copy, here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -90,21 +91,61 @@ def extract_conversation_context(
     selected = fresh if max_turns is None else fresh[:max(0, max_turns)]
 
     if max_context_chars is not None and selected:
+        # The ceiling is checked before a turn is admitted, including the first
+        # one. Admitting an oversized first turn would return more than the
+        # caller asked for AND advance the cursor past it, which is the same
+        # class of silent over-consumption this module exists to prevent.
         bounded: list[str] = []
         used = 0
         for turn in selected:
             separator_chars = 1 if bounded else 0
-            if bounded and used + separator_chars + len(turn) > max_context_chars:
+            if used + separator_chars + len(turn) > max_context_chars:
                 break
             bounded.append(turn)
             used += separator_chars + len(turn)
-            if len(bounded) == 1 and used > max_context_chars:
-                break
         selected = bounded
 
     context = "\n".join(selected)
     next_cursor = start + len(selected)
     return context, next_cursor, len(selected)
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Best-effort fsync of a directory so a rename is durably published.
+
+    On POSIX the file's own fsync does not guarantee the new directory entry
+    survives a power loss. Windows has no directory-fsync equivalent and
+    raises, so this degrades to a no-op there rather than failing the archive.
+    """
+    try:
+        fd = os.open(directory, getattr(os, "O_DIRECTORY", os.O_RDONLY))
+    except (OSError, AttributeError, ValueError):
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+_SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _archive_stem(session_id: str) -> str:
+    """Return a collision-free archive filename stem for a session ID.
+
+    Claude's own session IDs are UUIDs, which pass through unchanged so the
+    existing archives keep their filenames. Anything else is untrusted hook
+    input: blind character replacement would map two distinct IDs onto one
+    archive, where the second session is then rejected as a divergent snapshot
+    and can never be archived. A digest suffix keeps such IDs distinct.
+    """
+    if _SAFE_SESSION_ID.fullmatch(session_id):
+        return session_id
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:20]
+    readable = re.sub(r"[^A-Za-z0-9_-]", "_", session_id)[:40]
+    return f"{readable}-{digest}"
 
 
 def archive_transcript(
@@ -119,8 +160,7 @@ def archive_transcript(
     """
     target_dir = archive_dir or KNOWLEDGE_DIR / "daily" / "transcripts"
     target_dir.mkdir(parents=True, exist_ok=True)
-    safe_session_id = re.sub(r"[^A-Za-z0-9_-]", "_", session_id)
-    target = target_dir / f"{safe_session_id}.jsonl"
+    target = target_dir / f"{_archive_stem(session_id)}.jsonl"
     tmp = target.with_suffix(f".jsonl.tmp{os.getpid()}")
     lock = FileLock(str(target.with_suffix(".jsonl.lock")))
     with lock:
@@ -134,8 +174,17 @@ def archive_transcript(
                     f"Transcript snapshot for {session_id!r} diverges from its archive"
                 )
         try:
-            tmp.write_bytes(source_bytes)
+            # The archive is the authoritative copy the cursor is allowed to
+            # advance past, so it must reach stable storage before the rename
+            # publishes it — the same guarantee the daily log and the cursor
+            # already had. Without the fsync a power loss can leave a cursor
+            # that consumed turns the archive no longer contains.
+            with tmp.open("wb") as handle:
+                handle.write(source_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
             tmp.replace(target)
+            _fsync_dir(target_dir)
         except OSError:
             tmp.unlink(missing_ok=True)
             raise
