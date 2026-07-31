@@ -185,3 +185,104 @@ class TestBlankDocumentsAreNotEmbedded:
     def test_a_corpus_of_only_blanks_searches_to_nothing(self):
         corpus = EphemeralCorpus([{"id": "b1", "text": ""}, {"id": "b2", "text": ""}])
         assert corpus.search("query", limit=5, mode="vector") == []
+
+
+class TestChunkText:
+    """Windowing is the unit that decides what the embedder ever sees."""
+
+    def test_short_text_is_a_single_chunk(self):
+        from eval_corpus import chunk_text
+
+        assert chunk_text("three short words", size=150, overlap=30) == ["three short words"]
+
+    def test_long_text_is_split_into_windows(self):
+        from eval_corpus import chunk_text
+
+        words = " ".join(str(i) for i in range(500))
+        chunks = chunk_text(words, size=100, overlap=20)
+        assert len(chunks) > 1
+        assert all(len(c.split()) <= 100 for c in chunks)
+
+    def test_windows_overlap_so_a_boundary_fact_survives(self):
+        from eval_corpus import chunk_text
+
+        words = " ".join(str(i) for i in range(200))
+        chunks = chunk_text(words, size=100, overlap=20)
+        # The last 20 words of chunk 0 must reappear at the head of chunk 1.
+        assert chunks[0].split()[-20:] == chunks[1].split()[:20]
+
+    def test_every_word_appears_somewhere(self):
+        from eval_corpus import chunk_text
+
+        words = [str(i) for i in range(250)]
+        chunks = chunk_text(" ".join(words), size=100, overlap=20)
+        covered = {w for c in chunks for w in c.split()}
+        assert covered == set(words)
+
+    def test_overlap_must_be_smaller_than_size(self):
+        from eval_corpus import chunk_text
+
+        with pytest.raises(ValueError, match="overlap"):
+            chunk_text("a b c", size=10, overlap=10)
+
+    def test_blank_text_yields_no_chunks(self):
+        from eval_corpus import chunk_text
+
+        assert chunk_text("   ", size=100, overlap=20) == []
+
+
+class TestChunkedCorpus:
+    """Chunking exists because the embedder only sees a ~190-word window.
+
+    A fact buried 1000 words into a session is invisible to a whole-document
+    embedding. Splitting the document and ranking it by its best chunk
+    recovers it — measured at +12pp recall@5 on LongMemEval-S.
+    """
+
+    def _haystack(self):
+        filler = " ".join(f"unrelated filler sentence {i}" for i in range(400))
+        return [
+            # The distinguishing fact sits far past any embedder's window.
+            {"id": "buried", "text": f"{filler} the deployment key rotates every ninety days"},
+            {"id": "other", "text": " ".join(f"quarterly revenue commentary {i}" for i in range(400))},
+        ]
+
+    def test_finds_a_fact_buried_past_the_embedder_window(self):
+        corpus = EphemeralCorpus(self._haystack(), chunk_words=120, chunk_overlap=20)
+        assert corpus.search("how often does the deployment key rotate", limit=1, mode="vector") == ["buried"]
+
+    def test_results_are_parent_ids_not_chunk_ids(self):
+        corpus = EphemeralCorpus(self._haystack(), chunk_words=120, chunk_overlap=20)
+        results = corpus.search("deployment key rotation", limit=5, mode="vector")
+        assert all("##" not in r for r in results)
+
+    def test_a_parent_appears_at_most_once(self):
+        corpus = EphemeralCorpus(self._haystack(), chunk_words=120, chunk_overlap=20)
+        results = corpus.search("filler sentence", limit=5, mode="vector")
+        assert len(results) == len(set(results))
+
+    def test_limit_counts_parents_not_chunks(self):
+        corpus = EphemeralCorpus(self._haystack(), chunk_words=120, chunk_overlap=20)
+        assert len(corpus.search("sentence", limit=1, mode="vector")) == 1
+
+    def test_chunking_is_off_by_default(self):
+        corpus = EphemeralCorpus([{"id": "a", "text": "alpha beta"}])
+        assert corpus.chunked is False
+
+    def test_hybrid_still_works_with_chunking_enabled(self):
+        corpus = EphemeralCorpus(self._haystack(), chunk_words=120, chunk_overlap=20)
+        assert "buried" in corpus.search("deployment key rotates", limit=2, mode="hybrid")
+
+    def test_blank_documents_are_still_excluded(self):
+        corpus = EphemeralCorpus(
+            [{"id": "blank", "text": ""}, {"id": "real", "text": "postgres pooling"}],
+            chunk_words=120,
+            chunk_overlap=20,
+        )
+        assert corpus.search("anything", limit=5, mode="vector") == ["real"]
+
+    def test_chunked_corpora_are_isolated_from_each_other(self):
+        first = EphemeralCorpus([{"id": "leaked", "text": "postgres pooling"}], chunk_words=50, chunk_overlap=10)
+        first.search("postgres", limit=1, mode="vector")
+        second = EphemeralCorpus([{"id": "own", "text": "tailwind classes"}], chunk_words=50, chunk_overlap=10)
+        assert second.search("postgres pooling", limit=5, mode="vector") == ["own"]

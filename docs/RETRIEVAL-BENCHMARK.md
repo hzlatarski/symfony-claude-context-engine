@@ -48,6 +48,9 @@ uv run python scripts/eval_longmemeval.py --dataset /c/tmp/longmemeval_s.json --
 
 # size a run first, and keep the per-question rankings
 uv run python scripts/eval_longmemeval.py --dataset ... --mode hybrid --limit 50 --json out.json
+
+# chunk long documents before embedding — better on every metric, ~10x slower
+uv run python scripts/eval_longmemeval.py --dataset ... --mode hybrid --chunk-words 150
 ```
 
 `--mode bm25` is the right default for a quick regression check after a
@@ -78,6 +81,32 @@ For reference, the numbers agentmemory publishes for the same dataset are
 BM25 0.862 / hybrid 0.952 / vector 0.966 at recall@5. Our BM25 is 10 points
 above theirs and our hybrid beats their hybrid; our vector-only trails their
 0.966, which is consistent with them chunking before embedding (see below).
+
+### Chunking
+
+`all-MiniLM-L6-v2` truncates at roughly 190 words, but LongMemEval sessions
+run a median of 1633 — so a whole-session embedding represents only the
+opening, and anything stated later is invisible to vector search.
+`--chunk-words 150 --chunk-overlap 30` splits each document into overlapping
+windows, embeds each, and ranks a document by its best-matching window.
+
+Hybrid, first 150 questions, same subset both rows:
+
+| | recall@5 | recall@10 | ndcg@10 | rr@20 | runtime |
+|---|---|---|---|---|---|
+| whole-session | 0.9467 | 0.9867 | 0.8512 | 0.8353 | ~285s |
+| **chunked 150w/30o** | **0.9600** | **1.0000** | **0.8926** | **0.8904** | 2790s |
+
+Better on every metric, and recall@10 is perfect. The gain is largest on the
+*ranking* metrics (NDCG +4.1pp, rr +5.5pp) rather than raw recall, which is
+what you would expect: chunking mostly helps documents the vector stream
+already reached but ranked poorly, by letting the matching passage speak for
+the document instead of its first paragraph.
+
+The cost is roughly 10× the runtime, because each document becomes ~11
+embeddings. Chunking applies to the vector index only — BM25 reads whole
+documents and has no window limit, so its score is unchanged (there is a
+test pinning that).
 
 **Sanity controls** (rerun these if a number ever looks too good):
 
@@ -137,7 +166,18 @@ collection name plus an explicit `close()`; guarded by
 `TestIsolationBetweenCorpora`. If you build any other ephemeral Chroma index
 in this project, do the same.
 
-**2. The BM25 index is built from title + body, not body.**
+**2. `ingest.py` truncated state.json to `{}` on every run.** Its migration
+mutator called `migrate_state_schema(current)`, which mutates in place and
+returns *the same object*, then did `current.clear()` — emptying the
+"migrated" copy too — and updated from the now-empty dict. Every ingest wiped
+the ingest history, which then made the next run re-process all 497 sources
+at LLM cost. It destroyed 496 source records and 83 daily records twice in
+one week before being found. Guarded by
+`TestIngestMigrationDoesNotWipeState`; `tests/conftest.py` additionally
+redirects `STATE_FILE` for every test and fails any test that touches the
+real file.
+
+**3. The BM25 index is built from title + body, not body.**
 `_iter_article_zones` deliberately folds the article title into the token
 stream while the stored `text` omits it. Rebuilding the index from `text`
 silently drops every title term from live search — and the entire existing
@@ -155,13 +195,8 @@ guarded by `TestTitleIsIndexed`.
   150-question subset), which bounds how much information is being discarded
   — yet vector still reaches 0.924, so truncation is a real constraint here
   rather than a crippling one.
-- **Chunking recovers most of it.** Splitting sessions into 150-word windows
-  with 30-word overlap, embedding each, and ranking a session by its best
-  chunk lifts vector-only from **0.820 → 0.940 recall@5** and NDCG@10 from
-  0.731 → 0.889 on the same 50-question subset. That is the single largest
-  retrieval improvement measured so far, and it is the likeliest explanation
-  for agentmemory's higher published vector-only figure. Worth implementing
-  as a real mode rather than a scratch experiment.
+- **Chunking recovers most of it** — see below. It is now a real option
+  (`--chunk-words`), not a scratch experiment.
 - 15 of the 500 questions list one session id **twice**. Every observed case
   is byte-identical content and never a gold session, so the loader collapses
   them and prints a note. The same id with *differing* content raises instead

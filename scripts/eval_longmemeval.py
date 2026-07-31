@@ -200,8 +200,17 @@ def evaluate(
     mode: str = "hybrid",
     k_values: Sequence[int] = eval_metrics.DEFAULT_K_VALUES,
     progress: bool = False,
+    chunk_words: int | None = None,
+    chunk_overlap: int = 0,
 ) -> dict[str, Any]:
-    """Run ``mode`` retrieval over every question and score the results."""
+    """Run ``mode`` retrieval over every question and score the results.
+
+    ``chunk_words`` splits each session into overlapping windows before
+    embedding, so the vector stream can see past the embedder's ~190-word
+    limit. It affects the vector index only — BM25 always reads whole
+    documents — and a chunked run is not comparable to an unchunked one, so
+    both settings are recorded in the report.
+    """
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}; expected one of {MODES}")
 
@@ -213,7 +222,11 @@ def evaluate(
     for index, question in enumerate(questions, start=1):
         # Context-managed so each question's index is released as soon as it
         # is scored — see EphemeralCorpus.close for why that is not optional.
-        with EphemeralCorpus(question.documents) as corpus:
+        with EphemeralCorpus(
+            question.documents,
+            chunk_words=chunk_words,
+            chunk_overlap=chunk_overlap,
+        ) as corpus:
             blank_sessions += corpus.blank_documents
             retrieved = corpus.search(question.question, limit=depth, mode=mode)
         scores = eval_metrics.score_question(
@@ -245,6 +258,8 @@ def evaluate(
         "k_values": list(k_values),
         "elapsed_seconds": round(time.monotonic() - started, 1),
         # Protocol deviations, surfaced so a run is comparable to another.
+        "chunk_words": chunk_words,
+        "chunk_overlap": chunk_overlap if chunk_words else 0,
         "collapsed_duplicate_sessions": getattr(questions, "collapsed_duplicates", 0),
         "blank_sessions": blank_sessions,
         "summary": eval_metrics.aggregate(metric_only),
@@ -273,7 +288,9 @@ def format_report(report: dict[str, Any]) -> str:
         "",
         f"LongMemEval-S retrieval — mode={report['mode']}  "
         f"questions={summary.get('questions', 0)}  "
-        f"depth={report['depth']}  ({report['elapsed_seconds']}s)",
+        f"depth={report['depth']}  ({report['elapsed_seconds']}s)"
+        + (f"  chunked={report['chunk_words']}w/{report['chunk_overlap']}o"
+           if report.get("chunk_words") else ""),
         "=" * 72,
     ]
     for key in sorted(k for k in summary if k != "questions"):
@@ -314,6 +331,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Recall cutoffs to report (default: 5 10 20).",
     )
     parser.add_argument(
+        "--chunk-words",
+        type=int,
+        default=None,
+        help=(
+            "Split sessions into windows of this many words before embedding. "
+            "Lifts vector recall past the embedder's ~190-word limit; try 150."
+        ),
+    )
+    parser.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=30,
+        help="Word overlap between chunks, so a boundary-straddling fact survives.",
+    )
+    parser.add_argument(
         "--json",
         type=Path,
         default=None,
@@ -333,7 +365,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         file=sys.stderr,
         flush=True,
     )
-    report = evaluate(questions, mode=args.mode, k_values=tuple(args.k), progress=True)
+    report = evaluate(
+        questions,
+        mode=args.mode,
+        k_values=tuple(args.k),
+        progress=True,
+        chunk_words=args.chunk_words,
+        chunk_overlap=args.chunk_overlap,
+    )
     print(format_report(report))
 
     if args.json:

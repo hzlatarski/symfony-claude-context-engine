@@ -158,3 +158,51 @@ class TestLoadStateWarnsOnBackfill:
 
         utils.load_state(path)
         assert capsys.readouterr().err == ""
+
+
+class TestIngestMigrationDoesNotWipeState:
+    """`ingest.py` truncated the live state.json to `{}` on every run.
+
+    Its migrate mutator did:
+
+        migrated = migrate_state_schema(current)
+        current.clear()
+        current.update(migrated)
+
+    `migrate_state_schema` mutates in place and returns the *same* object, so
+    `current.clear()` emptied `migrated` too and the update copied nothing
+    back. Observed twice in one week: 496 ingest records and 83 daily records
+    destroyed, and a full re-ingest of 497 files launched because the history
+    looked empty.
+    """
+
+    def test_migrate_state_schema_returns_the_same_object(self):
+        # Pinning the property the caller has to defend against.
+        import utils
+
+        state = {"ingested_daily": {}, "ingested_sources": {}}
+        assert utils.migrate_state_schema(state) is state
+
+    def test_the_ingest_mutator_preserves_existing_records(self):
+        import ingest
+
+        state = {
+            "ingested_daily": {"2026-04-09.md": {"hash": "a"}},
+            "ingested_sources": {"design-specs/x.md": {"hash": "b"}},
+            "total_cost": 208.18,
+        }
+        ingest.migrate_state_mutator(state)
+
+        assert state["ingested_sources"] == {"design-specs/x.md": {"hash": "b"}}
+        assert state["ingested_daily"] == {"2026-04-09.md": {"hash": "a"}}
+        assert state["total_cost"] == 208.18
+
+    def test_the_ingest_mutator_still_migrates_the_legacy_schema(self):
+        import ingest
+
+        state = {"ingested": {"2026-04-09.md": {"hash": "a"}}}
+        ingest.migrate_state_mutator(state)
+
+        assert state["ingested_daily"] == {"2026-04-09.md": {"hash": "a"}}
+        assert state["ingested_sources"] == {}
+        assert "ingested" not in state

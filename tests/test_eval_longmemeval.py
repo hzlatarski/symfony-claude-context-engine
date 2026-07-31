@@ -254,3 +254,55 @@ class TestQuestionValidation:
         path.write_text(json.dumps([instance]), encoding="utf-8")
         with pytest.raises(ValueError, match="question"):
             harness.load_questions(path)
+
+
+class TestChunkedMode:
+    """Chunking is a corpus-construction option, not a retrieval mode.
+
+    It changes what the embedder sees, so a run that used it is not
+    comparable to one that did not — the report must say so.
+    """
+
+    def test_chunk_settings_are_recorded_in_the_report(self, dataset_path):
+        report = harness.evaluate(
+            harness.load_questions(dataset_path),
+            mode="bm25",
+            chunk_words=150,
+            chunk_overlap=30,
+        )
+        assert report["chunk_words"] == 150
+        assert report["chunk_overlap"] == 30
+
+    def test_unchunked_runs_record_no_chunking(self, dataset_path):
+        report = harness.evaluate(harness.load_questions(dataset_path), mode="bm25")
+        assert report["chunk_words"] is None
+
+    def test_chunking_does_not_disturb_keyword_scoring(self, dataset_path):
+        # BM25 reads whole documents either way, so the bm25 number must be
+        # identical with and without chunking.
+        plain = harness.evaluate(harness.load_questions(dataset_path), mode="bm25")
+        chunked = harness.evaluate(
+            harness.load_questions(dataset_path), mode="bm25", chunk_words=50, chunk_overlap=10
+        )
+        assert plain["summary"]["recall@5"] == chunked["summary"]["recall@5"]
+
+    def test_cli_accepts_the_chunking_flags(self, dataset_path, tmp_path, capsys):
+        out = tmp_path / "report.json"
+        exit_code = harness.main([
+            "--dataset", str(dataset_path),
+            "--mode", "bm25",
+            "--chunk-words", "150",
+            "--chunk-overlap", "30",
+            "--json", str(out),
+        ])
+        assert exit_code == 0
+        assert json.loads(out.read_text(encoding="utf-8"))["chunk_words"] == 150
+
+    def test_overlap_not_smaller_than_size_is_rejected(self, dataset_path):
+        with pytest.raises(ValueError, match="overlap"):
+            harness.evaluate(
+                harness.load_questions(dataset_path),
+                mode="vector",
+                chunk_words=50,
+                chunk_overlap=50,
+            )

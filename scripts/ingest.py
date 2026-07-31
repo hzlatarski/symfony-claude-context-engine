@@ -51,6 +51,30 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 MAX_INGEST_ATTEMPTS = 3
 
 
+def migrate_state_mutator(current: dict) -> None:
+    """Bring ``current`` up to the split-schema shape, in place.
+
+    Written defensively on purpose. The previous version was::
+
+        migrated = migrate_state_schema(current)
+        current.clear()
+        current.update(migrated)
+
+    ``migrate_state_schema`` mutates its argument and returns *the same
+    object*, so ``current.clear()`` emptied ``migrated`` as well and the
+    update copied an empty dict back. Every ingest run therefore truncated
+    state.json to ``{}`` — destroying the ingest history and triggering a
+    full re-ingest of every source at LLM cost. It cost 496 source records
+    and 83 daily records twice in one week before it was found.
+
+    Migrating a copy and writing the result back is correct whether the
+    helper mutates in place or returns a new dict.
+    """
+    migrated = migrate_state_schema(dict(current))
+    current.clear()
+    current.update(migrated)
+
+
 def source_state_key(group: SourceGroup, file_path: Path) -> str:
     """Build the state.json key for a source file: '{source_id}/{filename}'."""
     return f"{group.id}/{file_path.name}"
@@ -434,12 +458,7 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Print per-file decisions")
     args = parser.parse_args()
 
-    def migrate(current: dict) -> None:
-        migrated = migrate_state_schema(current)
-        current.clear()
-        current.update(migrated)
-
-    state = update_state(migrate)
+    state = update_state(migrate_state_mutator)
 
     groups = load_sources_config()
     if not groups:
