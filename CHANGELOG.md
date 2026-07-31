@@ -4,6 +4,32 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [0.8.0] — 2026-07-31
+
+Two things the new retrieval benchmark turned up while it was being built: a data-loss bug that had been destroying the ingest history on every run, and a measured improvement to vector retrieval.
+
+### Fixed
+
+- **`ingest.py` truncated `state.json` to `{}` on every run.** Its migration mutator called `migrate_state_schema(current)` — which mutates in place and returns *the same object* — then `current.clear()`, which emptied the "migrated" copy too, then updated from the now-empty dict. The damage compounds: with the ingest history gone the next run re-queues all 497 sources at LLM cost, and that run wipes it again. It destroyed 496 source records and 83 daily records twice in one week before being found. After the fix the queue is 69 files rather than 499, because the skip logic can finally see the history.
+- **The test suite could write to the developer's live `state.json`.** Two tests exercised production code paths without redirecting it. `tests/conftest.py` now redirects `STATE_FILE` to a tmp file for every test by default, and a backstop fails any test where a top-level key shrank or vanished — restoring the previous content first. The backstop checks shrinkage rather than byte equality on purpose: a legitimate background ingest may be appending while the suite runs, and a byte comparison would both fail spuriously and restore a stale snapshot over that writer's progress.
+
+### Added
+
+- **Chunked embedding (`--chunk-words`, `--chunk-overlap`).** `all-MiniLM-L6-v2` truncates at roughly 190 words while LongMemEval sessions run a median of 1633, so a whole-document embedding only ever represents the opening. Chunking splits documents into overlapping windows and ranks a document by its best-matching window.
+
+  Hybrid, first 150 questions, same subset both rows:
+
+  | | recall@5 | recall@10 | ndcg@10 | rr@20 | runtime |
+  |---|---|---|---|---|---|
+  | whole-session | 0.9467 | 0.9867 | 0.8512 | 0.8353 | ~285s |
+  | chunked 150w/30o | **0.9600** | **1.0000** | **0.8926** | **0.8904** | 2790s |
+
+  Better on every metric, and recall@10 is perfect. The gain is largest on the *ranking* metrics rather than raw recall, which is what you would expect: chunking mostly helps documents the vector stream already reached but ranked poorly, by letting the matching passage speak for the document instead of its first paragraph. The cost is roughly 10× the runtime. Chunking applies to the vector index only — BM25 reads whole documents and has no window limit — with a test pinning that its score is unchanged.
+
+### Notes
+
+- Stopping a background shell does not necessarily kill the Python process it launched. Two orphaned `ingest.py` runs survived their wrappers here and kept rewriting `state.json` for hours, one of them from before the migrate fix — which is why the loss appeared to recur after each restore. Check for surviving `python.exe` children before concluding a fix did not work.
+
 ## [0.7.0] — 2026-07-31
 
 Retrieval quality is now measured rather than argued about. Until this release every ranking knob — the RRF constant, the pool multiplier, the tokenizer, the embedding model — was set by reasoning alone; the 950-test suite checked behavior but never asked whether search actually finds the right thing. The new harness scores our real ranking path against LongMemEval-S (500 questions, ~50 sessions per haystack) and reports recall@k, NDCG@10 and reciprocal rank.
