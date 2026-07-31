@@ -252,3 +252,49 @@ class TestInvalidation:
         bm25_store.invalidate()
         assert bm25_store._index is None
         assert bm25_store._docs == []
+
+
+class TestTitleIsIndexed:
+    """The title is deliberately folded into the BM25 token stream.
+
+    ``_iter_article_zones`` tokenizes ``f"{title} {zone_text}"`` while the
+    stored ``text`` is the zone body alone. Anything that rebuilds the
+    index from ``text`` silently drops title terms from search — a
+    regression no other test in this file would notice, because every
+    other fixture happens to repeat title words in the body.
+    """
+
+    def test_query_matching_only_the_title_still_retrieves(self, kb):
+        import bm25_store
+
+        _write_article(
+            kb,
+            "doctrine-uuid-param-binding",
+            title="Doctrine UUID parameter binding",
+            observed="Bind the entity identifier explicitly on foreign key comparisons.",
+        )
+        _write_article(
+            kb,
+            "unrelated",
+            title="Tailwind purge behaviour",
+            observed="Utility classes are removed at build time.",
+        )
+        bm25_store.invalidate()
+
+        # "doctrine" and "uuid" appear ONLY in the title, never in the body.
+        results = bm25_store.search_articles("doctrine uuid", limit=5)
+        assert [r["slug"] for r in results][:1] == ["concepts/doctrine-uuid-param-binding"]
+
+    def test_body_only_terms_still_retrieve(self, kb):
+        import bm25_store
+
+        _write_article(
+            kb,
+            "pooling",
+            title="Database notes",
+            observed="Postgres connection pooling exhausted the available slots.",
+        )
+        bm25_store.invalidate()
+
+        results = bm25_store.search_articles("pooling exhausted", limit=5)
+        assert [r["slug"] for r in results] == ["concepts/pooling"]

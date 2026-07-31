@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -39,11 +40,37 @@ def _default_state() -> dict:
 
 
 def load_state(state_file: Path | None = None) -> dict:
-    """Load persistent state from state.json."""
+    """Load persistent state from state.json, normalized against the defaults.
+
+    Every default key is guaranteed present. Without this, a state.json that
+    has lost a key — which happened on 2026-07-30, when the live file came
+    back missing ``ingested_sources`` — hands writers a dict they index
+    directly, and ``state["ingested_sources"][key] = entry`` raises KeyError
+    only *after* a full ingest has re-processed every source file. Existing
+    values and unknown keys are left untouched.
+    """
     path = state_file or STATE_FILE
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return _default_state()
+    if not path.exists():
+        return _default_state()
+
+    state = json.loads(path.read_text(encoding="utf-8"))
+    backfilled = []
+    for key, default in _default_state().items():
+        if key not in state:
+            state[key] = default
+            backfilled.append(key)
+
+    if backfilled:
+        # Warn rather than fail. Failing is what cost a completed ingest run;
+        # staying silent is what let 496 records disappear unnoticed for days.
+        print(
+            f"warning: {path.name} was missing {', '.join(sorted(backfilled))} — "
+            f"backfilled with empty defaults. If this is not a fresh install, "
+            f"the file lost data and a backup should be reconciled.",
+            file=sys.stderr,
+            flush=True,
+        )
+    return state
 
 
 def _merge_state(current: dict, incoming: dict) -> dict:

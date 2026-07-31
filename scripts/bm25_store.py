@@ -61,6 +61,54 @@ def tokenize(text: str) -> list[str]:
     return [t for t in tokens if len(t) >= 2]
 
 
+class TokenIndex:
+    """BM25 over an arbitrary text corpus, using this project's tokenizer.
+
+    Extracted from ``_build_index``/``search_articles`` so the retrieval
+    benchmark can score the *same* keyword ranking over a foreign corpus.
+    A reimplementation in the harness would measure the harness, not us.
+
+    ``rank`` returns ``(corpus_index, score)`` pairs, highest first, gated
+    on token presence rather than on a positive score — see the comment in
+    ``rank`` for why that distinction is load-bearing.
+    """
+
+    __slots__ = ("_bm25", "_token_sets", "_size")
+
+    def __init__(self, texts: list[str] | tuple[str, ...]) -> None:
+        tokenized = [tokenize(text) for text in texts]
+        self._size = len(tokenized)
+        self._token_sets = [set(tokens) for tokens in tokenized]
+        # BM25Okapi divides by the average document length, which is 0 when
+        # every document tokenizes to nothing — guard rather than let it
+        # raise from inside the library.
+        self._bm25 = BM25Okapi(tokenized) if any(tokenized) else None
+
+    def __len__(self) -> int:
+        return self._size
+
+    def rank(self, query: str) -> list[tuple[int, float]]:
+        """Rank the corpus against ``query``; highest score first."""
+        if self._bm25 is None:
+            return []
+        query_tokens = tokenize(query)
+        if not query_tokens:
+            return []
+        query_set = set(query_tokens)
+
+        scores = self._bm25.get_scores(query_tokens)
+        # Gate on token presence, NOT on score. BM25Okapi's IDF goes
+        # negative when a term appears in most of the corpus, so a genuine
+        # match can score below zero; "score > 0" would silently drop it.
+        hits = [
+            (position, float(score))
+            for position, score in enumerate(scores)
+            if query_set & self._token_sets[position]
+        ]
+        hits.sort(key=lambda pair: -pair[1])
+        return hits
+
+
 def _sentinel_mtime() -> float:
     """Return state.json's mtime or 0.0 if the file does not yet exist."""
     import config
@@ -131,13 +179,18 @@ def _iter_article_zones() -> list[dict[str, Any]]:
             # Fold the title into the tokenized stream so title terms
             # contribute to the BM25 score without inflating the stored
             # excerpt text.
-            tokens = tokenize(f"{title} {zone_text}")
+            index_text = f"{title} {zone_text}"
+            tokens = tokenize(index_text)
             if not tokens:
                 continue
             records.append({
                 "id": f"{slug}::{zone_name}",
                 "slug": slug,
                 "text": zone_text,
+                # The exact string the index is built from — title folded in.
+                # Kept separate from "text" (the excerpt shown to callers) so
+                # rebuilding the index can never silently drop title terms.
+                "index_text": index_text,
                 "tokens": tokens,
                 "metadata": {**base_metadata, "zone": zone_name},
             })
@@ -153,12 +206,10 @@ def _build_index() -> None:
     if not _docs:
         _index = None
         return
-    _index = BM25Okapi([d["tokens"] for d in _docs])
-    # Pre-compute a set per doc for O(1) query-token presence checks.
-    # BM25Okapi's IDF can go negative when N is small or a term appears
-    # in most docs, so we can't use "score > 0" as a match filter.
-    for doc in _docs:
-        doc["_token_set"] = set(doc["tokens"])
+    # Build from "index_text", NOT "text": the title is deliberately folded
+    # into the indexed stream and "text" omits it. Indexing "text" here
+    # silently drops every title term from search.
+    _index = TokenIndex([d["index_text"] for d in _docs])
 
 
 def _ensure_index() -> None:
@@ -220,26 +271,15 @@ def search_articles(
     if _index is None or not _docs:
         return []
 
-    query_tokens = tokenize(query)
-    if not query_tokens:
-        return []
-    query_set = set(query_tokens)
-
-    scores = _index.get_scores(query_tokens)
-    # Gate on token presence (not score) because BM25Okapi's IDF can be
-    # negative — score alone doesn't tell us whether a doc actually
-    # contained any of the query terms. BM25 still decides the rank order
-    # among the gated docs.
+    # TokenIndex applies the tokenizer and the negative-IDF presence gate;
+    # only the metadata filters are this layer's business.
     scored: list[tuple[float, dict[str, Any]]] = []
-    for score, doc in zip(scores, _docs):
-        if not (query_set & doc["_token_set"]):
-            continue
+    for position, score in _index.rank(query):
+        doc = _docs[position]
         meta = doc["metadata"]
         if not _passes_filters(meta, min_confidence, type_filter, zone_filter, include_quarantined):
             continue
-        scored.append((float(score), doc))
-
-    scored.sort(key=lambda pair: -pair[0])
+        scored.append((score, doc))
 
     out: list[dict[str, Any]] = []
     for score, doc in scored[:limit]:

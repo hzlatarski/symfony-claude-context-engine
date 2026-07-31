@@ -65,3 +65,96 @@ def test_locked_mutation_can_remove_obsolete_key(tmp_path) -> None:
     utils.update_state(lambda state: state.pop("ingested", None), path)
 
     assert "ingested" not in utils.load_state(path)
+
+
+class TestLoadStateNormalization:
+    """A state.json missing a top-level key must not crash its writers.
+
+    Observed 2026-07-30: the live state.json had lost "ingested_sources"
+    entirely. load_state returned the raw dict, and ingest.py's
+    `state["ingested_sources"][key] = entry` raised KeyError after
+    re-processing all 497 source files — so a full ingest run burned its
+    work and wrote nothing. migrate_state_schema already guarded this,
+    but load_state never called it.
+    """
+
+    def test_missing_ingested_sources_is_restored_as_empty(self, tmp_path):
+        import json
+
+        import utils
+
+        path = tmp_path / "state.json"
+        path.write_text(json.dumps({"ingested_daily": {}, "codebase_hashes": {}}), encoding="utf-8")
+
+        state = utils.load_state(path)
+        assert state["ingested_sources"] == {}
+
+    def test_every_default_key_is_present(self, tmp_path):
+        import json
+
+        import utils
+
+        path = tmp_path / "state.json"
+        path.write_text(json.dumps({"ingested_daily": {}}), encoding="utf-8")
+
+        state = utils.load_state(path)
+        for key in utils._default_state():
+            assert key in state, f"load_state dropped default key {key!r}"
+
+    def test_existing_values_are_never_overwritten(self, tmp_path):
+        import json
+
+        import utils
+
+        path = tmp_path / "state.json"
+        path.write_text(
+            json.dumps({"ingested_sources": {"a.md": {"hash": "x"}}, "query_count": 7}),
+            encoding="utf-8",
+        )
+
+        state = utils.load_state(path)
+        assert state["ingested_sources"] == {"a.md": {"hash": "x"}}
+        assert state["query_count"] == 7
+
+    def test_unknown_keys_are_preserved(self, tmp_path):
+        import json
+
+        import utils
+
+        path = tmp_path / "state.json"
+        path.write_text(json.dumps({"failed_sources": {"z.md": 1}}), encoding="utf-8")
+
+        assert utils.load_state(path)["failed_sources"] == {"z.md": 1}
+
+
+class TestLoadStateWarnsOnBackfill:
+    """Backfilling a missing key must be visible, not silent.
+
+    Inserting `{}` for an absent `ingested_sources` keeps the compiler
+    running, but it also turns evidence of a corrupt or truncated write into
+    ordinary-looking empty state. The warning is what distinguishes "new
+    install" from "your state file lost 496 records".
+    """
+
+    def test_missing_key_emits_a_warning(self, tmp_path, capsys):
+        import json
+
+        import utils
+
+        path = tmp_path / "state.json"
+        path.write_text(json.dumps({"ingested_daily": {}}), encoding="utf-8")
+
+        utils.load_state(path)
+        err = capsys.readouterr().err
+        assert "ingested_sources" in err
+
+    def test_complete_state_is_silent(self, tmp_path, capsys):
+        import json
+
+        import utils
+
+        path = tmp_path / "state.json"
+        path.write_text(json.dumps(utils._default_state()), encoding="utf-8")
+
+        utils.load_state(path)
+        assert capsys.readouterr().err == ""

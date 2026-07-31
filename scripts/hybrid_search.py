@@ -29,6 +29,46 @@ _RRF_K = 60
 _POOL_MULTIPLIER = 3
 
 
+def fuse_rankings(
+    ranked_lists: list[list[dict[str, Any]]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Fuse any number of ranked result lists via Reciprocal Rank Fusion.
+
+    Each list must be ordered best-first and each result must carry an
+    ``id``. A document appearing in several lists accumulates one
+    ``1 / (k + rank)`` contribution per list, which is what makes
+    corroboration across streams outrank a single stream's strong opinion.
+
+    The first list to yield a given id supplies the returned payload; later
+    duplicates only add score. Returns the top ``limit`` with an added
+    ``rrf_score`` field.
+
+    Extracted so the retrieval benchmark fuses through the identical code
+    path as live search — a copied constant would drift silently.
+    """
+    scores: dict[str, float] = {}
+    merged: dict[str, dict[str, Any]] = {}
+
+    for results in ranked_lists:
+        # One vote per document per stream. A stream that repeats an id would
+        # otherwise cast two votes and outrank a document both streams agreed
+        # on — the opposite of what RRF is for. The first (best) rank wins.
+        counted: set[str] = set()
+        for rank, result in enumerate(results, start=1):
+            rid = result["id"]
+            if rid in counted:
+                continue
+            counted.add(rid)
+            scores[rid] = scores.get(rid, 0.0) + 1.0 / (_RRF_K + rank)
+            merged.setdefault(rid, result)
+
+    ordered = sorted(merged.values(), key=lambda r: -scores[r["id"]])
+    for result in ordered:
+        result["rrf_score"] = scores[result["id"]]
+    return ordered[:limit]
+
+
 def search_articles(
     query: str,
     limit: int = 5,
@@ -57,25 +97,6 @@ def search_articles(
     vec_results = vector_store.search_articles(query=query, **filters)
     bm25_results = bm25_store.search_articles(query=query, **filters)
 
-    scores: dict[str, float] = {}
-    merged: dict[str, dict[str, Any]] = {}
-
-    for rank, result in enumerate(vec_results, start=1):
-        rid = result["id"]
-        scores[rid] = scores.get(rid, 0.0) + 1.0 / (_RRF_K + rank)
-        merged.setdefault(rid, result)
-
-    for rank, result in enumerate(bm25_results, start=1):
-        rid = result["id"]
-        scores[rid] = scores.get(rid, 0.0) + 1.0 / (_RRF_K + rank)
-        # Prefer whichever path has richer metadata on first-seen; we
-        # don't overwrite because both shapes carry the same slug/text.
-        merged.setdefault(rid, result)
-
-    ordered = sorted(
-        merged.values(),
-        key=lambda r: -scores[r["id"]],
-    )
-    for result in ordered:
-        result["rrf_score"] = scores[result["id"]]
-    return ordered[:limit]
+    # Vector first so its payload wins on a first-seen tie; both shapes
+    # carry the same slug/text, but the vector path has richer metadata.
+    return fuse_rankings([vec_results, bm25_results], limit)
