@@ -4,6 +4,36 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [0.7.0] — 2026-07-31
+
+Retrieval quality is now measured rather than argued about. Until this release every ranking knob — the RRF constant, the pool multiplier, the tokenizer, the embedding model — was set by reasoning alone; the 950-test suite checked behavior but never asked whether search actually finds the right thing. The new harness scores our real ranking path against LongMemEval-S (500 questions, ~50 sessions per haystack) and reports recall@k, NDCG@10 and reciprocal rank.
+
+Baseline on all 500 questions: **bm25 0.9640 / vector 0.9240 / hybrid 0.9680 recall@5**. Hybrid wins every recall cutoff, but bm25 alone edges it on both NDCG@10 and rr@20 — fusion buys coverage, not precision, at roughly 60× the runtime. Sanity controls put a random ranking at 0.180 against a 0.191 chance rate.
+
+Building it surfaced two defects in live code that the existing suite could not see, and an adversarial review round caught nine more in the harness itself before any number was trusted.
+
+### Added
+
+- **`scripts/eval_metrics.py`, `scripts/eval_corpus.py`, `scripts/eval_longmemeval.py`** — the benchmark: metrics over ranked id lists, an ephemeral per-question index, and the LongMemEval-S loader/scorer/CLI. `--mode bm25` needs no embeddings and scores all 500 in ~16s, which makes it a practical regression check after any tokenizer or ranking change.
+- **`docs/RETRIEVAL-BENCHMARK.md`** — how to run it, the baseline table, what the harness deliberately does *not* measure, and the two traps below written up so they do not recur.
+- **`bm25_store.TokenIndex` and `hybrid_search.fuse_rankings`** — extracted from previously inlined code so the benchmark shares one implementation with live search instead of copying it. A harness that copies the ranking code measures the copy.
+
+### Fixed
+
+- **The BM25 index was built from the wrong string.** `_iter_article_zones` deliberately folds the article title into the token stream while the stored `text` omits it. Rebuilding the index from `text` silently dropped every title term from live knowledge-base search — and the entire suite still passed, because every existing fixture happens to repeat title words in its body. Records now carry an explicit `index_text`.
+- **`load_state` handed writers a dict with missing keys.** It returned raw JSON with no normalization, so a state file that had lost a key crashed its writer — `ingest.py` raised `KeyError` only *after* re-processing all 497 source files, discarding the whole run. Observed live on 2026-07-30 with `ingested_sources` gone entirely and 496 records unrecoverable from the file. Defaults are now backfilled *and* a warning is printed, because silence is what let the loss go unnoticed for days.
+- **Blank documents competed for vector ranks.** They were embedded behind a placeholder on the assumption that a document with no content "cannot match anything" — false for nearest-neighbour search, which always returns a ranking. LongMemEval-S contains 1228 zero-turn sessions, about 5% of the indexed corpus. They are now excluded from the vector index and counted in the report.
+- **`fuse_rankings` let a single stream vote twice** for a repeated id, letting one retriever's duplicate outrank a document both streams agreed on. RRF assumes one rank per document per ranking.
+- **Reciprocal rank was truncated but labelled as MRR.** Results are only materialized to `depth`, so gold below it contributed 0. Reported as `rr@<depth>` now, and not comparable to published full-ranking MRR.
+- **`aggregate()` skipped absent metric keys**, dividing by a smaller denominator than the question count it reported — a partial or resumed run would have looked complete, and better than it was. Ragged input is now rejected.
+- **NDCG could exceed 1.0** when a ranking repeated a gold id, and a negative cutoff silently meant "all but the last N" rather than failing. Empty questions were accepted, becoming an arbitrary nearest-neighbour lookup under vector search.
+
+### Notes
+
+- `chromadb.EphemeralClient()` is **not** isolated — it resolves through a shared in-process system client, so two clients requesting the same collection name get the same collection. A fixed name merged all 500 haystacks into one growing pool and reported vector recall of 0.354 instead of 0.924. Anything building an ephemeral Chroma index must use a unique collection name and delete it; `TestIsolationBetweenCorpora` guards this.
+- Chunking sessions to 150-word windows before embedding lifts vector-only from 0.820 to 0.940 recall@5 on a 50-question subset — the largest single improvement measured so far, and a candidate for a real mode.
+- The LongMemEval-S dataset is not vendored (278 MB); the benchmark takes a `--dataset` path.
+
 ## [0.6.1] — 2026-07-30
 
 Hardening from a post-release verification pass over 0.6.0. That release's own suite reproduced cleanly (850 passed) and its core zero-loss mechanism verified correct — both extraction limits are `None`, the cursor advances only through included turns, and raw-index failure still blocks it. But nine claims in its two design documents were not fully satisfied by the code. Each is now fixed with a regression test; the suite is 879 passed.
