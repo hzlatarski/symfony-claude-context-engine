@@ -4,6 +4,22 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [0.8.1] — 2026-07-31
+
+0.8.0 fixed the `state.json` clobber in `ingest.py` and missed the identical copy in `compile.py`. Since the scheduler runs compile periodically, the file kept being destroyed on its own timetable — which is why the loss appeared to continue after the ingest fix had been verified working against a real run.
+
+### Fixed
+
+- **`compile.py` carried the same state-destroying migration as `ingest.py`.** Both call sites had independently written `migrated = migrate_state_schema(current); current.clear(); current.update(migrated)`, which empties the dict it is about to copy back because the helper returns its own argument.
+- **`migrate_state_schema` is now pure.** It copies its argument and never mutates it, so that idiom is correct for every caller — including ones not written yet. Two authors independently reached for the same destructive pattern, which is the argument for fixing the helper rather than the callers one at a time.
+- **One shared `migrate_state_mutator`** now lives in `utils`; the local copies in `ingest.py` and `compile.py` are gone, and a test asserts both modules reference the same object so they cannot drift apart again.
+
+Verified against the real `state.json`: startup migration preserves all 11 keys, 496 ingest records and 83 daily records where it previously left `{}`.
+
+### Notes
+
+- The earlier test pinning `migrate_state_schema` "returns the same object" encoded the *dangerous* property as if it were a contract. It is replaced by a purity assertion. A test that documents a footgun is not the same as a test that prevents one.
+
 ## [0.8.0] — 2026-07-31
 
 Two things the new retrieval benchmark turned up while it was being built: a data-loss bug that had been destroying the ingest history on every run, and a measured improvement to vector retrieval.
