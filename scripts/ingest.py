@@ -33,7 +33,7 @@ from utils import (
     file_hash,
     list_wiki_articles,
     load_sources_config,
-    migrate_state_schema,
+    migrate_state_mutator,
     read_wiki_index,
     resolve_source_files,
     update_state,
@@ -49,30 +49,6 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 # invocation, up to the 600s timeout. Give up after this many consecutive
 # failures; --all still forces a retry.
 MAX_INGEST_ATTEMPTS = 3
-
-
-def migrate_state_mutator(current: dict) -> None:
-    """Bring ``current`` up to the split-schema shape, in place.
-
-    Written defensively on purpose. The previous version was::
-
-        migrated = migrate_state_schema(current)
-        current.clear()
-        current.update(migrated)
-
-    ``migrate_state_schema`` mutates its argument and returns *the same
-    object*, so ``current.clear()`` emptied ``migrated`` as well and the
-    update copied an empty dict back. Every ingest run therefore truncated
-    state.json to ``{}`` — destroying the ingest history and triggering a
-    full re-ingest of every source at LLM cost. It cost 496 source records
-    and 83 daily records twice in one week before it was found.
-
-    Migrating a copy and writing the result back is correct whether the
-    helper mutates in place or returns a new dict.
-    """
-    migrated = migrate_state_schema(dict(current))
-    current.clear()
-    current.update(migrated)
 
 
 def source_state_key(group: SourceGroup, file_path: Path) -> str:

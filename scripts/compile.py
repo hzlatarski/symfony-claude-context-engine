@@ -29,7 +29,7 @@ from utils import (
     file_hash,
     list_raw_files,
     list_wiki_articles,
-    migrate_state_schema,
+    migrate_state_mutator,
     read_wiki_index,
     update_state,
 )
@@ -430,12 +430,7 @@ async def compile_logs(logs: list[Path], state: dict) -> list[bool]:
 
 
 def _main_unlocked(args: argparse.Namespace) -> int:
-    def migrate(current: dict) -> None:
-        migrated = migrate_state_schema(current)
-        current.clear()
-        current.update(migrated)
-
-    state = update_state(migrate)
+    state = update_state(migrate_state_mutator)
 
     # Determine which files to compile
     if args.file:

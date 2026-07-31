@@ -348,7 +348,21 @@ def migrate_state_schema(state: dict) -> dict:
     New: {"ingested_daily": {"2026-04-09.md": {...}}, "ingested_sources": {}, ...}
 
     Idempotent: safe to call multiple times.
+
+    **Pure** — returns a new dict and never mutates its argument. It used to
+    mutate in place *and* return the same object, which quietly turned the
+    obvious caller idiom into data loss::
+
+        migrated = migrate_state_schema(current)
+        current.clear()          # also empties `migrated` — same object
+        current.update(migrated) # copies nothing back
+
+    Both ``compile.py`` and ``ingest.py`` independently wrote exactly that,
+    and both destroyed state.json on every run. Purity is what makes the
+    idiom safe for every caller, including ones not written yet.
     """
+    state = dict(state)
+
     if "ingested_daily" in state:
         state.setdefault("ingested_sources", {})
         return state
@@ -360,6 +374,18 @@ def migrate_state_schema(state: dict) -> dict:
 
     state.setdefault("ingested_sources", {})
     return state
+
+
+def migrate_state_mutator(current: dict) -> None:
+    """In-place schema migration, for use as an ``update_state`` callback.
+
+    The single shared implementation. Two hand-rolled copies drifted apart
+    once already — one was fixed and the other kept destroying state.json on
+    the scheduler's timetable.
+    """
+    migrated = migrate_state_schema(current)
+    current.clear()
+    current.update(migrated)
 
 
 # ── Wikilink helpers ──────────────────────────────────────────────────

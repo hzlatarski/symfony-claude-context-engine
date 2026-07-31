@@ -176,12 +176,32 @@ class TestIngestMigrationDoesNotWipeState:
     looked empty.
     """
 
-    def test_migrate_state_schema_returns_the_same_object(self):
-        # Pinning the property the caller has to defend against.
+    def test_migrate_state_schema_does_not_mutate_its_argument(self):
+        # It used to mutate in place AND return the same object, which made
+        # the natural `clear(); update(migrated)` idiom destroy the state.
+        # Purity is what makes that idiom safe for every caller, present and
+        # future — two callers wrote it independently and both lost data.
         import utils
 
-        state = {"ingested_daily": {}, "ingested_sources": {}}
-        assert utils.migrate_state_schema(state) is state
+        original = {"ingested_daily": {"a.md": {"hash": "x"}}, "total_cost": 1.5}
+        snapshot = {"ingested_daily": {"a.md": {"hash": "x"}}, "total_cost": 1.5}
+
+        result = utils.migrate_state_schema(original)
+
+        assert original == snapshot, "migrate_state_schema mutated its input"
+        assert result is not original
+
+    def test_the_naive_clear_update_idiom_is_now_safe(self):
+        # Exactly what compile.py and ingest.py both wrote.
+        import utils
+
+        current = {"ingested_daily": {"a.md": {}}, "ingested_sources": {"b.md": {}}}
+        migrated = utils.migrate_state_schema(current)
+        current.clear()
+        current.update(migrated)
+
+        assert current["ingested_sources"] == {"b.md": {}}
+        assert current["ingested_daily"] == {"a.md": {}}
 
     def test_the_ingest_mutator_preserves_existing_records(self):
         import ingest
@@ -206,3 +226,37 @@ class TestIngestMigrationDoesNotWipeState:
         assert state["ingested_daily"] == {"2026-04-09.md": {"hash": "a"}}
         assert state["ingested_sources"] == {}
         assert "ingested" not in state
+
+
+class TestCompileMigrationDoesNotWipeState:
+    """`compile.py` carried the same clobber as `ingest.py`.
+
+    Fixing only ingest left the scheduler's periodic compile run destroying
+    state.json on its own schedule — which is why the loss appeared to
+    continue after the ingest fix was verified working.
+    """
+
+    def test_the_compile_mutator_preserves_existing_records(self):
+        import compile as compile_module
+
+        state = {
+            "ingested_daily": {"2026-04-09.md": {"hash": "a"}},
+            "ingested_sources": {"design-specs/x.md": {"hash": "b"}},
+            "codebase_hashes": {"src/App.php": "deadbeef"},
+            "total_cost": 208.18,
+        }
+        compile_module.migrate_state_mutator(state)
+
+        assert state["ingested_sources"] == {"design-specs/x.md": {"hash": "b"}}
+        assert state["ingested_daily"] == {"2026-04-09.md": {"hash": "a"}}
+        assert state["codebase_hashes"] == {"src/App.php": "deadbeef"}
+        assert state["total_cost"] == 208.18
+
+    def test_ingest_and_compile_share_one_implementation(self):
+        # Two copies drifted apart once already; one of them was never fixed.
+        import compile as compile_module
+        import ingest
+        import utils
+
+        assert ingest.migrate_state_mutator is utils.migrate_state_mutator
+        assert compile_module.migrate_state_mutator is utils.migrate_state_mutator
