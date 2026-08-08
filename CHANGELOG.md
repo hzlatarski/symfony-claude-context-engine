@@ -4,6 +4,26 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [Unreleased]
+
+Two gaps found while evaluating [Graphify](https://github.com/Graphify-Labs/graphify), [brain.md](https://github.com/mindmuxai/brain.md) and [RAG-Anything](https://github.com/HKUDS/RAG-Anything) as possible dependencies. None was worth adopting — this engine already has the NetworkX/Leiden/tree-sitter stack Graphify is built on and the Truth + Timeline format brain.md specifies, and RAG-Anything's knowledge-graph construction requires a paid LLM API, which the subscription-only billing guarantee forbids. Two of the ideas were real gaps.
+
+### Added
+
+- **Graph salience** — `scripts/salience.py` and the `get_salience` MCP tool. `get_unified_neighbors`, `find_community` and `trace_path` all require a node id you already know; nothing said which node was worth asking about. Four rankings, zero LLM cost: **hubs** (degree), **brokers** (betweenness — removing one disconnects parts of the graph), **bridges** (the *surprising connections*) and **orphans** (articles with degree ≤ 1, which neighbour- and community-based retrieval can never surface). Centrality is computed over the whole graph and only *presented* per scope, since an article's brokerage often runs through the code it cites. Cached at `knowledge/salience.json`; writes `knowledge/SALIENCE.md`.
+- **PDF ingestion** — `type: pdf` source groups. A PDF becomes text and everything downstream (dedup pre-flight, ingest prompt, `[src:]` anchors, hash checkpointing) works unchanged: no second retrieval stack, no API call. The extractor is an opt-in chain (`pymupdf4llm` → `pypdf`) rather than a dependency, because this project is MIT, PyMuPDF is AGPL, and most projects have no PDFs. Guards a character budget — `ingest.py` inlines the text into a prompt already carrying AGENTS.md, the wiki index and compiled truth — and raises on a scanned/image-only PDF instead of ingesting an empty document, which would look exactly like a successful ingest.
+
+### Fixed
+
+- **`source_handlers` built two separate registries.** `__init__.py` registered its submodules by absolute import, so `source_handlers` and `scripts.source_handlers` each initialized their own `_HANDLERS`, and the spelling that did not match the one written in `__init__` got an empty one. Relative imports register into whichever package object is being initialized. A known residual remains — two module objects still exist, so a third-party `register()` is still per-spelling — documented in the module.
+- **`communities.detect` partitioned the raw multigraph.** It dropped self-loops but kept parallel edges, so an article naming the same target in three sections pulled two clusters together three times as hard as one naming it once. It also disagreed with `salience`, which measures the simplified graph: duplicating one wikilink could delete a genuine bridge from the report while every degree in that report stayed identical. Now deduplicated — the "undirected projection" the docstring already promised. `PARTITION_VERSION` invalidates existing caches, which the graph hash alone could not do, since no node or edge endpoint changed.
+- **One unreadable source file aborted the whole ingest run.** `ingest_source_file` was called unguarded, so a handler exception escaped *before* the `record_failure` bookkeeping and took the run's other results with it. Never observed with markdown, which does not raise; the PDF handler raises by design.
+- **`reflect.py --dry-run` died with `UnicodeEncodeError`** on a cp1252 Windows console — the digest contains `⚠` and `✓`. `utils.make_stdout_unicode_safe()` now covers both report scripts.
+
+### Notes
+
+- The bridge metric took three passes against the real 8,552-node graph before it produced anything usable, and the first two looked correct in tests. Ranked on raw cross-community edge betweenness, `EntityManagerInterface::flush` came first: degree 277, its callers never call each other, and Leiden puts each in its own cluster, so *every call to flush* scored as a high-betweenness, zero-shared-neighbour, cross-community edge — the least surprising links in the codebase. A community-density ceiling removed them, but it cannot be one global value: at 3 the sinks return, and at 1 the article bucket is empty because `crosslink.py` deliberately densifies the article graph. Even per-scope ceilings turned out to be a *proxy* — deduplicating parallel edges reshuffled the partition enough to readmit `flush`. Bridges are now ranked by `surprise = edge betweenness ÷ deg(u)·deg(v)`, the configuration-model expectation: the property stated directly rather than approximated, and scale-free, so nothing needs tuning per project.
+
 ## [0.8.1] — 2026-07-31
 
 0.8.0 fixed the `state.json` clobber in `ingest.py` and missed the identical copy in `compile.py`. Since the scheduler runs compile periodically, the file kept being destroyed on its own timetable — which is why the loss appeared to continue after the ingest fix had been verified working against a real run.

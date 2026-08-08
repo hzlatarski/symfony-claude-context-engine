@@ -557,6 +557,18 @@ Both are gitignored and regenerated automatically.
 
 No API key needed - uses Claude Code's built-in credentials at `~/.claude/.credentials.json`.
 
+### Optional: PDF ingestion
+
+`type: pdf` source groups need an extractor. Neither is a hard dependency —
+this project is MIT, PyMuPDF is AGPL-or-commercial, and most projects have
+no PDFs at all. The best available is selected automatically:
+
+- `pymupdf4llm` - markdown with headings and tables (AGPL-3.0)
+- `pypdf` - plain text (BSD, pure Python)
+
+With neither installed, a PDF source raises an error naming both rather than
+ingesting nothing. See the **PDF Ingestion** section of README.md.
+
 ---
 
 ## Costs
