@@ -1405,6 +1405,36 @@ def _build_communities(min_size: int = 3, top_n: int = 10) -> str:
     return "\n".join(lines)
 
 
+def _build_salience(kind: str = "all", top_n: int = 10, scope: str = "all") -> str:
+    """Render the graph salience report, or one section of it."""
+    from scripts import salience as _sal
+    from scripts.config import KNOWLEDGE_DIR
+
+    graph = _cache.get_unified_graph()
+    report = _sal.load_or_compute(graph, cache_path=KNOWLEDGE_DIR / "salience.json")
+
+    if kind == "all":
+        return _sal.render(report, top_n=top_n, scope=scope)
+
+    valid = ("hubs", "brokers", "bridges", "orphans")
+    if kind not in valid:
+        return f"Unknown kind '{kind}'. Expected one of: all, {', '.join(valid)}."
+
+    # Render the full report, then keep only the requested section. Cheaper
+    # than a second renderer and guarantees the two can never drift.
+    full = _sal.render(report, top_n=top_n, scope=scope)
+    heading_starts = {
+        "hubs": "## Hubs", "brokers": "## Brokers",
+        "bridges": "## Bridges", "orphans": "## Orphans",
+    }
+    lines = full.split("\n")
+    start = next((i for i, ln in enumerate(lines) if ln.startswith(heading_starts[kind])), None)
+    if start is None:
+        return full
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    return "\n".join(lines[start:end]).rstrip()
+
+
 def _build_find_rationale(tag: str | None = None, query: str | None = None, limit: int = 100) -> str:
     """List inline rationale comments (WHY / HACK / TODO / @deprecated / …).
 
@@ -1630,6 +1660,37 @@ def _make_server():
         if the node is not in the graph or is below the singleton threshold.
         """
         return _build_find_community(node_id)
+
+    @server.tool()
+    def get_salience(kind: str = "all", top_n: int = 10, scope: str = "all") -> str:
+        """Rank the unified graph: what carries it, and which links are surprising.
+
+        The complement to ``get_unified_neighbors`` / ``find_community``, both
+        of which need you to already know a node id. This one tells you which
+        node to ask about.
+
+        Args:
+            kind: ``all`` (default) or one section —
+                ``hubs`` (highest degree — what the KB mostly talks about),
+                ``brokers`` (highest betweenness — the load-bearing nodes;
+                removing one disconnects parts of the graph),
+                ``bridges`` (**surprising connections** — edges joining two
+                communities that have almost no other link and whose
+                endpoints share no common neighbour; cut one and the two
+                clusters are nearly severed. Split into Article↔Article,
+                Code↔Code and Article↔Code, each with its own density
+                threshold),
+                ``orphans`` (articles with degree ≤ 1 — written but
+                unreachable by neighbour/community retrieval).
+            top_n: Rows per table (default 10).
+            scope: ``all``, ``article``, or ``code``. Centrality is always
+                computed over the whole graph and only *presented* per scope —
+                an article's brokerage often runs through the code it cites.
+
+        Zero LLM cost. Cached at ``knowledge/salience.json`` and invalidated
+        automatically when the graph changes.
+        """
+        return _build_salience(kind, top_n, scope)
 
     @server.tool()
     def find_rationale(tag: str | None = None, query: str | None = None) -> str:

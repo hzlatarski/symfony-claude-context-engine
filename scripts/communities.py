@@ -97,12 +97,15 @@ import json
 from pathlib import Path
 
 
-def _signature(graph: dict, seed: int) -> str:
+def signature(graph: dict, *, seed: int) -> str:
     """Stable hash over the graph's node IDs and edge endpoints.
 
     Edge kinds/relations/confidences don't affect Leiden output so we
     exclude them from the signature — the cache survives metadata-only
     edits, e.g. a wikilink relation tweak.
+
+    Public because ``salience`` caches against the same graph shape and
+    must not fork a second, drifting definition of "same graph".
     """
     h = hashlib.sha1()
     h.update(f"seed={seed}\n".encode())
@@ -125,7 +128,7 @@ def load_or_compute(graph: dict, *, cache_path: Path, seed: int = 42, min_size: 
            "communities": [<community records>]}``
     """
     cache_path = Path(cache_path)
-    sig = _signature(graph, seed)
+    sig = signature(graph, seed=seed)
 
     if cache_path.exists():
         try:

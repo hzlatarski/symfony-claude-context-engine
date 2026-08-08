@@ -111,6 +111,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # The digest contains ⚠ and ✓; without this, --dry-run dies with
+    # UnicodeEncodeError on a cp1252 Windows console. See utils.
+    from utils import make_stdout_unicode_safe
+    make_stdout_unicode_safe()
+
     if args.dry_run:
         print(build_lessons())
         return

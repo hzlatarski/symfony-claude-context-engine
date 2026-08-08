@@ -64,7 +64,13 @@ sources:
     category: external
     description: "External articles, research notes, web clippings"
 
-  # PDF handler (not yet implemented — uncomment when D-scope ships)
+  # PDF sources. Needs an extractor library — neither is a hard dependency
+  # because most projects have no PDFs and PyMuPDF is AGPL:
+  #     uv add pymupdf4llm   # best output (markdown, headings, tables) — AGPL-3.0
+  #     uv add pypdf         # plain text only — BSD, pure Python
+  # Long documents are truncated at a page boundary to fit the ingest prompt;
+  # raise MEMORY_COMPILER_PDF_MAX_CHARS (default 120000) to take more.
+  # Scanned/image-only PDFs yield no text and fail loudly — OCR them first.
   # - id: external-pdfs
   #   type: pdf
   #   include:

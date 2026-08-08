@@ -24,6 +24,8 @@ A long-term memory system for Claude Code, purpose-built for Symfony projects. S
 - 🔗 **Cross-project linked search** — Set `MEMORY_COMPILER_LINKED_PROJECTS=/path/a,/path/b` and pass `include_linked=true` to `search_knowledge` to fan out a single query across multiple project knowledge bases. Results are RRF-merged and tagged with the originating project name.
 - 🕮 **[Multi-agent history mining](#multi-agent-history-mining)** — `scripts/import_agent_history.py` reads other agents' transcript stores (Codex `~/.codex/sessions`, other Claude Code projects `~/.claude/projects`) and normalizes each session into ingestible markdown under `knowledge/imported/<agent>/`. Zero LLM cost, idempotent, project-scoped by `cwd`. Closes the blind spot where work done outside *this* Claude Code project never reached the knowledge base. Adapter registry is the extension point for more agents.
 - 🪢 **[Wikilink backfill](#wikilink-backfill)** — `scripts/crosslink.py` scans every article for unlinked prose mentions of other articles' titles/aliases and weaves in `[[wikilinks]]` (appended to `### Related Concepts`, graph-safe against the path-based wikilink format). Pure Python, zero LLM cost, dry-run by default. Densifies the graph that feeds `compiled-truth.md` priority scoring, `get_unified_neighbors`, and the Leiden communities.
+- 🧭 **[Graph salience](#graph-salience)** — `scripts/salience.py` + the `get_salience` MCP tool rank the unified graph so you can find *what to ask about*: **hubs** (most connected), **brokers** (highest betweenness — removing one disconnects the graph), **bridges** (the *surprising connections*: an edge joining two communities that have almost no other link and whose endpoints share no common neighbour) and **orphans** (articles with degree ≤ 1 that neighbour- and community-based retrieval can never surface). `get_unified_neighbors` and `find_community` both need a node id you already know; this is the tool that gives you one. Pure graph structure, zero LLM cost.
+- 📄 **[PDF ingestion](#pdf-ingestion)** — `type: pdf` source groups feed PDFs through the same pipeline as markdown. The extractor is an opt-in preference chain (`pymupdf4llm` → `pypdf`), so no licence or install weight is imposed on projects that have no PDFs.
 - 🗺 **[Graph exports](#graph-exports)** — `scripts/export_graph.py` serializes the unified knowledge graph to GraphML (Gephi/yEd), Neo4j Cypher, a self-contained interactive HTML viewer (vis-network), or raw JSON — for visualization beyond the Obsidian vault and MCP tools.
 - 🔁 **[Retrieval-outcome feedback](#retrieval-outcome-feedback)** — the one signal time-based decay can't capture: *was an article useful when retrieved?* The agent marks a retrieval `useful` / `dead_end` / `corrected` via `record_retrieval_outcome`; outcomes are recency-weighted and feed a `WEIGHT_FEEDBACK` axis in priority scoring. `reflect.py` digests them into `LESSONS.md`; contested articles surface in `kb_health`. Backward-compatible — unrated articles score neutral. (Graphify's `save-result`/`reflect`.)
 - 💬 **[Inline rationale nodes](#inline-rationale-nodes)** — the call-graph parser lifts `// WHY:` / `// HACK` / `// TODO` / `/** @deprecated */` comments out of `src/**/*.php` and attaches them to the annotated method/class as first-class `note:` graph nodes. Surfaced via `find_rationale` and in `get_file_deps`. Answers "where are the known hacks / deprecations?" and gives `trace_route` the *why* next to the *what*.
@@ -542,6 +544,7 @@ uv run python scripts/compile.py               # compile daily logs → articles
 uv run python scripts/import_agent_history.py --agent all   # mine Codex/Claude history → knowledge/imported/
 uv run python scripts/crosslink.py             # preview wikilink backfill (add --apply to write)
 uv run python scripts/reflect.py               # aggregate retrieval feedback → knowledge/LESSONS.md (--dry-run to preview)
+uv run python scripts/salience.py              # rank the graph → knowledge/SALIENCE.md (--dry-run, --top-n, --scope)
 uv run python scripts/export_graph.py --format graphml      # export unified graph (graphml|cypher|html|json)
 uv run python scripts/ingest.py                # compile source files → articles
 uv run python scripts/ingest.py --all          # force re-ingest (per-file hash checkpoint still saves rerun cost)
@@ -741,6 +744,77 @@ uv run python scripts/crosslink.py --apply    # write changes
 Because this repo's wikilink syntax is **path-based** (`[[concepts/foo]]`) and does not support `[[slug|display]]` pipe aliases (a pipe would corrupt the graph node id), the pass does **not** rewrite prose inline. Instead, when article A mentions article B it appends `[[B-slug]]` to A's `### Related Concepts` section (creating the section under `## Truth` if absent). Matching is deliberately conservative — case-insensitive whole-word, titles/aliases longer than three characters, longest-first, and never inside frontmatter, fenced or inline code, existing wikilinks, or markdown links. It never links an article to itself or duplicates an existing link.
 
 A denser graph directly improves `compiled-truth.md` priority scoring (cross-linkedness is a weight), `get_unified_neighbors` traversal, and Leiden community detection.
+
+---
+
+## Graph Salience
+
+`get_unified_neighbors`, `find_community` and `trace_path` all require a node id you already know. Nothing told you which node was worth asking about. `salience.py` ranks the graph four ways:
+
+```bash
+uv run python scripts/salience.py                      # → knowledge/SALIENCE.md
+uv run python scripts/salience.py --dry-run --top-n 20 # print instead
+uv run python scripts/salience.py --scope article      # articles only
+```
+
+```jsonc
+// agent → symfony-code-intel MCP
+get_salience { "kind": "bridges", "scope": "article", "top_n": 10 }
+```
+
+| Ranking | Measure | Answers |
+|---|---|---|
+| **Hubs** | degree | What does this knowledge base mostly talk about? |
+| **Brokers** | betweenness centrality | Which nodes are load-bearing? Removing one disconnects parts of the graph. A broker need not be a hub — few links, but they are the only links. |
+| **Bridges** | edge betweenness, filtered | **The surprising connections.** An edge joining two communities that have almost no other link, whose endpoints share no common neighbour. Nothing else in the graph implies it. |
+| **Orphans** | degree ≤ 1 | Which articles did the compiler write that nothing links to? Neighbour- and community-based retrieval can never reach them. |
+
+Centrality is computed over the **whole** graph and only *presented* per scope — an article's brokerage often runs through the code it cites, so filtering the graph to articles first would change every number.
+
+Two filters do the real work in **Bridges**, and both were added because the naive version was useless:
+
+- **No common neighbour.** A triangle-closing edge is corroborated by the rest of the graph, not surprising.
+- **A community-density ceiling**, per section. Without it the ranking is swamped by universal sinks: `EntityManagerInterface::flush` has degree 277, its callers never call each other, and Leiden puts each in its own cluster — so *every call to flush* scored as a high-betweenness, zero-shared-neighbour, cross-community edge. Those are the least surprising links in the codebase. The ceilings differ by section (`code` 1, `article` 3) because the two graphs have very different densities: at 3 the sinks come back, and at 1 the article bucket is empty, since `crosslink.py` deliberately densifies the article graph. Override with `--max-pair-edges`.
+
+Zero LLM cost. Cached at `knowledge/salience.json`, invalidated automatically when the graph changes or the ranking logic is revised.
+
+---
+
+## PDF Ingestion
+
+The ingest pipeline was markdown-only, so any PDF in a project — compliance docs, customer curricula, specs delivered as PDF, papers — was invisible to the knowledge base. A `type: pdf` source group closes that:
+
+```yaml
+- id: external-pdfs
+  type: pdf
+  include:
+    - "sources/pdfs/*.pdf"
+  category: research
+  description: "Research papers and PDF documents"
+```
+
+A PDF becomes text and everything downstream — dedup pre-flight, the ingest prompt, `[src:]` anchors, per-file hash checkpointing — works unchanged. There is no second retrieval stack and no API call.
+
+**Install an extractor.** Neither is a hard dependency: this project is MIT, PyMuPDF is AGPL-or-commercial, and most projects have no PDFs at all.
+
+| Library | Output | Licence |
+|---|---|---|
+| `pymupdf4llm` | markdown with headings and tables | AGPL-3.0 (or commercial) |
+| `pypdf` | plain text | BSD, pure Python |
+
+```bash
+uv add pymupdf4llm    # preferred
+uv add pypdf          # lighter, permissive
+```
+
+The best available is selected automatically; with neither installed you get an error naming both, not a silent empty ingest.
+
+**Two guards**, because both failure modes are silent and expensive:
+
+- **Character budget** — `ingest.py` inlines the extracted text into a prompt that already carries AGENTS.md, the wiki index and compiled truth. An unbounded 300-page PDF blows the context window and fails opaquely. Content is truncated at a page boundary with a visible `[TRUNCATED]` notice; raise `MEMORY_COMPILER_PDF_MAX_CHARS` (default 120,000) to take more.
+- **Empty extraction** — a scanned, image-only PDF yields no text. That raises, rather than ingesting an empty document, because an empty ingest looks exactly like a successful one. OCR the file first.
+
+Provenance (`extractor`, `pages`, `pages_extracted`, `truncated`) is attached to the document's frontmatter.
 
 ---
 

@@ -206,6 +206,26 @@ def file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
+def make_stdout_unicode_safe() -> None:
+    """Stop ``print()`` of non-ASCII from killing a CLI script on Windows.
+
+    Every report this repo generates uses ``—``, ``·``, ``≤``, ``⚠``. Files
+    are written with ``encoding="utf-8"`` so they are fine, but Python picks
+    the console codepage for ``sys.stdout`` — cp1252 on a default Windows
+    shell — and a single em-dash raises ``UnicodeEncodeError`` mid-print.
+    The traceback makes a working report look like a crashed script.
+
+    Call once at the top of any ``main()`` that prints report text. No-op
+    where stdout is already UTF-8 or is not reconfigurable (a pipe wrapped
+    by a harness, a captured buffer under pytest).
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 # ── Slug / naming ─────────────────────────────────────────────────────
 
 def slugify(text: str) -> str:

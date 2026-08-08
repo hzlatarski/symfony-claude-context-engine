@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from source_handlers import SourceDocument, register
+from . import SourceDocument, register
 
 
 def extract(path: Path) -> SourceDocument:
