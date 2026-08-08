@@ -43,6 +43,13 @@ from . import SourceDocument, register
 # pre-flight block.
 DEFAULT_MAX_CHARS = 120_000
 
+# Below this a "successful" ingest is meaningless. The oversized-first-page
+# path hard-cuts to the budget, so a budget of 1 yields the single character
+# "[" — non-empty, so it passes the empty guard, gets sent to the compiler,
+# and the source file is then recorded as ingested and never revisited. Any
+# budget under this is treated as a misconfiguration and ignored.
+MIN_MAX_CHARS = 1_000
+
 
 def _max_chars() -> int:
     """Character budget, overridable via ``MEMORY_COMPILER_PDF_MAX_CHARS``."""
@@ -53,7 +60,7 @@ def _max_chars() -> int:
         value = int(raw)
     except ValueError:
         return DEFAULT_MAX_CHARS
-    return value if value > 0 else DEFAULT_MAX_CHARS
+    return value if value >= MIN_MAX_CHARS else DEFAULT_MAX_CHARS
 
 
 def _pages_via_pymupdf4llm(path: Path) -> list[str]:

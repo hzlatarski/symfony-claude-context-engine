@@ -13,6 +13,11 @@ Public surface:
 """
 from __future__ import annotations
 
+# Bump whenever ``detect`` changes what it treats as "the graph" or how it
+# partitions it. Mixed into the cache signature — see signature().
+# 2: parallel edges are deduplicated (v1 fed Leiden the raw multigraph).
+PARTITION_VERSION = 2
+
 
 def detect(graph: dict, *, seed: int = 42, min_size: int = 2) -> list[dict]:
     """Return one record per community in the unified graph.
@@ -39,13 +44,24 @@ def detect(graph: dict, *, seed: int = 42, min_size: int = 2) -> list[dict]:
         return []
 
     id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
-    ig_edges = []
+    # Deduplicate parallel edges as well as self-loops. This is the
+    # "undirected projection" the docstring promises, and it matters twice
+    # over. Modularity counts every parallel copy, so an article that happens
+    # to name the same target in three sections would pull those two clusters
+    # together three times as hard as one that names it once — an artefact of
+    # prose, not a stronger semantic tie. And ``salience`` measures degree and
+    # betweenness on the simplified graph: leaving duplicates in here made the
+    # two disagree about what the graph *is*, so a duplicated wikilink could
+    # silently merge two communities and delete a genuine bridge from the
+    # report while every degree in that report stayed the same.
+    seen: set[tuple[int, int]] = set()
     for e in graph["edges"]:
         src = id_to_idx.get(e["from"])
         dst = id_to_idx.get(e["to"])
         if src is None or dst is None or src == dst:
             continue
-        ig_edges.append((src, dst))
+        seen.add((src, dst) if src < dst else (dst, src))
+    ig_edges = sorted(seen)
 
     g = ig.Graph(n=len(node_ids), edges=ig_edges, directed=False)
     partition = la.find_partition(
@@ -106,8 +122,15 @@ def signature(graph: dict, *, seed: int) -> str:
 
     Public because ``salience`` caches against the same graph shape and
     must not fork a second, drifting definition of "same graph".
+
+    ``PARTITION_VERSION`` is mixed in so that a change to what ``detect``
+    considers "the graph" invalidates caches written by the old rule. The
+    graph hash alone cannot do that: dropping parallel edges changed the
+    partition without changing a single node or edge endpoint, so every
+    existing cache file would have kept serving the old assignment forever.
     """
     h = hashlib.sha1()
+    h.update(f"partition={PARTITION_VERSION}\n".encode())
     h.update(f"seed={seed}\n".encode())
     for nid in sorted(graph["nodes"]):
         h.update(f"n:{nid}\n".encode())

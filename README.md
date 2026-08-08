@@ -766,15 +766,16 @@ get_salience { "kind": "bridges", "scope": "article", "top_n": 10 }
 |---|---|---|
 | **Hubs** | degree | What does this knowledge base mostly talk about? |
 | **Brokers** | betweenness centrality | Which nodes are load-bearing? Removing one disconnects parts of the graph. A broker need not be a hub — few links, but they are the only links. |
-| **Bridges** | edge betweenness, filtered | **The surprising connections.** An edge joining two communities that have almost no other link, whose endpoints share no common neighbour. Nothing else in the graph implies it. |
+| **Bridges** | `surprise` = edge betweenness ÷ deg(u)·deg(v) | **The surprising connections.** An edge joining two communities that have almost no other link, whose endpoints share no common neighbour. Nothing else in the graph implies it. |
 | **Orphans** | degree ≤ 1 | Which articles did the compiler write that nothing links to? Neighbour- and community-based retrieval can never reach them. |
 
 Centrality is computed over the **whole** graph and only *presented* per scope — an article's brokerage often runs through the code it cites, so filtering the graph to articles first would change every number.
 
-Two filters do the real work in **Bridges**, and both were added because the naive version was useless:
+Three things do the real work in **Bridges**, each added because the version before it produced garbage on the real graph:
 
 - **No common neighbour.** A triangle-closing edge is corroborated by the rest of the graph, not surprising.
-- **A community-density ceiling**, per section. Without it the ranking is swamped by universal sinks: `EntityManagerInterface::flush` has degree 277, its callers never call each other, and Leiden puts each in its own cluster — so *every call to flush* scored as a high-betweenness, zero-shared-neighbour, cross-community edge. Those are the least surprising links in the codebase. The ceilings differ by section (`code` 1, `article` 3) because the two graphs have very different densities: at 3 the sinks come back, and at 1 the article bucket is empty, since `crosslink.py` deliberately densifies the article graph. Override with `--max-pair-edges`.
+- **A community-density ceiling**, per section. Ranked on raw edge betweenness the list is swamped by universal sinks: `EntityManagerInterface::flush` has degree 277, its callers never call each other, and Leiden puts each in its own cluster — so *every call to flush* scored as a high-betweenness, zero-shared-neighbour, cross-community edge. Those are the least surprising links in the codebase. The ceilings differ by section (`code` 1, `article` 3) because the two graphs have very different densities: the article bucket is empty at 1, since `crosslink.py` deliberately densifies it. Override with `--max-pair-edges`.
+- **Degree normalization** — the ranking itself. `surprise = edge betweenness ÷ deg(u)·deg(v)`: traffic carried, divided by the configuration-model expectation that the edge exists at all. The community ceiling turned out to be only a *proxy* for "don't rank utilities" — it depends on where Leiden happens to cut, and deduplicating parallel edges was enough to let `flush` back in. This is the property stated directly, and it is scale-free, so no threshold needs tuning per project.
 
 Zero LLM cost. Cached at `knowledge/salience.json`, invalidated automatically when the graph changes or the ranking logic is revised.
 

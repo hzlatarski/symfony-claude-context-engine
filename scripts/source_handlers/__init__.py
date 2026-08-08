@@ -50,6 +50,14 @@ def available_types() -> list[str]:
 # every get_handler() call against it raises "no handler registered".
 # ``from . import`` resolves against __package__, so both spellings register.
 #
+# KNOWN LIMITATION: this fixes the built-ins, not the underlying split. Python
+# still creates two distinct module objects with two ``_HANDLERS`` dicts and
+# two ``SourceDocument`` classes. A *third-party* ``register()`` against one
+# spelling stays invisible to the other, and ``isinstance(doc, SourceDocument)``
+# is False across regimes. Nothing in-tree does either. If out-of-tree handlers
+# ever land, the real fix is to alias one spelling to the other in
+# ``sys.modules`` at startup rather than to register twice.
+#
 # ``pdf`` registers unconditionally — its extractor libraries are optional and
 # resolved lazily inside extract(), so importing it costs nothing and a project
 # without them still gets "pdf" in available_types() plus an actionable error

@@ -153,6 +153,41 @@ def test_universal_sink_is_not_a_bridge():
     assert all("SINK" not in (br["from"], br["to"]) for br in _all_bridges(report))
 
 
+def test_high_degree_utility_ranks_below_a_specific_pair():
+    """Raw edge betweenness put universal sinks first; `surprise` must not.
+
+    The community-density ceiling alone was not enough — it depends on how
+    Leiden happens to cut the graph, and after parallel-edge dedup it let
+    ``EntityManagerInterface::flush`` back into the real report. The
+    degree normalization is what actually encodes "an edge into something
+    everything calls is not surprising".
+
+    SINK is reachable from both clusters; SPECIFIC is a low-degree pair.
+    """
+    a = ["A1", "A2", "A3", "A4"]
+    edges = [(x, y) for i, x in enumerate(a) for y in a[i + 1:]]
+    edges += [(n, "SINK") for n in a]          # SINK: high degree
+    edges += [("SINK", "S2"), ("SINK", "S3"), ("SINK", "S4"), ("SINK", "S5")]
+    edges += [("A1", "SPECIFIC"), ("SPECIFIC", "SP2")]  # low-degree pair
+    report = salience.compute(_graph(
+        a + ["SINK", "S2", "S3", "S4", "S5", "SPECIFIC", "SP2"], edges),
+        max_pair_edges=99,
+    )
+    ranked = [(b["from"], b["to"]) for b in _all_bridges(report)]
+    sink_ranks = [i for i, p in enumerate(ranked) if "SINK" in p]
+    specific_ranks = [i for i, p in enumerate(ranked) if "SPECIFIC" in p]
+    assert specific_ranks, "the low-degree pair should be reported at all"
+    assert not sink_ranks or min(specific_ranks) < min(sink_ranks), (
+        f"a high-degree utility outranked a specific pair: {ranked[:4]}"
+    )
+
+
+def test_surprise_is_betweenness_normalized_by_endpoint_degrees():
+    bridge = _all_bridges(salience.compute(_barbell()))[0]
+    # Barbell joint: both endpoints have degree 4 (3 clique + the bridge).
+    assert bridge["surprise"] == round(bridge["edge_betweenness"] / (4 * 4), 3)
+
+
 def test_max_pair_edges_admits_weaker_bridges_when_raised():
     """Two clusters joined by exactly 2 edges: excluded at 1, included at 2."""
     a, b = ["A1", "A2", "A3"], ["B1", "B2", "B3"]
@@ -309,14 +344,16 @@ def test_load_or_compute_reuses_cache_on_unchanged_graph(tmp_path):
     first = salience.load_or_compute(graph, cache_path=cache)
     assert cache.exists()
 
-    # Corrupt the stored report but keep the signature: a cache hit must
-    # return the stored value, proving it did not silently recompute.
+    # Empty the stored bridges but keep both the signature and the report's
+    # shape: a cache hit must return the stored value, proving it did not
+    # silently recompute. (The shape must stay valid or _is_valid_report
+    # rejects it — which is a different code path, tested separately.)
     data = json.loads(cache.read_text(encoding="utf-8"))
-    data["report"]["bridges"] = []
+    data["report"]["bridges"] = {"article": [], "code": [], "mixed": []}
     cache.write_text(json.dumps(data), encoding="utf-8")
 
-    assert salience.load_or_compute(graph, cache_path=cache)["bridges"] == []
-    assert first["bridges"]  # the real computation did find one
+    assert _all_bridges(salience.load_or_compute(graph, cache_path=cache)) == []
+    assert _all_bridges(first)  # the real computation did find one
 
 
 def test_load_or_compute_recomputes_when_graph_changes(tmp_path):
@@ -328,6 +365,58 @@ def test_load_or_compute_recomputes_when_graph_changes(tmp_path):
     graph["edges"].append({"from": "A2", "to": "NEW", "kind": "wikilink"})
     report = salience.load_or_compute(graph, cache_path=cache)
     assert "NEW" in [o["id"] for o in report["orphans"]]
+
+
+def test_cache_invalidates_on_node_metadata_the_report_renders(tmp_path):
+    """Regression: the key hashed topology only, but the report shows metadata.
+
+    ``communities.signature`` covers node ids and edges — right for Leiden,
+    which reads nothing else. This report buckets by ``kind``, prints
+    ``label`` and shows an article's ``type``. Retitling an article moves no
+    edge, so the topology hash was unchanged and the stale label was served
+    forever.
+    """
+    cache = tmp_path / "salience.json"
+    graph = _barbell()
+    salience.load_or_compute(graph, cache_path=cache)
+
+    graph["nodes"]["A1"]["label"] = "Renamed Article"
+    report = salience.load_or_compute(graph, cache_path=cache)
+    labels = [r["label"] for r in report["hubs"]["article"]]
+    assert "Renamed Article" in labels
+
+    graph["nodes"]["A1"]["kind"] = "symbol"
+    report = salience.load_or_compute(graph, cache_path=cache)
+    assert "A1" not in [r["id"] for r in report["hubs"]["article"]]
+
+
+def test_duplicate_edges_do_not_delete_a_genuine_bridge(tmp_path):
+    """Regression: salience simplified the graph, communities.detect did not.
+
+    Degree and betweenness were measured on the simple graph while Leiden
+    partitioned the multigraph. Duplicating the barbell's sole bridge pulled
+    the two cliques into one community, so the bridge vanished from the
+    report — while every degree in that same report stayed identical.
+    """
+    plain = salience.compute(_barbell())
+    duped = _barbell()
+    duped["edges"] += [{"from": "A1", "to": "B1", "kind": "wikilink"}] * 30
+    assert _all_bridges(salience.compute(duped)) == _all_bridges(plain)
+
+
+def test_load_or_compute_rejects_a_structurally_invalid_cached_report(tmp_path):
+    """Valid JSON is not a valid report — render() would crash on it."""
+    cache = tmp_path / "salience.json"
+    graph = _barbell()
+    salience.load_or_compute(graph, cache_path=cache)
+
+    data = json.loads(cache.read_text(encoding="utf-8"))
+    data["report"] = None  # signature still matches
+    cache.write_text(json.dumps(data), encoding="utf-8")
+
+    report = salience.load_or_compute(graph, cache_path=cache)
+    assert salience.render(report)  # must not raise
+    assert len(_all_bridges(report)) == 1
 
 
 def test_load_or_compute_survives_a_corrupt_cache(tmp_path):

@@ -109,19 +109,25 @@ def test_parser_failure_is_reported_with_the_backend_name(monkeypatch, fake_pdf)
 # ── character budget ──────────────────────────────────────────────────
 
 
+# Budgets must clear MIN_MAX_CHARS or they are ignored as misconfiguration,
+# so these use page sizes scaled to the floor rather than toy values.
+_BUDGET = pdf_handler.MIN_MAX_CHARS
+_PAGE = _BUDGET // 2 + 100  # two pages cannot both fit
+
+
 def test_budget_truncates_on_a_page_boundary(monkeypatch, fake_pdf):
-    monkeypatch.setenv("MEMORY_COMPILER_PDF_MAX_CHARS", "60")
-    _use_pages(monkeypatch, ["A" * 40, "B" * 40, "C" * 40])
+    monkeypatch.setenv("MEMORY_COMPILER_PDF_MAX_CHARS", str(_BUDGET))
+    _use_pages(monkeypatch, ["A" * _PAGE, "B" * _PAGE, "C" * _PAGE])
     doc = pdf_handler.extract(fake_pdf)
     assert doc.frontmatter["pages_extracted"] == 1
     assert doc.frontmatter["truncated"] is True
-    assert "B" * 40 not in doc.content  # no half-fed page
+    assert "B" * _PAGE not in doc.content  # no half-fed page
     assert "[TRUNCATED]" in doc.content
 
 
 def test_truncation_notice_names_the_env_var(monkeypatch, fake_pdf):
-    monkeypatch.setenv("MEMORY_COMPILER_PDF_MAX_CHARS", "60")
-    _use_pages(monkeypatch, ["A" * 40, "B" * 40])
+    monkeypatch.setenv("MEMORY_COMPILER_PDF_MAX_CHARS", str(_BUDGET))
+    _use_pages(monkeypatch, ["A" * _PAGE, "B" * _PAGE])
     doc = pdf_handler.extract(fake_pdf)
     assert "MEMORY_COMPILER_PDF_MAX_CHARS" in doc.content
     assert "first 1 of 2 pages" in doc.content
@@ -129,8 +135,8 @@ def test_truncation_notice_names_the_env_var(monkeypatch, fake_pdf):
 
 def test_single_oversized_page_is_hard_cut_rather_than_dropped(monkeypatch, fake_pdf):
     """Returning nothing here would trip the empty guard and lose the document."""
-    monkeypatch.setenv("MEMORY_COMPILER_PDF_MAX_CHARS", "50")
-    _use_pages(monkeypatch, ["X" * 500])
+    monkeypatch.setenv("MEMORY_COMPILER_PDF_MAX_CHARS", str(_BUDGET))
+    _use_pages(monkeypatch, ["X" * (_BUDGET * 5)])
     doc = pdf_handler.extract(fake_pdf)
     assert doc.frontmatter["truncated"] is True
     assert doc.frontmatter["pages_extracted"] == 1
@@ -138,11 +144,11 @@ def test_single_oversized_page_is_hard_cut_rather_than_dropped(monkeypatch, fake
 
 
 def test_content_stays_within_budget_plus_notice(monkeypatch, fake_pdf):
-    monkeypatch.setenv("MEMORY_COMPILER_PDF_MAX_CHARS", "100")
-    _use_pages(monkeypatch, ["A" * 80, "B" * 80, "C" * 80])
+    monkeypatch.setenv("MEMORY_COMPILER_PDF_MAX_CHARS", str(_BUDGET))
+    _use_pages(monkeypatch, ["A" * _PAGE, "B" * _PAGE, "C" * _PAGE])
     doc = pdf_handler.extract(fake_pdf)
     body = doc.content.split("[TRUNCATED]")[0]
-    assert len(body) <= 100
+    assert len(body) <= _BUDGET
 
 
 def test_default_budget_applies_when_env_var_is_absent(monkeypatch):
@@ -154,6 +160,57 @@ def test_default_budget_applies_when_env_var_is_absent(monkeypatch):
 def test_invalid_budget_falls_back_to_the_default(monkeypatch, bad):
     monkeypatch.setenv("MEMORY_COMPILER_PDF_MAX_CHARS", bad)
     assert pdf_handler._max_chars() == pdf_handler.DEFAULT_MAX_CHARS
+
+
+@pytest.mark.parametrize("tiny", ["1", "10", "999"])
+def test_degenerate_budget_is_ignored(monkeypatch, tiny):
+    """Regression: budget=1 hard-cut an oversized page to the single char "[".
+
+    That is non-empty, so it passed the empty guard, reached the compiler as
+    the entire document, and marked the source ingested — permanently, since
+    ingest keys off the file hash.
+    """
+    monkeypatch.setenv("MEMORY_COMPILER_PDF_MAX_CHARS", tiny)
+    assert pdf_handler._max_chars() == pdf_handler.DEFAULT_MAX_CHARS
+
+
+def test_hard_cut_page_still_carries_real_text(monkeypatch, fake_pdf):
+    monkeypatch.setenv("MEMORY_COMPILER_PDF_MAX_CHARS", str(pdf_handler.MIN_MAX_CHARS))
+    _use_pages(monkeypatch, ["Z" * 50_000])
+    doc = pdf_handler.extract(fake_pdf)
+    assert doc.content.count("Z") > 100, "cut kept the marker but lost the page text"
+
+
+# ── the ingest loop must survive a raising handler ────────────────────
+
+
+def test_a_raising_handler_fails_one_file_not_the_whole_batch(monkeypatch, fake_pdf):
+    """Regression: an unguarded call let one bad PDF abort the entire run.
+
+    The PDF handler raises by design — scanned, encrypted, or no extractor
+    installed. Before the guard, that exception escaped the per-file loop
+    *before* record_failure ran, so the run died and the files it had
+    already ingested were never reconciled.
+    """
+    import ingest
+
+    def _boom(_group, _path, _state):
+        raise ValueError("No extractable text in scanned.pdf")
+
+    monkeypatch.setattr(ingest, "ingest_source_file", _boom)
+    cost, ok = ingest.ingest_one_safely(object(), fake_pdf, {})
+    assert (cost, ok) == (0.0, False)
+
+
+def test_a_raising_handler_reports_the_reason(monkeypatch, fake_pdf, capsys):
+    import ingest
+
+    def _boom(_group, _path, _state):
+        raise RuntimeError("PDF ingestion needs an extractor")
+
+    monkeypatch.setattr(ingest, "ingest_source_file", _boom)
+    ingest.ingest_one_safely(object(), fake_pdf, {})
+    assert "PDF ingestion needs an extractor" in capsys.readouterr().err
 
 
 # ── extractor selection ───────────────────────────────────────────────

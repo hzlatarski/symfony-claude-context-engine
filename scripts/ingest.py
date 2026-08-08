@@ -426,6 +426,28 @@ architectural patterns.
     return 0.0, True
 
 
+def ingest_one_safely(group, file_path: Path, state: dict) -> tuple[float, bool]:
+    """Run one file's ingest, converting any exception into a normal failure.
+
+    One unreadable file must not abort the batch. Source handlers are
+    allowed — expected — to raise: the PDF handler raises on a scanned,
+    encrypted or corrupt document, and on "no extractor installed at all".
+    With markdown that essentially never happened, so the call site was
+    unguarded, and a single bad file would kill the whole run *before* the
+    caller's ``record_failure`` bookkeeping — losing the run's other results
+    and leaving nothing to explain why. Treated here as this file failing,
+    exactly like an empty extraction, so the loop continues and the failure
+    is recorded and retried next run.
+
+    Returns ``(cost, succeeded)``.
+    """
+    try:
+        return asyncio.run(ingest_source_file(group, file_path, state))
+    except Exception as exc:
+        print(f"  ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 0.0, False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Ingest source files into knowledge base")
     parser.add_argument("--all", action="store_true", help="Force re-ingest all sources")
@@ -498,7 +520,7 @@ def main():
             total_cost=total_cost,
             started_at=started,
         )
-        cost, ok = asyncio.run(ingest_source_file(group, fpath, state))
+        cost, ok = ingest_one_safely(group, fpath, state)
         total_cost += cost
         key = source_state_key(group, fpath)
         if ok:

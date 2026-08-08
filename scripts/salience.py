@@ -13,11 +13,13 @@ Four rankings, all pure graph structure — zero LLM cost:
 * **Brokers** — highest *betweenness centrality*. The load-bearing nodes:
   removing one disconnects parts of the graph from each other. A node can
   be a broker without being a hub (few links, but they are the only links).
-* **Bridges** — the *surprising connections*. Edges with high edge-
-  betweenness whose endpoints sit in **different Leiden communities** and
-  share **no common neighbours**. These are the links that join two
-  otherwise-separate areas of the knowledge base — the ones worth reading
-  because nothing else in the graph implies them.
+* **Bridges** — the *surprising connections*. Edges whose endpoints sit in
+  **different Leiden communities** that have almost no other link, and which
+  share **no common neighbours**. Ranked by ``surprise`` — edge betweenness
+  divided by ``deg(u)·deg(v)``, the configuration-model expectation — so
+  that a utility everything calls cannot crowd out the real bridges. These
+  are the links joining two otherwise-separate areas of the knowledge base:
+  worth reading because nothing else in the graph implies them.
 * **Orphans** — articles with degree ≤ 1. The compiler wrote them and
   (almost) nothing links to them, so neighbour- and community-based
   retrieval will never surface them. The actionable inverse of hubs.
@@ -50,7 +52,8 @@ from pathlib import Path
 # 2: bridges gained the max_pair_edges filter (v1 ranked universal sinks first).
 # 3: bridges became a per-scope dict (v2 was a flat list; render() now indexes it).
 # 4: max_pair_edges became per-scope (one global value could not serve both).
-CACHE_VERSION = 4
+# 5: bridges rank by degree-normalized "surprise", not raw edge betweenness.
+CACHE_VERSION = 5
 
 # How many edges may join two communities before an edge between them stops
 # counting as a "bridge". These differ because the two graphs have genuinely
@@ -280,10 +283,19 @@ def compute(
             "joins": f"{community_size.get(cu, 0)}<->{community_size.get(cv, 0)}",
             "pair_edges": pair_count,
             "edge_betweenness": round(score, 2),
+            # Configuration-model normalization. Under a null model that
+            # preserves degrees, the expected number of edges between u and v
+            # is proportional to deg(u)·deg(v) — so raw betweenness is
+            # systematically inflated for any edge touching a high-degree
+            # node, and a universal sink's every edge outranks every genuine
+            # bridge. Dividing by that expectation asks the right question:
+            # how much traffic does this edge carry *relative to how
+            # unremarkable its existence is*. Scale-free, no tuned constant.
+            "surprise": round(score / (degrees[u] * degrees[v]), 3),
             "_bucket": bucket_name,
         })
 
-    collected.sort(key=lambda b: (-b["edge_betweenness"], b["from"], b["to"]))
+    collected.sort(key=lambda b: (-b["surprise"], b["from"], b["to"]))
     # Cap *per bucket*, not globally. The code graph is an order of magnitude
     # denser than the article graph, so one global cap starves article↔article
     # bridges out of the report entirely — and those are the ones a knowledge
@@ -327,12 +339,39 @@ def compute(
 
 
 def signature(graph: dict, *, seed: int) -> str:
-    """Cache key: graph shape + seed + ranking-logic version.
+    """Cache key: graph shape + rendered node metadata + seed + logic version.
+
+    ``communities.signature`` covers topology only — correct for Leiden,
+    which reads nothing else. It is *not* sufficient here: this report
+    buckets by ``kind``, displays ``label``, and shows an article's ``type``,
+    none of which change the graph's shape. Renaming an article's title or
+    correcting its type would otherwise reuse a cache that still shows the
+    old value, indefinitely, because the topology hash never moved.
 
     ``CACHE_VERSION`` is in the key so a change to the ranking logic can
     never be served from a cache the old logic wrote.
     """
-    return f"{CACHE_VERSION}:{_communities().signature(graph, seed=seed)}"
+    import hashlib
+
+    h = hashlib.sha1()
+    for nid in sorted(graph["nodes"]):
+        meta = graph["nodes"][nid]
+        h.update(
+            f"{nid}|{meta.get('kind', '')}|{meta.get('label', '')}"
+            f"|{meta.get('type', '')}\n".encode()
+        )
+    topology = _communities().signature(graph, seed=seed)
+    return f"{CACHE_VERSION}:{topology}:{h.hexdigest()}"
+
+
+def _is_valid_report(report: object) -> bool:
+    """True if ``report`` has the shape ``render`` and callers index into."""
+    if not isinstance(report, dict):
+        return False
+    for key in ("totals", "hubs", "brokers", "bridges"):
+        if not isinstance(report.get(key), dict):
+            return False
+    return isinstance(report.get("orphans"), list)
 
 
 def load_or_compute(
@@ -364,8 +403,15 @@ def load_or_compute(
                 and data.get("cap") == cap
                 and data.get("max_pair_edges") == thresholds
             ):
-                return data["report"]
-        except (json.JSONDecodeError, KeyError, OSError):
+                report = data["report"]
+                # Well-formed JSON is not a well-formed report. A file whose
+                # "report" is null or a list still parses and still matches
+                # the signature, and would be handed to render(), which
+                # indexes it — taking down get_salience with an
+                # AttributeError instead of quietly recomputing.
+                if _is_valid_report(report):
+                    return report
+        except (json.JSONDecodeError, KeyError, TypeError, OSError):
             pass  # corrupt cache — recompute
 
     report = compute(graph, seed=seed, cap=cap, max_pair_edges=thresholds)
@@ -442,13 +488,15 @@ def render(report: dict, *, top_n: int = 10, scope: str = "all") -> str:
     thresholds = report.get("max_pair_edges", DEFAULT_MAX_PAIR_EDGES)
     lines += ["## Bridges — surprising connections", "",
               "_An edge joining two communities that have almost no other link, "
-              "whose endpoints share no common neighbour, ranked by edge "
-              "betweenness. Cut it and the two clusters are nearly severed — "
-              "which is what makes the link worth reading. `Joins` gives the two "
-              "community sizes. The per-section threshold is the maximum number "
-              "of edges allowed between the two communities; it differs by "
-              "section because the code graph is far denser than the article "
-              "graph._", ""]
+              "whose endpoints share no common neighbour. Cut it and the two "
+              "clusters are nearly severed — which is what makes the link worth "
+              "reading. Ranked by **surprise** = edge betweenness ÷ "
+              "deg(u)·deg(v): traffic carried relative to how expected the edge "
+              "is, so a utility that everything calls does not crowd out the "
+              "real bridges. `Joins` gives the two community sizes; the "
+              "per-section threshold caps how many edges may join them, and "
+              "differs by section because the code graph is far denser than the "
+              "article graph._", ""]
     bridge_titles = {"article": "Article ↔ Article", "code": "Code ↔ Code",
                      "mixed": "Article ↔ Code"}
     # "mixed" is shown under either single scope: an article↔code bridge is
@@ -460,7 +508,7 @@ def render(report: dict, *, top_n: int = 10, scope: str = "all") -> str:
                      f"(≤{thresholds.get(bucket, '?')} edges between communities)")
         lines.append("")
         lines += _table(rows, [("From", "from"), ("To", "to"),
-                               ("Joins", "joins"),
+                               ("Joins", "joins"), ("Surprise", "surprise"),
                                ("Edge betweenness", "edge_betweenness")])
 
     orphans = report.get("orphans", [])[:top_n]
