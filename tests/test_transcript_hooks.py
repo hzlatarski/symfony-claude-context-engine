@@ -96,6 +96,48 @@ def test_missing_transcript_is_reported_as_hook_failure(
 
 
 @pytest.mark.parametrize("hook_name", ["session-end", "pre-compact"])
+def test_sidechain_session_is_a_clean_skip_not_an_error(
+    hook_name,
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    """A subagent session has a directory but no transcript of its own.
+
+    Hooks fire for those too. Treating them as errors produced a steady
+    stream of ``ERROR transcript missing`` on a perfectly healthy machine —
+    23 in one day against a single real capture — which read exactly like a
+    broken pipeline and buried anything genuinely wrong.
+    """
+    monkeypatch.delenv("CLAUDE_INVOKED_BY", raising=False)
+    hook_path = Path(__file__).parents[1] / "hooks" / f"{hook_name}.py"
+    spec = importlib.util.spec_from_file_location(
+        f"test_sidechain_{hook_name.replace('-', '_')}",
+        hook_path,
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    session_id = "0f55ae33-6a17-4244-b299-234722e73e64"
+    # The session directory exists (Claude Code created it for tool-results);
+    # the transcript beside it never will.
+    (tmp_path / session_id).mkdir()
+
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(json.dumps({
+            "session_id": session_id,
+            "transcript_path": str(tmp_path / f"{session_id}.jsonl"),
+        })),
+    )
+
+    assert module.main() == 0
+    assert "transcript missing" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("hook_name", ["session-end", "pre-compact"])
 def test_spawn_failure_is_nonzero_and_leaves_durable_retry(
     hook_name,
     tmp_path,

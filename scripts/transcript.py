@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +26,60 @@ TRANSCRIPT_CHUNK_OVERLAP = 256
 _EXACT_REFERENCE_RE = re.compile(
     r"https?://[^\s<>\"']+|[A-Za-z0-9][A-Za-z0-9_.:/?&=%+-]{31,}"
 )
+
+
+#: Return values of :func:`resolve_transcript`'s status field.
+TRANSCRIPT_OK = "ok"
+TRANSCRIPT_SIDECHAIN = "sidechain"
+TRANSCRIPT_MISSING = "missing"
+
+
+def resolve_transcript(transcript_path_str: str) -> tuple[Path | None, str]:
+    """Locate a session's JSONL transcript, distinguishing "absent" from "none".
+
+    Returns ``(path, status)``. ``status`` is one of:
+
+    * ``ok`` — the transcript exists; ``path`` points at it.
+    * ``sidechain`` — no transcript exists, but the session's own directory
+      does. This is a **subagent / sidechain session**: Claude Code gives it a
+      session id and a directory for ``tool-results/``, but its conversation
+      lives inside the parent session's transcript, so no standalone JSONL is
+      ever written. There is nothing to capture and nothing is wrong.
+    * ``missing`` — neither exists. A genuine anomaly worth an error.
+
+    That distinction is the whole point. Both hooks previously treated every
+    absent transcript as an error, and because hooks fire for subagent
+    sessions too, a healthy machine logged a steady stream of
+    ``ERROR transcript missing``. On 2026-08-08 this repo's own project
+    directory held 1,115 such session directories against 100 real
+    transcripts — so the errors outnumbered the successes 23:1 in a single
+    day while capture was in fact working perfectly. Noise at that ratio is
+    worse than no logging: it hides the real failures and, on inspection,
+    reads exactly like a broken pipeline.
+
+    Windows drive-letter case is normalized here as well; Claude Code
+    sometimes emits ``C:\\...`` where the filesystem path is ``c:\\...``.
+    """
+    if not transcript_path_str or not isinstance(transcript_path_str, str):
+        return None, TRANSCRIPT_MISSING
+
+    candidates = [Path(transcript_path_str)]
+    if sys.platform == "win32" and len(transcript_path_str) >= 2 and transcript_path_str[1] == ":":
+        candidates.append(
+            Path(transcript_path_str[0].swapcase() + transcript_path_str[1:])
+        )
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate, TRANSCRIPT_OK
+
+    # No transcript. A sibling directory named for the session means Claude
+    # Code did create the session — it simply has no transcript of its own.
+    for candidate in candidates:
+        if candidate.with_suffix("").is_dir():
+            return None, TRANSCRIPT_SIDECHAIN
+
+    return None, TRANSCRIPT_MISSING
 
 
 def _conversation_turns(transcript_path: Path) -> list[str]:

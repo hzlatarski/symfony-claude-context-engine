@@ -37,7 +37,12 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from flush_cursor import load_cursor  # noqa: E402
 from log_setup import configure as configure_logging  # noqa: E402
 from pending_flush import create_pending_flush, load_pending_flushes  # noqa: E402
-from transcript import archive_transcript, extract_conversation_context  # noqa: E402
+from transcript import (  # noqa: E402
+    TRANSCRIPT_SIDECHAIN,
+    archive_transcript,
+    extract_conversation_context,
+    resolve_transcript,
+)
 
 configure_logging(
     SCRIPTS_DIR / "flush.log",
@@ -74,15 +79,17 @@ def main() -> int:
     if not transcript_path_str or not isinstance(transcript_path_str, str):
         return _failure("No transcript path; pre-compact capture was not scheduled")
 
-    transcript_path = Path(transcript_path_str)
-    if not transcript_path.exists():
-        # On Windows, Claude Code sometimes emits an uppercase drive letter (C:\...)
-        # but the actual filesystem path uses lowercase (c:\...). Try both.
-        if sys.platform == "win32" and len(transcript_path_str) >= 2 and transcript_path_str[1] == ":":
-            alt = transcript_path_str[0].swapcase() + transcript_path_str[1:]
-            transcript_path = Path(alt)
-        if not transcript_path.exists():
-            return _failure("transcript missing: %s", transcript_path_str)
+    transcript_path, status = resolve_transcript(transcript_path_str)
+    if status == TRANSCRIPT_SIDECHAIN:
+        # Subagent/sidechain session: its turns live in the parent's
+        # transcript, so there is nothing here to capture. Not a failure.
+        logging.info(
+            "No standalone transcript for session=%s - subagent/sidechain, "
+            "its turns are captured with the parent session", session_id
+        )
+        return 0
+    if transcript_path is None:
+        return _failure("transcript missing: %s", transcript_path_str)
 
     try:
         transcript_archive = archive_transcript(transcript_path, session_id)
