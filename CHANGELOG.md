@@ -4,6 +4,18 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [0.10.0] — 2026-08-15
+
+Two changes from a session evaluating [Graft](https://github.com/NanoNets/Graft): a token-cheap "signatures without bodies" primitive ported as a new tool, and making the auto-fetch hook visible and fire on more prompts.
+
+### Added
+
+- **`get_file_api` MCP tool** — a file's class + method signatures with the bodies stripped, so an agent can learn a file's shape without reading it in full (ported from Graft's `file_api`). Built on the existing mtime-cached call graph, so it costs no extra parse. Controller actions surface their `#[Route]` binding; `_slice_signature` scans the declaration outside `()`/`[]`, strings and comments, so route placeholders (`#[Route('/user/{id}')]`) and stray braces in comments or JS template literals never truncate the signature. Covers PHP classes and Stimulus JS; interfaces, traits and Twig are out of scope.
+
+### Changed
+
+- **`UserPromptSubmit` hook is now visible and fires wider.** It emits a user-facing `systemMessage` marker (e.g. `[code-intel] auto-fetch: deps x1, related-code x3, KB x4`) so the auto-fetch is no longer silent, and it runs the semantic codebase search on conceptual (why/how) prompts and a new narrow code-work detector (`_looks_codey`: structural verbs + locators), not only when a file is named. Trivial-edit verbs (fix/patch/rename) and bare domain nouns stay excluded so ordinary edits keep paying zero search cost.
+
 ## [0.9.0] — 2026-08-08
 
 Two gaps found while evaluating [Graphify](https://github.com/Graphify-Labs/graphify), [brain.md](https://github.com/mindmuxai/brain.md) and [RAG-Anything](https://github.com/HKUDS/RAG-Anything) as possible dependencies. None was worth adopting — this engine already has the NetworkX/Leiden/tree-sitter stack Graphify is built on and the Truth + Timeline format brain.md specifies, and RAG-Anything's knowledge-graph construction requires a paid LLM API, which the subscription-only billing guarantee forbids. Two of the ideas were real gaps. The fixes below came out of the adversarial review of that work, plus one hook defect found separately in the session logs.
