@@ -4,9 +4,9 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
-## [Unreleased]
+## [0.9.0] — 2026-08-08
 
-Two gaps found while evaluating [Graphify](https://github.com/Graphify-Labs/graphify), [brain.md](https://github.com/mindmuxai/brain.md) and [RAG-Anything](https://github.com/HKUDS/RAG-Anything) as possible dependencies. None was worth adopting — this engine already has the NetworkX/Leiden/tree-sitter stack Graphify is built on and the Truth + Timeline format brain.md specifies, and RAG-Anything's knowledge-graph construction requires a paid LLM API, which the subscription-only billing guarantee forbids. Two of the ideas were real gaps.
+Two gaps found while evaluating [Graphify](https://github.com/Graphify-Labs/graphify), [brain.md](https://github.com/mindmuxai/brain.md) and [RAG-Anything](https://github.com/HKUDS/RAG-Anything) as possible dependencies. None was worth adopting — this engine already has the NetworkX/Leiden/tree-sitter stack Graphify is built on and the Truth + Timeline format brain.md specifies, and RAG-Anything's knowledge-graph construction requires a paid LLM API, which the subscription-only billing guarantee forbids. Two of the ideas were real gaps. The fixes below came out of the adversarial review of that work, plus one hook defect found separately in the session logs.
 
 ### Added
 
