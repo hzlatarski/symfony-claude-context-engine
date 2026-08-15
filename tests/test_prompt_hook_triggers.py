@@ -50,3 +50,30 @@ def test_conceptual_prompts_trigger_kb(hook, prompt):
 ])
 def test_mechanical_prompts_do_not_trigger_kb(hook, prompt):
     assert not hook._looks_conceptual(prompt)
+
+
+@pytest.mark.parametrize("prompt", [
+    "where is the upload rate limiter implemented",
+    "what calls the grading handler",
+    "find the code that resolves the voice gender",
+    "which service builds the scenario prompt",
+    "implement rate limiting on the upload endpoint",
+    "refactor the arena voice bridge",
+    "what is the blast radius of changing the session cost",
+])
+def test_code_work_prompts_trigger_codebase(hook, prompt):
+    assert hook._looks_codey(prompt)
+
+
+@pytest.mark.parametrize("prompt", [
+    # Trivial edits must stay cheap — no ~1.3s codebase search:
+    "Fix the typo in the header",
+    "Rename this variable to totalCount",
+    "improve the grading UI spacing",
+    "bump the persona image size to 512px",
+    "thanks, that looks great",
+    # Bare domain nouns alone are not a locator:
+    "the controller looks fine",
+])
+def test_trivial_prompts_do_not_trigger_codebase(hook, prompt):
+    assert not hook._looks_codey(prompt)

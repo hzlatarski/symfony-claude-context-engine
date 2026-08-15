@@ -68,6 +68,30 @@ _CONCEPTUAL_RE = re.compile(
 def _looks_conceptual(prompt: str) -> bool:
     return bool(_CONCEPTUAL_RE.search(prompt))
 
+
+# Code-work triggers. Imperative "change/find code" prompts frequently name NO
+# concrete entity (no *.php path, no PascalCase class, no ``VERB /route``), so
+# the entity regexes above miss them and the agent gets zero code context —
+# then falls back to blind Grep/Read. We fire the semantic codebase search on
+# strong structural *verbs* and *locators* only. Deliberately EXCLUDED, to keep
+# the ~1.3s search off trivial edits (mirroring _CONCEPTUAL_RE's caution):
+# trivial-edit verbs (fix/patch/rename/add/tweak) and bare domain nouns
+# (controller/service/route/endpoint). "Fix the typo" must stay cheap; a
+# named file/class already routes through the entity regexes above.
+_CODE_INTENT_RE = re.compile(
+    r"\b(?:"
+    r"implement\w*|refactor\w*|debug\w*|"
+    r"where(?:'s| is| are| does| do)|find the|locate\b|"
+    r"which (?:file|class|service|method|controller|function|handler)|"
+    r"call ?(?:site|chain|graph)|blast[ -]?radius|what (?:calls|uses|depends on)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_codey(prompt: str) -> bool:
+    return bool(_CODE_INTENT_RE.search(prompt))
+
 # Hook disable mechanism, mirroring the other memory-compiler hooks.
 _disabled = os.environ.get("MEMORY_COMPILER_DISABLED_HOOKS", "").lower().split(",")
 if "all" in _disabled or "user-prompt-submit" in _disabled:
@@ -76,12 +100,27 @@ if "all" in _disabled or "user-prompt-submit" in _disabled:
     sys.exit(0)
 
 
-def _emit(context: str) -> None:
-    print(json.dumps({"hookSpecificOutput": {
+def _emit(context: str, system_message: str = "") -> None:
+    """Emit the hook result.
+
+    ``additionalContext`` is injected into Claude's context (the user does not
+    see it). ``systemMessage`` is rendered to the *user* in the terminal — we
+    use it for a short "what was auto-fetched" marker so the retrieval is
+    visible instead of silent.
+    """
+    out: dict = {"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",
         "additionalContext": context,
-    }}))
+    }}
+    if system_message:
+        out["systemMessage"] = system_message
+    print(json.dumps(out))
     sys.exit(0)
+
+
+def _bullet_count(section: str) -> int:
+    """Number of ``- `` list items in a rendered section (for the marker)."""
+    return sum(1 for ln in section.splitlines() if ln.startswith("- "))
 
 
 # -----------------------------------------------------------------------------
@@ -276,7 +315,8 @@ def main() -> None:
     files = _resolve_files(prompt)
     routes = _resolve_routes(prompt)
     conceptual = _looks_conceptual(prompt)
-    if not files and not routes and not conceptual:
+    codey = _looks_codey(prompt)
+    if not files and not routes and not conceptual and not codey:
         _emit("")
 
     if str(ROOT) not in sys.path:
@@ -285,6 +325,8 @@ def main() -> None:
     # 3. Code-intel sections (structure from the graph). Failure-isolated so a
     #    parse error here still lets the KB section below run.
     code_sections: list[str] = []
+    n_deps = 0
+    n_trace = 0
     if files or routes:
         try:
             from scripts.mcp_server import _build_file_deps, _build_trace_route
@@ -295,6 +337,7 @@ def main() -> None:
                 out = _build_file_deps(rel)
                 if out and not any(m in out for m in _MISS_MARKERS):
                     code_sections.append(f"### `{rel}`\n{_clip(out, MAX_SECTION_CHARS)}")
+                    n_deps += 1
 
             for method, path in routes:
                 out = _build_trace_route(method, path)
@@ -302,24 +345,45 @@ def main() -> None:
                     code_sections.append(
                         f"### Route trace: {method} {path}\n{_clip(out, MAX_SECTION_CHARS)}"
                     )
+                    n_trace += 1
         except Exception:
-            code_sections = code_sections  # keep whatever succeeded
+            pass  # keep whatever succeeded
 
     # 4. Retrieval sections (curated KB + semantically-related code). These load
-    #    Chroma once; both share the import cost.
+    #    Chroma once; both share the import cost. Related-code now also fires on
+    #    conceptual/code-work prompts (not only when a file is named) so ordinary
+    #    "fix/where-is/how-does" questions surface code, not just the KB.
     kb_sections: list[str] = []
+    n_kb = 0
+    n_related = 0
     if conceptual:
         s = _kb_section(prompt)
         if s:
+            n_kb = _bullet_count(s)
             kb_sections.append(_clip(s, MAX_SECTION_CHARS))
-    if files:
+    if files or conceptual or codey:
         s = _codebase_section(prompt, set(files))
         if s:
+            n_related = _bullet_count(s)
             kb_sections.append(_clip(s, MAX_SECTION_CHARS))
 
     all_sections = code_sections + kb_sections
     if not all_sections:
         _emit("")
+
+    # Visible marker (systemMessage → shown to the user; additionalContext is not).
+    # Pure ASCII — a Unicode marker (emoji / × / →) risks a cp1252 render fault
+    # on Windows terminals, which would defeat the whole point of a visible line.
+    fired: list[str] = []
+    if n_deps:
+        fired.append(f"deps x{n_deps}")
+    if n_trace:
+        fired.append(f"route-trace x{n_trace}")
+    if n_related:
+        fired.append(f"related-code x{n_related}")
+    if n_kb:
+        fired.append(f"KB x{n_kb}")
+    marker = ("[code-intel] auto-fetch: " + ", ".join(fired)) if fired else ""
 
     header = (
         "## Auto-fetched context\n\n"
@@ -332,7 +396,7 @@ def main() -> None:
         "(`get_file_deps`, `trace_route`, `impact_of_change`, `get_article`, "
         "`search_knowledge`).\n\n"
     )
-    _emit(_clip(header + "\n\n".join(all_sections), MAX_TOTAL_CHARS))
+    _emit(_clip(header + "\n\n".join(all_sections), MAX_TOTAL_CHARS), marker)
 
 
 if __name__ == "__main__":
