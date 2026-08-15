@@ -379,6 +379,173 @@ def _file_deps_stimulus(file_path: str) -> str:
     return "\n".join(lines)
 
 
+def _slice_signature(text: str) -> str:
+    """Return a method declaration with its body stripped.
+
+    Scans ``text`` (the declaration region, attributes included) char by char
+    and stops at the first ``{`` or ``;`` seen while *outside* any ``()``/``[]``
+    and outside a string literal. That guard is what keeps route-attribute
+    placeholders like ``#[Route('/user/{id}')]`` from truncating the signature
+    at their ``{`` — the placeholder sits inside ``[...]`` and ``(...)``, so its
+    brace is skipped and only the real body brace ends the slice. Internal
+    whitespace is collapsed so multi-line / promoted-constructor signatures
+    render on one line.
+
+    String literals (``'`` ``"`` and JS backtick) and comments (``//``, ``#``
+    line comments, ``/* */`` blocks) inside the param list are skipped so a
+    stray ``)`` / ``{`` in their text cannot end the slice early. Heredoc/nowdoc
+    param defaults are not handled — they do not occur in this codebase.
+    """
+    out: list[str] = []
+    depth_paren = 0
+    depth_brack = 0
+    in_str: str | None = None
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_str is not None:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        nxt = text[i + 1] if i + 1 < n else ""
+        # Comments — skip their text entirely (``#[`` is an attribute, not one).
+        if (ch == "/" and nxt == "/") or (ch == "#" and nxt != "["):
+            j = text.find("\n", i)
+            if j == -1:
+                break
+            i = j
+            continue
+        if ch == "/" and nxt == "*":
+            j = text.find("*/", i + 2)
+            if j == -1:
+                break
+            i = j + 2
+            continue
+        if ch in ("'", '"', "`"):
+            in_str = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth_paren += 1
+        elif ch == ")":
+            depth_paren -= 1
+        elif ch == "[":
+            depth_brack += 1
+        elif ch == "]":
+            depth_brack -= 1
+        elif ch in ("{", ";") and depth_paren <= 0 and depth_brack <= 0:
+            break
+        out.append(ch)
+        i += 1
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+
+def _build_file_api(file_path: str) -> str:
+    """Return the API surface of a file — class + method signatures, no bodies.
+
+    A token-cheap way to learn a file's shape before reading it in full
+    (mirrors Graft's ``file_api``). Reuses the mtime-cached call graph — each
+    symbol already carries ``file``/``line``/``end_line``/``visibility`` — and
+    slices the declaration from source up to the body-opening ``{`` (or the
+    ``;`` of an abstract/interface method). Attributes such as ``#[Route(...)]``
+    sit inside the sliced region, so controller actions show their URL binding.
+
+    Covers PHP classes and Stimulus controller JS. Interfaces, traits, and
+    free functions are not in the call graph, so they are not listed here;
+    Twig templates have no method surface — use ``get_template_graph`` for those.
+    """
+    file_path = file_path.replace("\\", "/").lstrip("./")
+
+    graph = _cache.get_call_graph()
+    symbols = graph["symbols"]
+    classes = graph["classes"]
+
+    # Symbols defined in this file, in source order (call graph is sorted by line).
+    file_symbols = sorted(
+        ((sid, info) for sid, info in symbols.items() if info.get("file") == file_path),
+        key=lambda pair: pair[1].get("line", 0),
+    )
+    if not file_symbols:
+        return (
+            f"No parsed API surface for: {file_path}\n"
+            "This tool covers PHP classes and Stimulus controller JS. "
+            "Interfaces/traits/free functions and Twig templates are not indexed "
+            "here — use get_file_deps or get_template_graph instead."
+        )
+
+    # Read the source once for signature slicing.
+    try:
+        src_lines = (PROJECT_ROOT / file_path).read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        src_lines = []
+
+    def _signature(info: dict) -> str:
+        start_line = info.get("line", 0)
+        end_line = info.get("end_line", start_line)
+        if not src_lines or start_line < 1:
+            return ""
+        lo = start_line - 1
+        hi = min(end_line, start_line + 60)  # cap the scan region
+        region = "\n".join(src_lines[lo:hi])
+        return _slice_signature(region)
+
+    # Group methods by owner (PHP FQCN or ``js:<name>``), preserving first-seen order.
+    methods_by_owner: dict[str, list] = {}
+    owner_first_line: dict[str, int] = {}
+    for sid, info in file_symbols:
+        if sid.startswith("js:"):
+            owner = sid.split("::", 1)[0]
+        elif "::" in sid:
+            owner = sid.rsplit("::", 1)[0]
+        else:
+            owner = "(file)"
+        methods_by_owner.setdefault(owner, []).append((sid, info))
+        owner_first_line.setdefault(owner, info.get("line", 0))
+
+    total = sum(len(v) for v in methods_by_owner.values())
+    lines = [
+        f"# API surface: {file_path}",
+        f"_{total} method(s) across {len(methods_by_owner)} type(s). "
+        "Signatures only — no bodies._",
+        "",
+    ]
+
+    for owner in sorted(methods_by_owner, key=lambda o: owner_first_line[o]):
+        if owner.startswith("js:"):
+            lines.append(f"## Stimulus controller `{owner[3:]}`")
+        else:
+            cinfo = classes.get(owner, {})
+            header = f"## `{owner}`"
+            if cinfo.get("extends"):
+                header += f" extends `{cinfo['extends']}`"
+            lines.append(header)
+            for note in cinfo.get("rationale", []):
+                lines.append(f"> {note['tag']}: {note['text']}")
+        lines.append("")
+        for sid, info in sorted(methods_by_owner[owner], key=lambda t: t[1].get("line", 0)):
+            sig = _signature(info)
+            if not sig:  # fallback when source is unreadable
+                name = sid.rsplit("::", 1)[-1]
+                vis = info.get("visibility", "")
+                sig = f"{vis} {name}(…)".strip()
+            lines.append(f"- L{info.get('line', 0)} `{sig}`")
+            for note in info.get("rationale", []):
+                lines.append(f"  > {note['tag']}: {note['text']}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def _build_route_map(prefix: str = "") -> str:
     routes = _cache.get_route_map()
     filtered = {
@@ -1548,6 +1715,17 @@ def _make_server():
     def get_file_deps(file_path: str) -> str:
         """Dependencies for a specific file. Handles PHP, Twig, and Stimulus JS files."""
         return _build_file_deps(file_path)
+
+    @server.tool()
+    def get_file_api(file_path: str) -> str:
+        """API surface of a file: class + method signatures, NO bodies — token-cheap.
+
+        Read this before opening a PHP/JS file in full when you only need its
+        shape (what methods exist, their params, return types, and — for
+        controllers — the ``#[Route]`` binding). Covers PHP classes and Stimulus
+        controller JS. For Twig use get_template_graph.
+        """
+        return _build_file_api(file_path)
 
     @server.tool()
     def get_route_map(prefix: str = "") -> str:

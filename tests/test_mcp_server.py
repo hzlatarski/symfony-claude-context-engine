@@ -242,3 +242,93 @@ def test_build_find_community_for_known_node():
 def test_build_find_community_for_missing_node():
     result = mcp_server._build_find_community("article:concepts/does-not-exist-anywhere")
     assert "not found" in result.lower() or "not in" in result.lower()
+
+
+# --- get_file_api -----------------------------------------------------------
+
+def test_slice_signature_keeps_route_placeholder_brace():
+    # The ``{id}`` placeholder lives inside ``[...]`` and ``(...)`` — its brace
+    # must NOT be mistaken for the body brace, or the signature truncates.
+    text = (
+        "#[Route('/user/{id}/status', methods: ['GET'])]\n"
+        "public function status(int $id): JsonResponse\n"
+        "{"
+    )
+    sig = mcp_server._slice_signature(text)
+    assert sig == (
+        "#[Route('/user/{id}/status', methods: ['GET'])] "
+        "public function status(int $id): JsonResponse"
+    )
+
+
+def test_slice_signature_stops_at_abstract_semicolon():
+    sig = mcp_server._slice_signature("public function foo(): void;")
+    assert sig == "public function foo(): void"
+
+
+def test_slice_signature_ignores_comment_braces_in_params():
+    # A ``//`` comment inside the param list must not truncate the slice, even
+    # if it carries a stray ``)`` or ``{`` (a real case in UsageCostService).
+    text = (
+        "public function __construct(\n"
+        "    private readonly Foo $foo, // keep this ) { last\n"
+        "    private readonly Bar $bar,\n"
+        ") {"
+    )
+    sig = mcp_server._slice_signature(text)
+    assert sig == (
+        "public function __construct( private readonly Foo $foo, "
+        "private readonly Bar $bar, )"
+    )
+
+
+def test_slice_signature_keeps_attribute_after_hash_guard():
+    # ``#[Autowire(...)]`` on a promoted param is an attribute, not a comment.
+    text = "public function __construct(#[Autowire('x')] Foo $foo): void {"
+    sig = mcp_server._slice_signature(text)
+    assert sig == "public function __construct(#[Autowire('x')] Foo $foo): void"
+
+
+def test_slice_signature_ignores_js_template_literal_brace():
+    text = "connect(value = `) {`) {"
+    sig = mcp_server._slice_signature(text)
+    assert sig == "connect(value = `) {`)"
+
+
+def test_slice_signature_collapses_multiline_constructor():
+    text = (
+        "public function __construct(\n"
+        "    private readonly Foo $foo,\n"
+        "    private readonly Bar $bar,\n"
+        ") {"
+    )
+    sig = mcp_server._slice_signature(text)
+    assert sig == (
+        "public function __construct( private readonly Foo $foo, "
+        "private readonly Bar $bar, )"
+    )
+
+
+def test_build_file_api_lists_methods_without_bodies():
+    from scripts.parsers import PROJECT_ROOT
+
+    result = mcp_server._build_file_api("src/Entity/User.php")
+    assert isinstance(result, str)
+    assert "API surface" in result
+    assert "Signatures only" in result
+    assert "User" in result
+    # Token-cheap property: the API surface must be far smaller than the source.
+    source = (PROJECT_ROOT / "src/Entity/User.php").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert len(result) < len(source)
+
+
+def test_build_file_api_missing_file():
+    result = mcp_server._build_file_api("src/Doesnt/Exist.php")
+    assert "No parsed API surface" in result
+
+
+def test_build_file_api_twig_not_indexed():
+    result = mcp_server._build_file_api("templates/arena/index.html.twig")
+    assert "No parsed API surface" in result
