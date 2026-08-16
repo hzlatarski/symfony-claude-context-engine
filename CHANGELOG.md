@@ -4,6 +4,18 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [0.11.0] — 2026-08-16
+
+One change from a session evaluating [gortex](https://github.com/zzet/gortex) (a Go code-intelligence engine). Most of gortex overlaps what this engine already ships — deps, route tracing, impact analysis, merge-order risk, hybrid BM25+vector retrieval, cross-project search, a confidence-scored call graph — and gortex has no knowledge-compiler layer, so there was nothing to adopt wholesale. Its one idea worth porting was **contract detection**: linking the provider of a message/route/event to its consumer and flagging the loose ends. Started narrow with the Symfony Messenger bus, the async sibling of the call graph's existing `fetch()` → route resolution.
+
+### Added
+
+- **`find_message_handlers` MCP tool** + `scripts/parsers/messenger_map.py` — maps a Symfony Messenger message class to the `#[AsMessageHandler]` handler(s) that consume it and the `->dispatch(new X())` / `->dispatchAfterCurrentBus(new X())` call sites that produce it. Answers "which handler runs this message?" and "who dispatches it?" without a grep sweep, and flags two contract gaps a grep can't rank: **unhandled** (dispatched but no handler — a real wiring bug) and **undispatched** (a handler with no literal producer, i.e. never sent or sent through a variable). Regex-based like `route_map` (no tree-sitter dependency), mtime-cached on `src/**/*.php`. Only messenger messages (`App\Message\` namespace, or a class that actually has a handler) are tracked, so Symfony EventDispatcher `->dispatch(new App\Event\…)` calls — which share the method name — stay out of the results. On the reference app: 14 messages, 14 handlers, 28 dispatch sites, 0 unhandled, 1 undispatched (`SchedulerHeartbeatMessage`, sent by the Scheduler rather than a literal `new`).
+
+### Notes
+
+- Adversarial review ran on **Fable** (the sanctioned Codex reviewer was unavailable), which found 17 issues by executing the parser against crafted PHP. The material ones were fixed with a regression test each: grouped `use App\Message\{A, B};` imports (were mis-resolved to the handler's own namespace, firing *two* false orphans for one wired message), a docblock containing the word "class" fabricating a handler name, a commented-out `#[AsMessageHandler]` still counting, union-typed first params dropping the handler, `new Envelope(new X())` wrappers hiding the inner message, relative-qualified `Message\X` names, two handler classes in one file being conflated, parameter attributes, the `method:` argument, and an `unresolved_dispatch` counter that double-counted deep-indented sends and overstated EventDispatcher calls. Comment bodies are now blanked (newline-preserving, so `file:line` stays correct) before parsing. Deferred, and documented in the module: cache invalidation on file *deletion* (a limitation shared by every cache in `mcp_server.py`) and producer scanning limited to `src/`.
+
 ## [0.10.0] — 2026-08-15
 
 Two changes from a session evaluating [Graft](https://github.com/NanoNets/Graft): a token-cheap "signatures without bodies" primitive ported as a new tool, and making the auto-fetch hook visible and fire on more prompts.

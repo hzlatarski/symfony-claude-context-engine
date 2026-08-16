@@ -32,7 +32,7 @@ _MEMORY_COMPILER_ROOT = _HERE.parent     # .../memory-compiler
 if str(_MEMORY_COMPILER_ROOT) not in sys.path:
     sys.path.insert(0, str(_MEMORY_COMPILER_ROOT))
 
-from scripts.parsers import PROJECT_ROOT, php_graph, route_map, twig_graph, stimulus_map, git_intel, call_graph
+from scripts.parsers import PROJECT_ROOT, php_graph, route_map, twig_graph, stimulus_map, git_intel, call_graph, messenger_map
 from scripts import unified_graph
 from scripts import parent_watchdog, mermaid_render
 
@@ -63,6 +63,8 @@ class ParseCache:
         self._stim_mtime: float = 0.0
         self._call_graph_cache: dict | None = None
         self._call_graph_mtime: float = 0.0
+        self._messenger_cache: dict | None = None
+        self._messenger_mtime: float = 0.0
         self._unified_graph_cache: dict | None = None
         self._unified_graph_signature: tuple = ()
 
@@ -109,6 +111,14 @@ class ParseCache:
 
     def get_git_intel(self) -> dict:
         return git_intel.load_or_parse(PROJECT_ROOT)
+
+    def get_messenger_map(self) -> dict:
+        current = self._max_mtime((PROJECT_ROOT / "src").rglob("*.php"))
+        if self._messenger_cache is None or current != self._messenger_mtime:
+            log.info("Rebuilding messenger map cache")
+            self._messenger_cache = messenger_map.parse(PROJECT_ROOT)
+            self._messenger_mtime = current
+        return self._messenger_cache
 
     def get_call_graph(self) -> dict:
         # Both PHP and Stimulus JS files affect the graph — invalidate on either.
@@ -854,6 +864,89 @@ def _branch_ancestry(branches: list[str]) -> set[tuple[str, str]]:
             if rc == 0:
                 pairs.add((a, b))
     return pairs
+
+
+def _build_find_message_handlers(message: str | None = None) -> str:
+    """Render the Symfony Messenger contract map (message ↔ handler ↔ producer).
+
+    Reads ``messenger_map.parse`` output. With ``message`` set, shows the full
+    detail (every handler + every dispatch site) for matching messages; without
+    it, a compact overview plus the orphan lists.
+    """
+    mm = _cache.get_messenger_map()
+    messages: dict = mm["messages"]
+    stats: dict = mm["stats"]
+
+    if not messages:
+        return "No Symfony Messenger messages, handlers, or dispatch sites found in `src/`."
+
+    def _short(fqcn: str) -> str:
+        return messages.get(fqcn, {}).get("short") or fqcn.split("\\")[-1]
+
+    # --- Filtered detail view ----------------------------------------------
+    if message:
+        needle = message.lower().lstrip("\\")
+        hits = sorted(
+            fqcn for fqcn in messages
+            if needle in fqcn.lower() or needle in _short(fqcn).lower()
+        )
+        if not hits:
+            return f"No message matching `{message}` (searched {len(messages)} known messages)."
+        lines: list[str] = []
+        for fqcn in hits:
+            e = messages[fqcn]
+            lines.append(f"### `{fqcn}`")
+            if e["handlers"]:
+                for h in e["handlers"]:
+                    lines.append(
+                        f"- **handled by** `{h['handler_class']}::{h['handler_method']}` "
+                        f"— {h['file']}:{h['line']}"
+                    )
+            else:
+                lines.append("- ⚠️ **no handler** — dispatched but nothing consumes it")
+            if e["producers"]:
+                for p in sorted(e["producers"], key=lambda x: (x["file"], x["line"])):
+                    lines.append(f"- dispatched at {p['file']}:{p['line']} (`{p['via']}`)")
+            else:
+                lines.append("- no literal `dispatch(new …)` site found (may be dispatched via a variable)")
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
+    # --- Overview view ------------------------------------------------------
+    lines = [
+        f"**Messenger contract** — {stats['total_messages']} handled messages, "
+        f"{stats['total_handlers']} handlers, {stats['total_producer_sites']} dispatch sites.",
+        "",
+    ]
+    handled = sorted(fqcn for fqcn, e in messages.items() if e["handlers"])
+    for fqcn in handled:
+        e = messages[fqcn]
+        handler_str = ", ".join(f"`{h['handler_class'].split(chr(92))[-1]}::{h['handler_method']}`" for h in e["handlers"])
+        nprod = len(e["producers"])
+        prod_str = f"{nprod} dispatch site{'s' if nprod != 1 else ''}" if nprod else "⚠️ never dispatched (no literal site)"
+        lines.append(f"- `{e['short']}` → {handler_str} — {prod_str}")
+
+    unhandled = mm["orphans"]["unhandled"]
+    if unhandled:
+        lines.append("")
+        lines.append("**⚠️ Unhandled (dispatched, no handler):**")
+        for fqcn in unhandled:
+            lines.append(f"- `{fqcn}`")
+
+    undispatched = mm["orphans"]["undispatched"]
+    if undispatched:
+        lines.append("")
+        lines.append("**Handled but no literal dispatch site (check for variable dispatch):**")
+        for fqcn in undispatched:
+            lines.append(f"- `{_short(fqcn)}`")
+
+    if stats.get("unresolved_dispatch"):
+        lines.append("")
+        lines.append(
+            f"_{stats['unresolved_dispatch']} `dispatch(...)` call(s) pass a variable "
+            f"rather than `new X()` — not resolved (may include EventDispatcher calls)._"
+        )
+    return "\n".join(lines)
 
 
 def _build_merge_order_risk(
@@ -1938,6 +2031,37 @@ def _make_server():
         better past depth 3.
         """
         return _build_trace_route(method, path, max_depth, output_format, collapse_accessors)
+
+    @server.tool()
+    def find_message_handlers(message: str | None = None) -> str:
+        """Map Symfony Messenger messages to their handlers and dispatch sites.
+
+        The async equivalent of ``trace_route`` for the message bus. Answers
+        "which handler runs this message?", "who dispatches it?", and flags
+        contract gaps a plain grep misses:
+
+        - **Unhandled** — a message dispatched via ``->dispatch(new X())`` that
+          no ``#[AsMessageHandler]`` consumes (a real wiring bug).
+        - **Undispatched** — a handler with no literal dispatch site found
+          (either genuinely unused, or dispatched through a variable).
+
+        Args:
+            message: substring of a message short name or FQCN (e.g.
+                ``GradeSession``). Omit for the whole-bus overview + orphans.
+
+        Returns:
+            Markdown. Overview lists each handled message → handler(s) →
+            dispatch-site count, then the orphan sections. Filtered mode lists
+            every handler and every ``file:line`` dispatch site for the match.
+
+        Detection is regex over ``src/**/*.php`` (class-level and method-level
+        ``#[AsMessageHandler]``, explicit ``handles:`` args, and
+        ``dispatch``/``dispatchAfterCurrentBus`` producer calls). Only messenger
+        messages (``App\\Message\\`` namespace, or a class with a handler) are
+        tracked, so EventDispatcher ``->dispatch(new App\\Event\\…)`` calls do
+        not pollute the results.
+        """
+        return _build_find_message_handlers(message)
 
     @server.tool()
     def merge_order_risk(
