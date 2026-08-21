@@ -131,6 +131,112 @@ def test_parse_cache_uses_mtime_invalidation():
     assert a is b
 
 
+def test_build_explore_php_file_bundles_api_and_deps():
+    """A file target returns API surface AND dependency view in one payload."""
+    result = mcp_server._build_explore("src/Entity/User.php")
+    assert isinstance(result, str)
+    assert "User" in result
+    # API-surface section (signatures) and deps section (imports/imported-by)
+    assert "API surface" in result
+    assert "Imported By" in result or "Imports" in result
+    # Every file/route/class explore ends with the knowledge section
+    assert "Related knowledge" in result
+
+
+def test_build_explore_route_with_method_traces_call_chain():
+    result = mcp_server._build_explore("POST /api/session/start")
+    assert isinstance(result, str)
+    assert "SessionApiController" in result
+    assert "::start" in result
+    # A route explore includes the call-tree trace
+    assert "Call tree" in result or "Trace:" in result
+    assert "Related knowledge" in result
+
+
+def test_build_explore_bare_path_defaults_method():
+    """A bare '/path' (no verb) still resolves to the route + controller."""
+    result = mcp_server._build_explore("/api/session/start")
+    assert isinstance(result, str)
+    assert "SessionApiController" in result
+
+
+def test_build_explore_twig_file_without_prefix():
+    """A Twig path (with or without the templates/ prefix) resolves cleanly."""
+    result = mcp_server._build_explore("arena/index.html.twig")
+    assert isinstance(result, str)
+    assert "arena" in result.lower()
+    # Must NOT fall into the 'Template not found' error path
+    assert "not found" not in result.lower()
+    assert "Related knowledge" in result
+
+
+def test_build_explore_fqcn_resolves_to_file():
+    result = mcp_server._build_explore("App\\Service\\Session\\AccessControlService")
+    assert isinstance(result, str)
+    assert "AccessControlService" in result
+    # Resolves to the class's file and shows its method surface
+    assert "canAccess" in result
+    assert "API surface" in result
+
+
+def test_build_explore_bare_shortname_resolves():
+    """A bare class short-name (no namespace) resolves when unambiguous."""
+    result = mcp_server._build_explore("AccessControlService")
+    assert isinstance(result, str)
+    assert "AccessControlService" in result
+    assert "canAccess" in result
+
+
+def test_build_explore_unknown_target_explains_without_raising():
+    result = mcp_server._build_explore("TotallyMadeUpThing1234567")
+    assert isinstance(result, str)
+    assert "could not" in result.lower() or "not found" in result.lower() or "no " in result.lower()
+
+
+def test_build_explore_windows_backslash_path_is_a_file():
+    """A Windows-style path must classify as a file, not a class (regression)."""
+    result = mcp_server._build_explore("src\\Entity\\User.php")
+    assert isinstance(result, str)
+    assert "API surface" in result
+    assert "No class or file found" not in result
+
+
+def test_build_explore_route_verb_mismatch_rejected_cleanly():
+    """GET on a POST-only route must be rejected up front, not shown as success."""
+    result = mcp_server._build_explore("GET /api/session/start")
+    assert isinstance(result, str)
+    assert "does not handle" in result.lower()
+    assert "POST" in result
+    # Must NOT print a call-tree for a verb the route rejects
+    assert "Call tree" not in result
+
+
+def test_build_explore_method_symbol_missing_flags_it():
+    """A typo'd ::method still shows the class but flags the missing method."""
+    result = mcp_server._build_explore(
+        "App\\Service\\Session\\AccessControlService::noSuchMethod9000"
+    )
+    assert isinstance(result, str)
+    assert "not found on" in result.lower()
+    assert "API surface" in result  # still shows the class
+
+
+def test_build_explore_case_insensitive_class_name():
+    """PHP class names are case-insensitive — a lowercased name still resolves."""
+    result = mcp_server._build_explore("accesscontrolservice")
+    assert isinstance(result, str)
+    assert "AccessControlService" in result
+    assert "canAccess" in result
+
+
+def test_build_explore_header_names_detected_kind():
+    """The header states which target kind was detected, for transparency."""
+    result = mcp_server._build_explore("src/Entity/User.php")
+    lowered = result.lower()
+    assert "explore" in lowered
+    assert "file" in lowered
+
+
 def test_mcp_server_launches_without_import_error(tmp_path):
     """Regression: `python scripts/mcp_server.py` must not fail with
     ModuleNotFoundError when launched directly (the way Claude Code

@@ -1790,6 +1790,309 @@ def _build_find_community(node_id: str) -> str:
 
 
 # -----------------------------------------------------------------------------
+# explore() — one call, one natural target, everything about it
+# -----------------------------------------------------------------------------
+#
+# CodeGraph's measured advantage (88% fewer tool calls on its own benchmark) is
+# that *one* call answers the question. Our granular tools each return one slice,
+# so orienting on a file today costs get_file_api + get_file_deps + find_rationale,
+# and orienting on a URL costs trace_route + get_file_deps. get_neighborhood is
+# the graph-node analogue but needs a `symbol:`/`file:` node id — not the file
+# path, URL, or class name a developer actually starts from. explore() closes
+# that gap: it takes the natural target, detects its kind, and composes the
+# existing _build_* helpers into a single budgeted payload. It reuses the warm
+# ParseCache like every other tool, so it must NOT be wired into the cold
+# per-prompt UserPromptSubmit hook.
+
+_ROUTE_METHOD_RE = re.compile(
+    r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)$", re.IGNORECASE
+)
+
+
+def _classify_target(target: str) -> tuple:
+    """Detect what kind of thing ``target`` names.
+
+    Returns one of:
+        ("route", method_or_None, path)   — "POST /x", or a bare "/x"
+        ("file", normalised_path)         — a .php / .twig / _controller.js path
+        ("class", fqcn_or_symbol)         — contains a namespace sep or "::"
+        ("name", short_name)              — a bare identifier to resolve
+        ("unknown", raw)                  — nothing usable
+
+    Order matters: route verbs and leading "/" win first; a namespace
+    separator or "::" marks a class/symbol before extension checks, so an
+    FQCN is never mistaken for a path.
+    """
+    t = target.strip()
+    if not t:
+        return ("unknown", target)
+
+    m = _ROUTE_METHOD_RE.match(t)
+    if m:
+        return ("route", m.group(1).upper(), m.group(2))
+    if t.startswith("/"):
+        return ("route", None, t)
+
+    # Normalise separators FIRST so a Windows path (``src\Entity\User.php``) is
+    # recognised as a file before its backslashes are read as a namespace sep.
+    # Extension match is case-insensitive (``User.PHP`` is still a PHP file).
+    norm = t.replace("\\", "/").lstrip("./")
+    low = norm.lower()
+    if low.endswith(".php") or low.endswith(".twig") or low.endswith("_controller.js"):
+        return ("file", norm)
+
+    # FQCN / method symbol — a backslash or "::" now unambiguously means a
+    # namespace, since real file-suffixed paths were already handled above.
+    if "::" in t or "\\" in t:
+        return ("class", t.lstrip("\\"))
+
+    if "/" in norm and "." in norm.rsplit("/", 1)[-1]:
+        # A path with an extension we don't special-case (yaml, md, …).
+        return ("file", norm)
+
+    return ("name", t)
+
+
+def _resolve_class_to_file(target: str) -> tuple:
+    """Resolve an FQCN, ``FQCN::method``, or bare short-name to a source file.
+
+    Returns ``(rel_path, matched_fqcn)`` on a unique hit, ``(None, [candidates])``
+    when a short-name is ambiguous, or ``(None, [])`` when nothing matches.
+    Tries the call graph (method-aware) first, then the PHP graph (covers
+    interfaces/traits/enums the call graph doesn't index).
+    """
+    t = target.lstrip("\\")
+    cls = t.rsplit("::", 1)[0] if "::" in t else t
+    short = cls.rsplit("\\", 1)[-1]
+
+    classes = _cache.get_call_graph().get("classes", {})
+    if cls in classes and classes[cls].get("file"):
+        return classes[cls]["file"], cls
+
+    php_nodes = _cache.get_php_graph().get("nodes", {})
+
+    def _fqcn(node: dict) -> str:
+        ns = (node.get("namespace") or "").strip("\\")
+        name = node.get("class") or ""
+        return f"{ns}\\{name}".strip("\\") if name else ""
+
+    # Exact FQCN in the PHP graph.
+    for rel, node in php_nodes.items():
+        if _fqcn(node) == cls:
+            return rel, cls
+
+    # Short-name match across both graphs (dedup by file).
+    matches: dict[str, str] = {}  # fqcn -> file
+    for fqcn, info in classes.items():
+        if fqcn.rsplit("\\", 1)[-1] == short and info.get("file"):
+            matches[fqcn] = info["file"]
+    for rel, node in php_nodes.items():
+        if node.get("class") == short:
+            matches.setdefault(_fqcn(node) or short, rel)
+
+    if len(matches) == 1:
+        fqcn, rel = next(iter(matches.items()))
+        return rel, fqcn
+    if len(matches) > 1:
+        return None, sorted(matches)
+
+    # Case-insensitive fallback — PHP class names are case-insensitive, so
+    # ``accesscontrolservice`` should still resolve. Exact matches above win;
+    # this only runs when nothing matched with exact case.
+    cls_low, short_low = cls.lower(), short.lower()
+    ci: dict[str, str] = {}
+    for fqcn, info in classes.items():
+        if info.get("file") and (
+            fqcn.lower() == cls_low or fqcn.rsplit("\\", 1)[-1].lower() == short_low
+        ):
+            ci[fqcn] = info["file"]
+    for rel, node in php_nodes.items():
+        fq = _fqcn(node)
+        if fq.lower() == cls_low or (node.get("class") or "").lower() == short_low:
+            ci.setdefault(fq or short, rel)
+    if len(ci) == 1:
+        fqcn, rel = next(iter(ci.items()))
+        return rel, fqcn
+    if len(ci) > 1:
+        return None, sorted(ci)
+    return None, []
+
+
+def _related_articles_section(seed_ids: list[str], limit: int = 8) -> str:
+    """Render a compact 'Related knowledge' section for the given graph seeds.
+
+    Walks the unified graph two hops (undirected) from each seed node id
+    (``file:...`` / ``class:...`` / ``symbol:...``) and lists the article
+    nodes it reaches — the decision/why layer for this code. Bodies are not
+    inlined; the agent calls ``get_articles`` for those. Always renders the
+    heading (with an explicit 'none found' line) so callers can rely on it.
+    """
+    graph = _cache.get_unified_graph()
+    nodes, edges = graph["nodes"], graph["edges"]
+    seeds = [s for s in seed_ids if s in nodes]
+
+    lines = ["## Related knowledge"]
+    if not seeds:
+        lines.append("_No graph node for this target — none found._")
+        return "\n".join(lines)
+
+    adj: dict[str, set[str]] = {}
+    for e in edges:
+        adj.setdefault(e["from"], set()).add(e["to"])
+        adj.setdefault(e["to"], set()).add(e["from"])
+
+    visited = set(seeds)
+    frontier = set(seeds)
+    for _ in range(2):
+        nxt = {t for n in frontier for t in adj.get(n, set())} - visited
+        visited |= nxt
+        frontier = nxt
+
+    articles = sorted(n for n in visited if nodes.get(n, {}).get("kind") == "article")
+    if not articles:
+        lines.append("_None found in the knowledge graph._")
+        return "\n".join(lines)
+
+    lines.append("_Call `get_articles` for full bodies._")
+    for aid in articles[:limit]:
+        n = nodes[aid]
+        lines.append(
+            f"- `{aid}` — **{n.get('label', '')}** "
+            f"(type={n.get('type', '?')}, conf={n.get('confidence', '?')})"
+        )
+    if len(articles) > limit:
+        lines.append(f"- … and {len(articles) - limit} more")
+    return "\n".join(lines)
+
+
+def _build_explore(target: str, max_depth: int = 4) -> str:
+    """One call, one natural target, everything about it.
+
+    ``target`` may be a file path (``src/Foo.php``, ``foo/x.html.twig``,
+    ``bar_controller.js``), a route (``POST /api/x`` or a bare ``/api/x``),
+    an FQCN (``App\\Service\\Foo``), a method symbol (``App\\Service\\Foo::bar``),
+    or a bare class short-name (``Foo``). The output bundles the slices the
+    granular tools return one at a time:
+
+    - **file** → API surface + dependency/route/git/rationale view + related KB
+    - **route** → call-tree trace + related KB for the controller file
+    - **class/name** → resolved to its file, then the file view
+
+    Deliberately budgeted, not exhaustive: it composes existing builders and
+    appends the knowledge layer, so the agent trades ~3 calls (and ~3 permission
+    prompts) for one. Drill deeper with the granular tools when a slice is
+    truncated.
+    """
+    kind, *rest = _classify_target(target)
+
+    if kind == "unknown":
+        return (
+            "# Explore\n\n"
+            f"Could not tell what `{target}` refers to. Pass a file path "
+            "(`src/Foo.php`), a route (`POST /api/x` or `/api/x`), an FQCN "
+            "(`App\\Service\\Foo`), or a class name (`Foo`)."
+        )
+
+    if kind == "route":
+        method, path = rest
+        routes = _cache.get_route_map()
+        entry = routes["routes"].get(path)
+        if entry is None:
+            return (
+                f"# Explore (route)\n\nNo route found at path `{path}`. "
+                "Check the exact Symfony path, or call `get_route_map(prefix)` "
+                "to list candidates."
+            )
+        if method is None:
+            method = entry["methods"][0] if entry["methods"] else "GET"
+        elif entry["methods"] and method not in entry["methods"]:
+            # Reject the verb up front — otherwise the success header names a
+            # controller the trace then says does not handle this method.
+            return (
+                f"# Explore: `{method} {path}` (detected: route)\n\n"
+                f"Route `{path}` does not handle `{method}` — it handles "
+                f"{', '.join(entry['methods'])}. Re-run `explore` with one of those verbs."
+            )
+
+        header = (
+            f"# Explore: `{method} {path}` (detected: route)\n\n"
+            f"Controller `{entry['controller']}::{entry['action']}` "
+            f"— `{entry['file']}`\n"
+        )
+        trace = _build_trace_route(method, path, max_depth=max_depth)
+        related = _related_articles_section([f"file:{entry['file']}"])
+        return f"{header}\n{trace}\n\n{related}"
+
+    if kind in ("class", "name"):
+        orig = target
+        rel, matched = _resolve_class_to_file(orig)
+        if rel is None:
+            if matched:  # ambiguous short-name
+                cand = "\n".join(f"- `{c}`" for c in matched)
+                return (
+                    f"# Explore\n\n`{orig}` is ambiguous — "
+                    f"{len(matched)} classes share that name:\n{cand}\n\n"
+                    "Re-run `explore` with the full namespace."
+                )
+            return (
+                f"# Explore\n\nNo class or file found for `{orig}`. "
+                "Try the exact FQCN, or `search_codebase(query)` to locate it."
+            )
+        note = f"_Resolved `{matched}` → `{rel}`._\n\n"
+        # If a method symbol was given, verify the method actually exists —
+        # otherwise a typo'd `::method` would look like a clean class hit.
+        if "::" in orig:
+            method_name = orig.rsplit("::", 1)[1]
+            sym = f"{matched}::{method_name}"
+            if method_name and sym not in _cache.get_call_graph().get("symbols", {}):
+                note += (
+                    f"_Note: method `{method_name}` was not found on `{matched}` "
+                    "— showing the whole class._\n\n"
+                )
+        body = _explore_file(rel, header_kind="class")
+        return note + body
+
+    # kind == "file"
+    return _explore_file(rest[0], header_kind="file")
+
+
+def _explore_file(file_path: str, header_kind: str = "file") -> str:
+    """Compose the one-call file view: API surface + deps + related knowledge."""
+    file_path = file_path.replace("\\", "/").lstrip("./")
+    header = f"# Explore: `{file_path}` (detected: {header_kind})\n"
+
+    seeds = [f"file:{file_path}"]
+
+    if file_path.endswith(".php"):
+        api = _build_file_api(file_path)
+        deps = _build_file_deps(file_path)
+        # Seed related-articles from the file AND its classes so articles that
+        # cite a class (not the bare file node) are still reached.
+        graph = _cache.get_call_graph()
+        for fqcn, info in graph.get("classes", {}).items():
+            if info.get("file") == file_path:
+                seeds.append(f"class:{fqcn}")
+        related = _related_articles_section(seeds)
+        return f"{header}\n{api}\n\n---\n\n{deps}\n\n{related}"
+
+    # Twig: _build_file_deps keys templates by their `templates/`-prefixed
+    # path, while the unified graph node is `template:<path-without-prefix>`.
+    if file_path.endswith(".twig"):
+        tpl = file_path if file_path.startswith("templates/") else f"templates/{file_path}"
+        bare = tpl.removeprefix("templates/")
+        deps = _build_file_deps(tpl)
+        # An article may cite the template as either a `template:` node or a
+        # `file:templates/...` node — seed both so neither citation is dropped.
+        related = _related_articles_section([f"template:{bare}", f"file:{tpl}"])
+        return f"{header}\n{deps}\n\n{related}"
+
+    # Stimulus / other: deps view carries the useful structure.
+    deps = _build_file_deps(file_path)
+    related = _related_articles_section(seeds)
+    return f"{header}\n{deps}\n\n{related}"
+
+
+# -----------------------------------------------------------------------------
 # FastMCP server bindings
 # -----------------------------------------------------------------------------
 
@@ -1798,6 +2101,35 @@ def _make_server():
     from mcp.server.fastmcp import FastMCP
 
     server = FastMCP("symfony-code-intel")
+
+    @server.tool()
+    def explore(target: str, max_depth: int = 4) -> str:
+        """One call, one natural target, everything about it — start here.
+
+        The single-call orienting tool. Give it what you already have in hand
+        and it detects the kind and bundles what the granular tools return one
+        slice at a time, so you trade ~3 calls (and ~3 permission prompts) for
+        one:
+
+        - **File path** (``src/Service/Foo.php``, ``arena/index.html.twig``,
+          ``arena_controller.js``) → API surface + dependency/route/git/inline-
+          rationale view + related knowledge articles.
+        - **Route** (``POST /api/session/start`` or a bare ``/api/session/start``)
+          → the controller-to-services call-tree trace + related knowledge.
+        - **FQCN / method symbol / class name** (``App\\Service\\Foo``,
+          ``App\\Service\\Foo::bar``, or just ``Foo``) → resolved to its file,
+          then the file view. Ambiguous short-names list their candidates.
+
+        Deliberately budgeted, not a dump: it composes existing builders. When a
+        slice is truncated or you need one specific angle cheaply, reach for the
+        granular tool (``get_file_api``, ``get_file_deps``, ``trace_route``,
+        ``find_rationale``, ``impact_of_change``, ``get_articles``).
+
+        Args:
+            target: a file path, route, FQCN, method symbol, or class name.
+            max_depth: call-tree depth for the route case (default 4).
+        """
+        return _build_explore(target, max_depth=max_depth)
 
     @server.tool()
     def get_codebase_overview() -> str:
