@@ -4,6 +4,18 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [0.13.0] — 2026-08-29
+
+One change from a session evaluating the GraphRAG multi-hop-reasoning pattern ([The New Stack, 2026-08-27](https://thenewstack.io/graphrag-multi-hop-reasoning-python/)). The article's thesis — plain vector RAG misses multi-hop questions, so pair vector search with a knowledge graph and traverse it — is already this engine's architecture: the unified graph (article `[[wikilinks]]` + code call graph) plus `get_unified_neighbors` / `trace_path`. The one transferable idea was collapsing the two steps a relationship question needs (`search_knowledge`, then a neighbour walk on the *other* MCP server) into a single call. Measuring first showed the graph is dense enough to pay off — 961 articles, 5,470 `[[wikilink]]` edges, only 3 orphans — and, unlike the article's LLM-per-chunk Neo4j pipeline, the edges here are already free and deterministic, so nothing new is billed or parsed.
+
+### Added
+
+- **`expand_neighbors` flag on `search_knowledge`** — off by default. When set, each local article hit also carries `neighbors`: up to 8 slim `{slug, title, relation?}` pointers drawn from the article's outgoing `[[wikilink]]`s, so a "how does X relate to Y" / "why" query gets the connected map in one call instead of a follow-up `get_unified_neighbors` hop on the code-intel server. Deliberately cheap: one O(1) read of the hit's own markdown (no code-graph rebuild), reusing `unified_graph`'s wikilink regex so the definition of a link lives in one place. Dangling links are dropped for graph parity, self-links and `.md`-suffix duplicates collapse, and any read/resolve failure yields fewer/no neighbours — expansion can never raise and break a search. Foreign linked-project hits are skipped so a slug collision cannot attach the wrong project's links.
+
+### Notes
+
+- Adversarial review ran on the **Fable** subagent (Codex was quota-out). It found one **MAJOR** issue — cross-project neighbour pollution: with `include_linked=True`, a foreign hit whose slug collided with a local article would have been given the *local* article's links — plus two MINOR ones (`[[x.md]]` evading the self-link/dedup check; a fragile per-call import). All three fixed with a regression test each. 26 tests pass in `tests/test_knowledge_mcp.py` (11 new for `TestExpandNeighbors`); verified end-to-end against the real 961-article KB.
+
 ## [0.12.0] — 2026-08-21
 
 One change from a session evaluating [CodeGraph](https://github.com/colbymchenry/codegraph) (a Rust + tree-sitter, SQLite/FTS5, no-embeddings code-intelligence platform). Most of CodeGraph overlaps what this engine already ships — a structural call graph, local keyword search (BM25 + vectors), MCP serving, Symfony route mapping, mtime freshness — and CodeGraph has no knowledge-compiler layer, so there was nothing to adopt wholesale. Its one measured advantage is that a *single* tool call answers the question (its own benchmark: 88% fewer tool calls, 2 vs 28 median). We already had the graph-node analogue in `get_neighborhood`, but it needs a `symbol:`/`file:` node id — not the file path, URL, or class name a developer actually starts from. `explore` closes that gap.
