@@ -43,6 +43,7 @@ import parent_watchdog  # noqa: E402
 import vector_store  # noqa: E402
 from compile_truth import parse_frontmatter  # noqa: E402
 from config import KNOWLEDGE_DIR, MEMORY_TYPES  # noqa: E402
+from unified_graph import _HTML_COMMENT_RE, _TYPED_WIKILINK_RE  # noqa: E402
 from utils import load_contradictions, resolve_article_path  # noqa: E402
 
 log = logging.getLogger("knowledge_mcp_server")
@@ -59,6 +60,13 @@ SEARCH_MODES = {"hybrid", "vector", "bm25"}
 # search → get_observations split — saves ~10x context on multi-hit queries
 # where most matches turn out to be irrelevant.
 SNIPPET_CHARS = 220
+
+# Max outgoing [[wikilink]] neighbors surfaced per hit when
+# ``expand_neighbors=True``. Bounds the response so a single search cannot
+# balloon: the agent gets pointers (slug + title), then fetches the bodies
+# that matter via ``get_article``. Reverse (incoming) links are intentionally
+# out of scope — they would need a full-corpus scan, not a single O(1) read.
+NEIGHBOR_CAP = 8
 
 # Metadata fields preserved on slim search hits. Everything else in the
 # Chroma metadata blob (slug duplicates, large strings, internal bookkeeping)
@@ -117,6 +125,95 @@ def _slim_hit(hit: dict[str, Any]) -> dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 
+def _resolve_neighbor_title(target: str, kb: Any, cache: dict[str, Any]) -> Any:
+    """Resolve a wikilink target slug to its title, or ``False`` if dangling.
+
+    Memoized via ``cache`` so a neighbor shared by several hits is read once.
+    A resolved article with no frontmatter title falls back to its own slug; a
+    slug that does not resolve to a real article file returns ``False`` so the
+    caller can drop it — mirroring the unified graph, which never emits an edge
+    to a non-existent node.
+    """
+    if target in cache:
+        return cache[target]
+    try:
+        tpath = resolve_article_path(target, kb, must_exist=True)
+        title = parse_frontmatter(tpath.read_text(encoding="utf-8")).get("title") or target
+    except (ValueError, FileNotFoundError, OSError):
+        title = False
+    cache[target] = title
+    return title
+
+
+def _wikilink_neighbors(slug: str, cache: dict[str, Any]) -> list[dict[str, Any]]:
+    """One article's outgoing ``[[wikilink]]`` neighbors as slim pointers.
+
+    Reads only the article's own markdown (a single file read) and extracts its
+    ``[[target]]{relation}`` links with the same regex the unified graph uses,
+    so "what counts as a wikilink" stays defined in exactly one place. Returns
+    ``[{slug, title, relation?}]`` for up to ``NEIGHBOR_CAP`` distinct,
+    resolvable targets. Never raises: any read/resolve failure yields fewer (or
+    no) neighbors, so expansion can never break a search.
+    """
+    import config
+
+    kb = config.KNOWLEDGE_DIR
+    hit_slug = slug.strip().removesuffix(".md")
+    try:
+        path = resolve_article_path(hit_slug, kb, must_exist=True)
+        content = path.read_text(encoding="utf-8")
+    except (ValueError, FileNotFoundError, OSError):
+        return []
+
+    stripped = _HTML_COMMENT_RE.sub("", content)
+    neighbors: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for match in _TYPED_WIKILINK_RE.finditer(stripped):
+        # Normalize the raw link text the same way resolve_article_path will,
+        # so ``[[concepts/foo.md]]`` dedups with ``[[concepts/foo]]`` and a
+        # self-link is caught rather than listed as the article's own neighbor.
+        target = match.group(1).strip().removesuffix(".md")
+        relation = match.group(2)
+        if not target or target == hit_slug or target in seen:
+            continue
+        seen.add(target)
+        title = _resolve_neighbor_title(target, kb, cache)
+        if title is False:  # dangling link — drop it, as the graph would
+            continue
+        entry: dict[str, Any] = {"slug": target, "title": title}
+        if relation:
+            entry["relation"] = relation
+        neighbors.append(entry)
+        if len(neighbors) >= NEIGHBOR_CAP:
+            break
+    return neighbors
+
+
+def _attach_neighbors(hits: list[dict[str, Any]]) -> None:
+    """Attach outgoing-wikilink neighbors to each article hit, in place.
+
+    Shares one title cache across all hits so overlapping neighbor sets are
+    read once. Hits without a slug (or with no resolvable neighbors) are left
+    untouched — the ``neighbors`` key appears only when there is something to
+    show. Foreign linked-project hits are skipped: their slugs resolve against
+    the LOCAL knowledge/ tree, so a slug collision would otherwise attach a
+    local article's wikilinks to another project's hit (wrong-project data).
+    """
+    cache: dict[str, Any] = {}
+    for hit in hits:
+        # ``project`` is present only on linked-search hits: "<local>" for this
+        # project, or the linked project's directory name for a foreign one.
+        # Absent (None) on ordinary non-linked searches. Only expand local hits.
+        if hit.get("project") not in (None, "<local>"):
+            continue
+        slug = hit.get("slug")
+        if not slug:
+            continue
+        neighbors = _wikilink_neighbors(slug, cache)
+        if neighbors:
+            hit["neighbors"] = neighbors
+
+
 def _search_knowledge_impl(
     query: str,
     limit: int = 5,
@@ -126,6 +223,7 @@ def _search_knowledge_impl(
     include_quarantined: bool = False,
     mode: str = "hybrid",
     include_linked: bool = False,
+    expand_neighbors: bool = False,
 ) -> list[dict[str, Any]]:
     """Search curated articles with metadata filters.
 
@@ -168,23 +266,30 @@ def _search_knowledge_impl(
             zone_filter=zone_filter,
             include_quarantined=include_quarantined,
         )
-        return [_slim_hit(hit) for hit in raw]
+        hits = [_slim_hit(hit) for hit in raw]
+    else:
+        backend = {
+            "hybrid": hybrid_search.search_articles,
+            "vector": vector_store.search_articles,
+            "bm25": bm25_store.search_articles,
+        }[mode]
 
-    backend = {
-        "hybrid": hybrid_search.search_articles,
-        "vector": vector_store.search_articles,
-        "bm25": bm25_store.search_articles,
-    }[mode]
+        raw = backend(
+            query=query,
+            limit=limit,
+            type_filter=type_filter,
+            min_confidence=min_confidence,
+            zone_filter=zone_filter,
+            include_quarantined=include_quarantined,
+        )
+        hits = [_slim_hit(hit) for hit in raw]
 
-    raw = backend(
-        query=query,
-        limit=limit,
-        type_filter=type_filter,
-        min_confidence=min_confidence,
-        zone_filter=zone_filter,
-        include_quarantined=include_quarantined,
-    )
-    return [_slim_hit(hit) for hit in raw]
+    # Opt-in 1-hop graph expansion. Off by default: most lookups are single
+    # facts, and always-on expansion would bloat every response. Foreign
+    # (linked-project) slugs simply resolve to nothing locally and stay bare.
+    if expand_neighbors:
+        _attach_neighbors(hits)
+    return hits
 
 
 def _search_raw_daily_impl(
@@ -583,6 +688,7 @@ def _make_server():
         include_quarantined: bool = False,
         mode: str = "hybrid",
         include_linked: bool = False,
+        expand_neighbors: bool = False,
     ) -> list[dict[str, Any]]:
         """Search the curated knowledge base (hybrid BM25 + vector by default).
 
@@ -616,6 +722,12 @@ def _make_server():
                 queries. Hits get a ``project`` tag (``"<local>"`` or
                 the linked project's directory name). Incompatible with
                 ``mode='bm25'``.
+            expand_neighbors: attach each article's outgoing ``[[wikilink]]``
+                neighbors as ``{slug, title, relation?}`` pointers. Turn this
+                ON for relationship / "how does X relate to Y" / "why" questions
+                so you get the connected map in one call instead of a follow-up
+                ``get_unified_neighbors`` hop. Leave OFF (default) for
+                single-fact lookups — it adds tokens you do not need.
 
         Returns:
             List of slim hits: ``{id, slug, title, snippet, distance, metadata}``.
@@ -623,7 +735,10 @@ def _make_server():
             Lower ``distance`` means closer semantic match (0.0 = identical,
             1.0+ = unrelated). ``metadata`` is narrowed to
             ``{type, confidence, zone, quarantined, updated}``. When
-            ``include_linked=True`` each hit also carries ``project``.
+            ``include_linked=True`` each hit also carries ``project``. When
+            ``expand_neighbors=True`` an article hit that links to other
+            articles also carries ``neighbors`` — a slim list of up to 8
+            ``{slug, title, relation?}`` pointers you can ``get_article`` on.
 
             This is deliberately token-efficient: scan the snippets to decide
             which slugs are worth reading, then call ``get_article(slug)``
@@ -639,6 +754,7 @@ def _make_server():
             include_quarantined=include_quarantined,
             mode=mode,
             include_linked=include_linked,
+            expand_neighbors=expand_neighbors,
         )
 
     @server.tool()

@@ -369,6 +369,227 @@ class TestGetArticlesImpl:
         from knowledge_mcp_server import _get_articles_impl
         assert _get_articles_impl([]) == []
 
+
+class TestExpandNeighbors:
+    """Opt-in 1-hop [[wikilink]] expansion on search hits."""
+
+    def _setup(self, tmp_path, monkeypatch, hit_slug, hit_body):
+        """Point KNOWLEDGE_DIR at tmp_path and stub the search backend.
+
+        The backend returns one hit whose slug is ``hit_slug``; the article
+        body on disk is ``hit_body`` (so the test controls its wikilinks).
+        """
+        import config
+        import knowledge_mcp_server
+
+        monkeypatch.setattr(config, "KNOWLEDGE_DIR", tmp_path)
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / f"{hit_slug.split('/', 1)[1]}.md").write_text(
+            hit_body, encoding="utf-8"
+        )
+
+        def fake_backend(**kwargs):
+            return [{
+                "id": hit_slug,
+                "slug": hit_slug,
+                "text": "hit body",
+                "metadata": {"type": "fact", "title": "Hit"},
+                "distance": 0.1,
+            }]
+
+        monkeypatch.setattr(
+            knowledge_mcp_server.hybrid_search, "search_articles", fake_backend
+        )
+        return knowledge_mcp_server
+
+    def _write_article(self, tmp_path, slug, title=None, body="body"):
+        fm = "---\n" + (f"title: {title}\n" if title else "") + "type: fact\n---\n\n"
+        (tmp_path / "concepts" / f"{slug.split('/', 1)[1]}.md").write_text(
+            fm + body + "\n", encoding="utf-8"
+        )
+
+    def test_off_by_default_no_neighbors_key(self, tmp_path, monkeypatch):
+        kms = self._setup(
+            tmp_path, monkeypatch, "concepts/main",
+            "---\ntitle: Main\n---\n\nSee [[concepts/friend]].\n",
+        )
+        self._write_article(tmp_path, "concepts/friend", title="Friend")
+
+        results = kms._search_knowledge_impl("q")  # expand_neighbors defaults False
+        assert "neighbors" not in results[0]
+
+    def test_attaches_resolvable_neighbor_with_title(self, tmp_path, monkeypatch):
+        kms = self._setup(
+            tmp_path, monkeypatch, "concepts/main",
+            "---\ntitle: Main\n---\n\nRelated: [[concepts/friend]].\n",
+        )
+        self._write_article(tmp_path, "concepts/friend", title="Friend Article")
+
+        results = kms._search_knowledge_impl("q", expand_neighbors=True)
+        assert results[0]["neighbors"] == [
+            {"slug": "concepts/friend", "title": "Friend Article"}
+        ]
+
+    def test_captures_typed_relation_annotation(self, tmp_path, monkeypatch):
+        kms = self._setup(
+            tmp_path, monkeypatch, "concepts/main",
+            "---\ntitle: Main\n---\n\n[[concepts/friend]]{supports} the claim.\n",
+        )
+        self._write_article(tmp_path, "concepts/friend", title="Friend")
+
+        results = kms._search_knowledge_impl("q", expand_neighbors=True)
+        assert results[0]["neighbors"][0]["relation"] == "supports"
+
+    def test_dangling_link_is_dropped(self, tmp_path, monkeypatch):
+        """A wikilink to a non-existent article must not appear (graph parity)."""
+        kms = self._setup(
+            tmp_path, monkeypatch, "concepts/main",
+            "---\ntitle: Main\n---\n\n[[concepts/friend]] and [[concepts/ghost]].\n",
+        )
+        self._write_article(tmp_path, "concepts/friend", title="Friend")
+
+        results = kms._search_knowledge_impl("q", expand_neighbors=True)
+        slugs = [n["slug"] for n in results[0]["neighbors"]]
+        assert slugs == ["concepts/friend"]
+        assert "concepts/ghost" not in slugs
+
+    def test_neighbor_without_title_falls_back_to_slug(self, tmp_path, monkeypatch):
+        kms = self._setup(
+            tmp_path, monkeypatch, "concepts/main",
+            "---\ntitle: Main\n---\n\n[[concepts/friend]].\n",
+        )
+        self._write_article(tmp_path, "concepts/friend", title=None)  # no title
+
+        results = kms._search_knowledge_impl("q", expand_neighbors=True)
+        assert results[0]["neighbors"] == [
+            {"slug": "concepts/friend", "title": "concepts/friend"}
+        ]
+
+    def test_self_link_and_duplicates_are_ignored(self, tmp_path, monkeypatch):
+        kms = self._setup(
+            tmp_path, monkeypatch, "concepts/main",
+            "---\ntitle: Main\n---\n\n[[concepts/main]] [[concepts/friend]] "
+            "[[concepts/friend]] again.\n",
+        )
+        self._write_article(tmp_path, "concepts/friend", title="Friend")
+
+        results = kms._search_knowledge_impl("q", expand_neighbors=True)
+        slugs = [n["slug"] for n in results[0]["neighbors"]]
+        assert slugs == ["concepts/friend"]  # self dropped, dup collapsed
+
+    def test_cap_bounds_neighbor_count(self, tmp_path, monkeypatch):
+        from knowledge_mcp_server import NEIGHBOR_CAP
+
+        links = " ".join(f"[[concepts/n{i}]]" for i in range(NEIGHBOR_CAP + 5))
+        kms = self._setup(
+            tmp_path, monkeypatch, "concepts/main",
+            f"---\ntitle: Main\n---\n\n{links}\n",
+        )
+        for i in range(NEIGHBOR_CAP + 5):
+            self._write_article(tmp_path, f"concepts/n{i}", title=f"N{i}")
+
+        results = kms._search_knowledge_impl("q", expand_neighbors=True)
+        assert len(results[0]["neighbors"]) == NEIGHBOR_CAP
+
+    def test_hit_slug_unresolvable_is_graceful(self, tmp_path, monkeypatch):
+        """If the hit's own article file is missing, expansion is a no-op."""
+        import config
+        import knowledge_mcp_server
+
+        monkeypatch.setattr(config, "KNOWLEDGE_DIR", tmp_path)
+        (tmp_path / "concepts").mkdir()
+
+        def fake_backend(**kwargs):
+            return [{
+                "id": "concepts/gone",
+                "slug": "concepts/gone",
+                "text": "hit body",
+                "metadata": {"type": "fact", "title": "Gone"},
+                "distance": 0.1,
+            }]
+
+        monkeypatch.setattr(
+            knowledge_mcp_server.hybrid_search, "search_articles", fake_backend
+        )
+        results = knowledge_mcp_server._search_knowledge_impl(
+            "q", expand_neighbors=True
+        )
+        assert "neighbors" not in results[0]  # no crash, no empty key
+
+    def test_md_suffix_target_dedups_and_drops_self(self, tmp_path, monkeypatch):
+        """`[[x.md]]` normalizes to `x`: self-link dropped, dup collapsed."""
+        kms = self._setup(
+            tmp_path, monkeypatch, "concepts/main",
+            "---\ntitle: Main\n---\n\n[[concepts/main.md]] [[concepts/friend.md]] "
+            "[[concepts/friend]].\n",
+        )
+        self._write_article(tmp_path, "concepts/friend", title="Friend")
+
+        results = kms._search_knowledge_impl("q", expand_neighbors=True)
+        assert results[0]["neighbors"] == [
+            {"slug": "concepts/friend", "title": "Friend"}
+        ]
+
+    def test_foreign_linked_hit_is_not_expanded(self, tmp_path, monkeypatch):
+        """A linked-project hit whose slug collides locally must stay bare."""
+        import config
+        import knowledge_mcp_server
+
+        monkeypatch.setattr(config, "KNOWLEDGE_DIR", tmp_path)
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "main.md").write_text(
+            "---\ntitle: Main\n---\n\n[[concepts/friend]].\n", encoding="utf-8"
+        )
+        self._write_article(tmp_path, "concepts/friend", title="Friend")
+
+        def fake_backend(**kwargs):
+            return [{
+                "id": "otherproj::concepts/main",
+                "slug": "concepts/main",  # collides with a local slug
+                "text": "hit body",
+                "metadata": {"type": "fact", "title": "Main"},
+                "distance": 0.1,
+                "project": "otherproj",
+            }]
+
+        monkeypatch.setattr(
+            knowledge_mcp_server.hybrid_search, "search_articles", fake_backend
+        )
+        results = knowledge_mcp_server._search_knowledge_impl(
+            "q", expand_neighbors=True
+        )
+        assert "neighbors" not in results[0]
+
+    def test_local_labeled_hit_is_expanded(self, tmp_path, monkeypatch):
+        """A hit explicitly tagged project='<local>' still expands."""
+        import config
+        import knowledge_mcp_server
+
+        monkeypatch.setattr(config, "KNOWLEDGE_DIR", tmp_path)
+        (tmp_path / "concepts").mkdir()
+        (tmp_path / "concepts" / "main.md").write_text(
+            "---\ntitle: Main\n---\n\n[[concepts/friend]].\n", encoding="utf-8"
+        )
+        self._write_article(tmp_path, "concepts/friend", title="Friend")
+
+        def fake_backend(**kwargs):
+            return [{
+                "id": "<local>::concepts/main",
+                "slug": "concepts/main",
+                "text": "hit body",
+                "metadata": {"type": "fact", "title": "Main"},
+                "distance": 0.1,
+                "project": "<local>",
+            }]
+
+        monkeypatch.setattr(
+            knowledge_mcp_server.hybrid_search, "search_articles", fake_backend
+        )
+        results = knowledge_mcp_server._search_knowledge_impl(
+            "q", expand_neighbors=True
+        )
+        assert [n["slug"] for n in results[0]["neighbors"]] == ["concepts/friend"]
+
     def test_batch_rejects_path_traversal(self, tmp_path, monkeypatch):
         import config
 
