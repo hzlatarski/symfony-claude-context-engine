@@ -242,6 +242,51 @@ def collect(knowledge_root: Path, entity_type: str | None = None) -> dict:
     return by_entity
 
 
+def find_entity_matches(
+    graph: dict, query: str, entity_type: str | None = None
+) -> list[dict]:
+    """Fuzzy-find graph nodes the KB *mentions* whose id or label contains
+    ``query`` (case-insensitive substring), newest search surface for Slice 3.
+
+    Searches every node that is the target of a ``mentions`` edge — both minted
+    ``entity:`` nodes AND the ``class:``/``file:`` code nodes that prose
+    path/service mentions folded into — so "show me every note about X" works
+    whether X has a code twin or not. ``entity_type`` restricts to minted
+    ``entity:`` nodes of that type (folded code targets have no entity_type and
+    are excluded when a type is given).
+
+    Returns ``[{target, kind, entity_type, label, mentioners}]`` sorted by
+    mention count (desc) then target id. ``mentioners`` is the sorted unique
+    list of article node ids that reference the target.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    nodes = graph.get("nodes", {})
+    mentioners: dict[str, list[str]] = {}
+    for e in graph.get("edges", []):
+        if e.get("kind") == "mentions":
+            mentioners.setdefault(e["to"], []).append(e["from"])
+
+    out: list[dict] = []
+    for target, froms in mentioners.items():
+        node = nodes.get(target, {})
+        etype = node.get("entity_type")
+        if entity_type and (node.get("kind") != "entity" or etype != entity_type):
+            continue
+        label = str(node.get("label", ""))
+        if q in target.lower() or q in label.lower():
+            out.append({
+                "target": target,
+                "kind": node.get("kind", "?"),
+                "entity_type": etype,
+                "label": label,
+                "mentioners": sorted(set(froms)),
+            })
+    out.sort(key=lambda m: (-len(m["mentioners"]), m["target"]))
+    return out
+
+
 def run(
     knowledge_root: Path,
     min_articles: int = 1,

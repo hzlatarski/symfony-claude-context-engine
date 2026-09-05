@@ -6,7 +6,7 @@ mentions fold into existing ``file:``/``class:`` code nodes; every other type
 mints a standalone ``entity:`` node. No article file is ever written. Tests
 use synthetic tmp_path knowledge dirs and minimal call-graph dicts.
 """
-from scripts import unified_graph
+from scripts import entities, unified_graph
 
 _EMPTY_CG = {"symbols": {}, "edges": [], "classes": {}}
 
@@ -126,3 +126,60 @@ def test_no_entities_when_prose_has_none(tmp_path):
     result = unified_graph.build(call_graph=_EMPTY_CG, knowledge_root=tmp_path)
     assert _mentions(result) == set()
     assert not [n for n in result["nodes"] if n.startswith("entity:")]
+
+
+# ── find_entity_matches (Slice 3 search surface) ────────────────────────
+
+def _graph_two_hosts(tmp_path):
+    concepts = tmp_path / "concepts"
+    concepts.mkdir()
+    (concepts / "a.md").write_text(
+        "---\ntitle: A\n---\nProd host 65.21.4.203 runs it.", encoding="utf-8"
+    )
+    (concepts / "b.md").write_text(
+        "---\ntitle: B\n---\nSSH into 65.21.4.203; also needs ROLE_ADMIN.",
+        encoding="utf-8",
+    )
+    return unified_graph.build(call_graph=_EMPTY_CG, knowledge_root=tmp_path)
+
+
+def test_find_entity_matches_lists_mentioning_notes(tmp_path):
+    graph = _graph_two_hosts(tmp_path)
+    hits = entities.find_entity_matches(graph, "65.21")
+    assert len(hits) == 1
+    assert hits[0]["target"] == "entity:host/65.21.4.203"
+    assert hits[0]["mentioners"] == ["article:concepts/a", "article:concepts/b"]
+
+
+def test_find_entity_matches_type_filter(tmp_path):
+    graph = _graph_two_hosts(tmp_path)
+    assert [h["target"] for h in entities.find_entity_matches(graph, "ROLE", "role")] == [
+        "entity:role/ROLE_ADMIN"
+    ]
+    # A host is not a role → filtered out.
+    assert entities.find_entity_matches(graph, "65.21", "role") == []
+
+
+def test_find_entity_matches_empty_query_returns_nothing(tmp_path):
+    graph = _graph_two_hosts(tmp_path)
+    assert entities.find_entity_matches(graph, "   ") == []
+
+
+def test_find_entity_matches_finds_folded_code_node(tmp_path):
+    concepts = tmp_path / "concepts"
+    concepts.mkdir()
+    (concepts / "a.md").write_text(
+        "---\ntitle: A\n---\nThe ChatService handles it.", encoding="utf-8"
+    )
+    call_graph = {
+        "symbols": {},
+        "edges": [],
+        "classes": {"App\\Service\\ChatService": {"file": "src/Service/ChatService.php"}},
+    }
+    graph = unified_graph.build(call_graph=call_graph, knowledge_root=tmp_path)
+    # Untyped search finds the folded class node.
+    hits = entities.find_entity_matches(graph, "chatservice")
+    assert hits[0]["target"] == "class:App\\Service\\ChatService"
+    assert hits[0]["kind"] == "class"
+    # A type filter excludes folded code nodes (they carry no entity_type).
+    assert entities.find_entity_matches(graph, "chatservice", "service") == []

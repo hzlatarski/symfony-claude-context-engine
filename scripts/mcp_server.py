@@ -34,6 +34,7 @@ if str(_MEMORY_COMPILER_ROOT) not in sys.path:
 
 from scripts.parsers import PROJECT_ROOT, php_graph, route_map, twig_graph, stimulus_map, git_intel, call_graph, messenger_map
 from scripts import unified_graph
+from scripts import entities
 from scripts import parent_watchdog, mermaid_render
 
 log = logging.getLogger("mcp_server")
@@ -1755,6 +1756,37 @@ def _build_find_rationale(tag: str | None = None, query: str | None = None, limi
     return "\n".join(lines)
 
 
+def _build_find_entity(query: str, entity_type: str | None = None) -> str:
+    """Render matching mention-targets + the notes that reference each.
+
+    Thin renderer over ``entities.find_entity_matches`` — all matching logic
+    lives there so it stays unit-testable without booting the MCP server.
+    """
+    graph = _cache.get_unified_graph()
+    matches = entities.find_entity_matches(graph, query, entity_type)
+    if not (query or "").strip():
+        return 'Provide a search string, e.g. `find_entity("kokoro")`.'
+    if not matches:
+        scope = f" of type `{entity_type}`" if entity_type else ""
+        return f"No mentioned entities{scope} match `{query}`."
+
+    header = f"# find_entity: `{query}`"
+    if entity_type:
+        header += f"  (type=`{entity_type}`)"
+    lines = [header, f"{len(matches)} match(es)", ""]
+    for m in matches[:40]:
+        tag = m["entity_type"] or m["kind"]
+        lines.append(f"## `{m['target']}` — {tag} · {len(m['mentioners'])} note(s)")
+        for src in m["mentioners"][:30]:
+            label = graph["nodes"].get(src, {}).get("label", "")
+            lines.append(f"- `{src}` — {label}")
+        lines.append("")
+    lines.append(
+        "Tip: pass any node id above to `get_unified_neighbors` for its full radius."
+    )
+    return "\n".join(lines)
+
+
 def _build_find_community(node_id: str) -> str:
     """Report which community a given node belongs to + sibling members."""
     from scripts import communities as _comm
@@ -2263,6 +2295,28 @@ def _make_server():
         if the node is not in the graph or is below the singleton threshold.
         """
         return _build_find_community(node_id)
+
+    @server.tool()
+    def find_entity(query: str, entity_type: str = "") -> str:
+        """Find named things the KB talks about, and the notes that mention them.
+
+        Entities — hosts, project commands, Symfony roles, env vars, URLs,
+        services, source paths — are lifted from article PROSE by the extractor
+        and joined to the articles that name them via ``mentions`` edges. This
+        fuzzy-matches ``query`` (case-insensitive substring over node id +
+        label) and lists, per match, the notes that reference it. It is the
+        "show me every note about X" lookup that ``get_unified_neighbors`` needs
+        an exact node id for.
+
+        Searches minted ``entity:`` nodes AND the ``class:``/``file:`` code
+        nodes that prose service/path mentions folded into, so a service with a
+        real class is found too. ``entity_type`` (optional) — one of
+        ``host``/``command``/``role``/``envvar``/``url``/``service``/``path`` —
+        restricts to minted ``entity:`` nodes of that type; folded code targets
+        appear only when ``entity_type`` is empty (reach those via the
+        code-intel tools or ``get_unified_neighbors`` on the code node).
+        """
+        return _build_find_entity(query, entity_type or None)
 
     @server.tool()
     def get_salience(kind: str = "all", top_n: int = 10, scope: str = "all") -> str:

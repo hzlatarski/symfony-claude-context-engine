@@ -77,6 +77,7 @@ Six pure-Python parsers plus a tree-sitter call graph expose your live codebase 
 | `trace_path(from_node, to_node, max_depth=8)` | Shortest connection between two unified-graph nodes via BFS over the undirected projection. Each hop is annotated with the edge kind / relation / confidence. The between-two-nodes complement to `get_unified_neighbors`. |
 | `find_rationale(tag=None, query=None)` | Lists inline design-intent comments (`WHY` / `HACK` / `TODO` / `FIXME` / `@deprecated` / …) parsed from `src/**/*.php`, grouped by file with a per-tag count. Filter by exact `tag` and/or a substring `query`. |
 | `merge_order_risk(base="main", branches=None)` | Maps each branch's changed files into graph communities. Reports direct file conflicts (same file on 2+ branches) and community-overlap coupling risk (different files, same cluster). Auto-detects branches ahead of `base` when `branches` is omitted. |
+| `find_entity(query, entity_type="")` | "Show me every note about X." Fuzzy-matches `query` against **entities** — named things (hosts, project commands, Symfony roles, env vars, URLs, services, paths) lifted from article prose and joined to the notes that name them via `mentions` edges — and lists each match's mentioning notes. Searches minted `entity:` nodes **and** the `class:`/`file:` code nodes that prose service/path mentions folded into; `entity_type` restricts to a single minted type. The `get_unified_neighbors` "show me around X" without needing X's exact node id. |
 
 Runs live, mtime-cached, under one second. Git intelligence caches to `knowledge/git-intel.json` (HEAD-based invalidation); the symbol-level call graph caches to `knowledge/call-graph.json` (mtime + HEAD invalidation).
 
@@ -778,6 +779,32 @@ Three things do the real work in **Bridges**, each added because the version bef
 - **Degree normalization** — the ranking itself. `surprise = edge betweenness ÷ deg(u)·deg(v)`: traffic carried, divided by the configuration-model expectation that the edge exists at all. The community ceiling turned out to be only a *proxy* for "don't rank utilities" — it depends on where Leiden happens to cut, and deduplicating parallel edges was enough to let `flush` back in. This is the property stated directly, and it is scale-free, so no threshold needs tuning per project.
 
 Zero LLM cost. Cached at `knowledge/salience.json`, invalidated automatically when the graph changes or the ranking logic is revised.
+
+---
+
+## Entity Cross-Referencing
+
+`crosslink.py` links articles to each other by **title**; `[src:]` anchors link articles to **code**. Neither links by the *thing named inside the prose* — so twenty notes that all mention prod host `65.21.4.203`, role `ROLE_ADMIN`, or command `app:content:narrate` shared no edge. Entity extraction closes that gap.
+
+`scripts/entities.py` lifts a **small, closed, high-precision vocabulary** of named things out of article prose — `host` (IPv4), `command` (`app:*` console namespace), `role` (`ROLE_*`), `envvar` (SCREAMING_SNAKE with an env-var suffix), `url`, `path`, `service` (PascalCase `…Service`/`…Repository`/…). `unified_graph.build()` mints each as an `entity:<type>/<value>` node and joins the articles that name it via `mentions` edges. It is **build-time only** — the exact pattern as `note:` rationale nodes, so **no article file is ever written**. A prose `path`/`service` that matches an existing `file:`/`class:` node **folds into it** instead of minting a parallel node, so a note links straight to the real code through a shared name.
+
+Matching reuses `crosslink.mask_non_prose` (plus a `[src:]`-anchor mask), so entities are never counted inside frontmatter, code fences, inline code, existing links, or citation anchors. Precision is deliberately favoured over recall — a suffixless real env var is missed rather than let non-env constants in.
+
+```bash
+uv run python scripts/entities.py            # dry-run report: what named things the KB talks about
+uv run python scripts/entities.py --min 2    # only entities cross-referenced across >= 2 notes
+uv run python scripts/entities.py --type host
+```
+
+Two ways to query the result — no new tool needed for the first:
+
+```jsonc
+// agent → symfony-code-intel MCP
+get_unified_neighbors { "node_id": "entity:host/65.21.4.203" }   // full radius around a known entity
+find_entity          { "query": "65.21", "entity_type": "host" } // fuzzy "show me every note about X"
+```
+
+`get_salience` and `find_community` pick entity nodes up for free — a much-mentioned entity ranks as a hub. Because entity nodes are rebuilt from prose on every graph build (mtime-cached), they **self-heal**: an entity vanishes the moment the last note naming it is edited away. Idea adapted from [openaleph/openaleph](https://github.com/openaleph/openaleph)'s FollowTheMoney entity resolution, scoped to a closed vocabulary. Pure Python, zero LLM cost. Design + provenance: [ENTITY-EXTRACTION-PLAN.md](ENTITY-EXTRACTION-PLAN.md).
 
 ---
 
