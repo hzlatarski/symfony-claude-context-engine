@@ -24,16 +24,53 @@ Edges:
   ``classes`` map so file-level traversal works.
 
 Node ID prefixes are non-overlapping (``article:``, ``file:``, ``class:``,
-``symbol:``, ``template:``) so a single ID space is unambiguous.
+``symbol:``, ``template:``, ``note:``, ``entity:``) so a single ID space is
+unambiguous.
+
+Entity nodes (``entity:<type>/<value>``) are lifted from article PROSE by
+``entities.extract`` (hosts, commands, roles, env vars, URLs, paths, services)
+and joined to the articles that name them via ``mentions`` edges — the same
+build-time-only pattern as ``note:`` rationale nodes, so no article file is
+ever written. A prose ``path``/``service`` that matches an existing
+``file:``/``class:`` node folds into it instead of minting a parallel node.
 """
 from __future__ import annotations
 
 from pathlib import Path
 import re
 
+# ``entities`` (prose entity extraction) resolves under two import regimes
+# depending on how the entrypoint set up sys.path — mirror the parsers pattern.
+try:
+    from scripts import entities
+except ImportError:  # pragma: no cover - exercised only via CLI entrypoint
+    import entities
+
 _TYPED_WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\](?:\{([a-z0-9_]+)\})?")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _SRC_ANCHOR_RE = re.compile(r"\[src:([^\]]+)\]")
+
+
+def _resolve_entity_target(
+    canonical_id: str, entity_type: str, nodes: dict, class_by_shortname: dict
+) -> str | None:
+    """Map a prose entity to an EXISTING code node when one is unambiguous.
+
+    A ``path`` entity folds into the ``file:`` node of the same repo path; a
+    ``service`` entity folds into a ``class:`` node when exactly one class
+    carries that short name. Every other type (host/command/role/envvar/url),
+    and any path/service with no match (or an ambiguous service short-name),
+    returns ``None`` so the caller mints a standalone ``entity:`` node. This
+    stops one real thing being split across a code node and a parallel entity.
+    """
+    _, _, value = canonical_id.partition("/")
+    if entity_type == "path":
+        file_id = f"file:{value}"
+        return file_id if file_id in nodes else None
+    if entity_type == "service":
+        candidates = class_by_shortname.get(value, [])
+        return candidates[0] if len(candidates) == 1 else None
+    return None
 
 
 def build(call_graph: dict, knowledge_root: Path) -> dict:
@@ -152,6 +189,13 @@ def build(call_graph: dict, knowledge_root: Path) -> dict:
             }
             article_contents[node_id] = content
 
+    # Short-name → class node id(s), for folding ``service`` entities into
+    # existing code nodes. Built once, after Pass 0 has minted class nodes.
+    class_by_shortname: dict[str, list[str]] = {}
+    for nid, ndata in nodes.items():
+        if ndata.get("kind") == "class":
+            class_by_shortname.setdefault(ndata["label"], []).append(nid)
+
     # Pass 2: emit edges that reference other nodes.
     for src_id, content in article_contents.items():
         stripped = _HTML_COMMENT_RE.sub("", content)
@@ -166,6 +210,7 @@ def build(call_graph: dict, knowledge_root: Path) -> dict:
             edges.append(edge)
 
         seen_anchors: set[str] = set()
+        cited_files: set[str] = set()
         for anchor in _SRC_ANCHOR_RE.findall(stripped):
             if anchor in seen_anchors:
                 continue
@@ -174,6 +219,27 @@ def build(call_graph: dict, knowledge_root: Path) -> dict:
             if file_id not in nodes:
                 nodes[file_id] = {"kind": "file", "label": anchor}
             edges.append({"from": src_id, "to": file_id, "kind": "cites"})
+            cited_files.add(file_id)
+
+        # Entity mentions (Slice 2): recurring named things in prose. Fold into
+        # an existing code node when unambiguous, else mint an ``entity:`` node.
+        for ent in entities.extract(stripped):
+            target_id = _resolve_entity_target(
+                ent.canonical_id, ent.type, nodes, class_by_shortname
+            )
+            if target_id is None:
+                target_id = ent.canonical_id
+                if target_id not in nodes:
+                    nodes[target_id] = {
+                        "kind": "entity",
+                        "entity_type": ent.type,
+                        "label": ent.surface,
+                    }
+            elif target_id in cited_files:
+                # A prose path the article already cites via [src:] — the cites
+                # edge already represents it; skip the redundant mention.
+                continue
+            edges.append({"from": src_id, "to": target_id, "kind": "mentions"})
 
     return {"nodes": nodes, "edges": edges}
 
