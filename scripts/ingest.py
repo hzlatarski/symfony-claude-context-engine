@@ -26,7 +26,7 @@ from pathlib import Path
 import time
 
 import ingest_state
-from config import AGENTS_FILE, CLAUDE_BIN, CONCEPTS_DIR, CONNECTIONS_DIR, KNOWLEDGE_DIR, MODEL_INGEST, NO_WINDOW_CREATIONFLAGS, now_iso
+from config import AGENTS_FILE, CLAUDE_BIN, CONCEPTS_DIR, CONNECTIONS_DIR, KNOWLEDGE_DIR, MODEL_INGEST, NO_WINDOW_CREATIONFLAGS, compiler_agent_cwd, compiler_agent_permission_args, now_iso
 from source_handlers import get_handler
 from utils import (
     SourceGroup,
@@ -351,8 +351,6 @@ architectural patterns.
 - Append log at: {KNOWLEDGE_DIR / 'log.md'}
 """
 
-    from config import PROJECT_ROOT
-
     # Strip ANTHROPIC_API_KEY so claude uses subscription auth, not API credits
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
 
@@ -362,7 +360,8 @@ architectural patterns.
         "--no-session-persistence",
         "--output-format", "text",
         "--max-turns", "30",
-        "--dangerously-skip-permissions",
+        # Least privilege: read and write only under knowledge/ (the cwd).
+        *compiler_agent_permission_args(),
     ]
 
     def _run() -> subprocess.CompletedProcess:
@@ -373,7 +372,7 @@ architectural patterns.
             text=True,
             encoding="utf-8",
             timeout=600,
-            cwd=str(PROJECT_ROOT),
+            cwd=compiler_agent_cwd(KNOWLEDGE_DIR),
             env=env,
             creationflags=NO_WINDOW_CREATIONFLAGS,
         )

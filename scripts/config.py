@@ -202,6 +202,80 @@ def _resolve_claude_bin() -> str:
 CLAUDE_BIN = _resolve_claude_bin()
 
 
+# ── Least-privilege sandbox for the wiki-writing agent ───────────────
+# ingest.py and compile.py feed `claude -p` untrusted text (call transcripts,
+# attached documents, session logs) and used to run it with
+# --dangerously-skip-permissions from the host project root, so a
+# prompt-injected instruction could run shell commands, read secrets such as
+# .env.local, or edit any file in the host project. Everything the agent needs
+# is either inlined in the prompt or lives under knowledge/ (it reads existing
+# articles and writes/edits articles, index.md and log.md), so that is all it
+# gets:
+#   cwd = knowledge dir   the working directory is the only place file tools
+#                      may touch without approval; reads anywhere else would
+#                      prompt, and dontAsk turns every prompt into a denial.
+#   --tools            only these built-in tools exist in the session (no Bash,
+#                      PowerShell, WebFetch, WebSearch, Agent, Skill, ...).
+#   --allowedTools     Edit(./**) = edits under the working dir only. Edit
+#                      rules cover every file-editing tool, Write included; a
+#                      Write(path) rule would be accepted but never consulted.
+#                      Read/Glob/Grep need no rule inside the working dir. No
+#                      host path is interpolated into the rule, so directory
+#                      names can never widen it.
+#   --disallowedTools  explicit deny for the dangerous tools, belt and braces
+#                      (deny wins at every level).
+#   --permission-mode dontAsk  anything that would prompt is denied instead
+#                      of hanging.
+#   --strict-mcp-config + empty --mcp-config  no MCP servers or connectors.
+#   --setting-sources ""  no user/project/local settings: no hooks, no
+#                      permission allow-rules, no plugins leak in.
+COMPILER_AGENT_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep", "Write", "Edit")
+COMPILER_AGENT_DENIED_TOOLS: tuple[str, ...] = (
+    "Bash", "PowerShell", "WebFetch", "WebSearch",
+)
+COMPILER_AGENT_EDIT_RULE = "Edit(./**)"  # relative to cwd = knowledge dir
+
+
+def compiler_agent_permission_args() -> list[str]:
+    """CLI flags confining a wiki-compiling ``claude -p`` run to its cwd.
+
+    Shared by ingest.py and compile.py so the two call sites cannot drift.
+    Only safe together with ``cwd=compiler_agent_cwd(KNOWLEDGE_DIR)``.
+    """
+    return [
+        "--tools", ",".join(COMPILER_AGENT_TOOLS),
+        "--allowedTools", COMPILER_AGENT_EDIT_RULE,
+        "--disallowedTools", ",".join(COMPILER_AGENT_DENIED_TOOLS),
+        "--permission-mode", "dontAsk",
+        "--strict-mcp-config",
+        "--mcp-config", '{"mcpServers":{}}',
+        "--setting-sources", "",
+    ]
+
+
+def compiler_agent_cwd(knowledge_dir: Path) -> str:
+    """Working directory for the wiki-compiling agent: the knowledge dir.
+
+    Created if missing, since a nonexistent cwd would fail the spawn.
+
+    The cwd is the agent's whole sandbox (``Edit(./**)``), so it must not
+    resolve to the host project root or one of its ancestors — e.g. through a
+    ``knowledge`` symlink/junction pointing upward — which would hand the
+    agent the whole project again. Raises ``ValueError`` in that case; both
+    callers turn it into an ordinary, retried failure.
+    """
+    knowledge_dir = Path(knowledge_dir)
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    resolved = knowledge_dir.resolve()
+    project = PROJECT_ROOT.resolve()
+    if project == resolved or resolved in project.parents:
+        raise ValueError(
+            f"refusing to run the compiler agent in {resolved}: the knowledge "
+            f"dir resolves to the project root {project} or above it"
+        )
+    return str(knowledge_dir)
+
+
 def now_iso() -> str:
     """Current time in ISO 8601 format."""
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")

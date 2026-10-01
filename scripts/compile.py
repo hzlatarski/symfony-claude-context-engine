@@ -24,7 +24,7 @@ from pathlib import Path
 
 from filelock import FileLock
 
-from config import AGENTS_FILE, CLAUDE_BIN, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, MODEL_COMPILE, NO_WINDOW_CREATIONFLAGS, now_iso
+from config import AGENTS_FILE, CLAUDE_BIN, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, MODEL_COMPILE, NO_WINDOW_CREATIONFLAGS, compiler_agent_cwd, compiler_agent_permission_args, now_iso
 from utils import (
     file_hash,
     list_raw_files,
@@ -192,8 +192,6 @@ Read the daily log above and compile it into wiki articles following the schema 
 - Sources section should cite the daily log with specific claims extracted
 """
 
-    project_root = str(Path(__file__).resolve().parent.parent.parent.parent)
-
     # Strip ANTHROPIC_API_KEY so claude uses subscription auth, not API credits
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
 
@@ -203,7 +201,8 @@ Read the daily log above and compile it into wiki articles following the schema 
         "--no-session-persistence",
         "--output-format", "text",
         "--max-turns", "30",
-        "--dangerously-skip-permissions",
+        # Least privilege: read and write only under knowledge/ (the cwd).
+        *compiler_agent_permission_args(),
     ]
 
     def _run() -> subprocess.CompletedProcess:
@@ -214,7 +213,7 @@ Read the daily log above and compile it into wiki articles following the schema 
             text=True,
             encoding="utf-8",
             timeout=600,
-            cwd=project_root,
+            cwd=compiler_agent_cwd(KNOWLEDGE_DIR),
             env=env,
             creationflags=NO_WINDOW_CREATIONFLAGS,
         )
