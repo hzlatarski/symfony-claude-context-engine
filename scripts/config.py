@@ -253,6 +253,33 @@ def compiler_agent_permission_args() -> list[str]:
     ]
 
 
+# The agent's cwd is the knowledge dir, so every path it is *told* must be
+# relative to that dir: `concepts/x.md`, never `knowledge/concepts/x.md`
+# (which would land in knowledge/knowledge/). The inlined AGENTS.md schema
+# describes the layout as `knowledge/...`; this note maps it.
+COMPILER_AGENT_CWD_NOTE = (
+    "## Working directory\n\n"
+    "Your working directory is the knowledge base root; all paths are relative "
+    "to it. The schema below calls this directory `knowledge/`: it IS your "
+    "working directory, so where the schema says `knowledge/concepts/x.md` you "
+    "use `concepts/x.md`, and `knowledge/index.md` is `index.md`. Never create "
+    "a `knowledge/` folder."
+)
+
+
+def agent_path(path: Path, knowledge_dir: Path, *, is_dir: bool = False) -> str:
+    """``path`` as the agent must write it: relative to its cwd (the knowledge dir).
+
+    Falls back to the absolute path if ``path`` is not under ``knowledge_dir``
+    (never the case with the stock layout; the agent would be denied anyway).
+    """
+    try:
+        rel = Path(path).resolve().relative_to(Path(knowledge_dir).resolve()).as_posix()
+    except ValueError:
+        return str(path)
+    return f"{rel}/" if is_dir else rel
+
+
 def compiler_agent_cwd(knowledge_dir: Path) -> str:
     """Working directory for the wiki-compiling agent: the knowledge dir.
 

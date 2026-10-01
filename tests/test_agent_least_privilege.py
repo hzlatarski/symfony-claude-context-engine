@@ -212,3 +212,80 @@ def test_agent_cwd_refusal_is_a_normal_failure(tmp_path, monkeypatch) -> None:
     _cost, ok = asyncio.run(ingest.ingest_source_file(group, source, state))
     assert ok is False and state["ingested_sources"] == {}
     assert calls == [], "claude must never be spawned in the project root"
+
+
+# ── prompt paths: the agent's cwd is knowledge/, so it must be told paths
+#    relative to it. `knowledge/concepts/x.md` would land in knowledge/knowledge/.
+
+def _prompt_for(module_name: str, tmp_path: Path, monkeypatch) -> tuple[str, Path]:
+    kdir = tmp_path / "knowledge"
+    (kdir / "concepts").mkdir(parents=True)
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("# schema stub", encoding="utf-8")
+    module = ingest if module_name == "ingest" else compiler
+    monkeypatch.setattr(module, "AGENTS_FILE", agents)
+    monkeypatch.setattr(module, "KNOWLEDGE_DIR", kdir)
+    monkeypatch.setattr(module, "CONCEPTS_DIR", kdir / "concepts")
+    monkeypatch.setattr(module, "CONNECTIONS_DIR", kdir / "connections")
+    monkeypatch.setattr(module, "COMPILED_TRUTH_FILE", kdir / "compiled-truth.md")
+    monkeypatch.setattr(module, "update_state", lambda *_a, **_k: None)
+    monkeypatch.setattr(module.dedup, "similar_to_text", lambda *a, **k: [])
+    monkeypatch.setattr(module.dedup, "format_preflight_block", lambda *a, **k: "")
+    seen: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["prompt"] = kwargs["input"]
+        return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="x")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    if module_name == "ingest":
+        source = tmp_path / "doc.md"
+        source.write_text("# a source", encoding="utf-8")
+        group = utils.SourceGroup(id="docs", type="markdown", include=[], exclude=[],
+                                  category="research", description="test")
+        asyncio.run(ingest.ingest_source_file(group, source, {"ingested_sources": {}}))
+    else:
+        monkeypatch.setattr(compiler, "read_wiki_index", lambda *, compact=False: "")
+        monkeypatch.setattr(compiler, "_record_compile_failure", lambda *_a, **_k: None)
+        daily = kdir / "daily"
+        daily.mkdir()
+        log = daily / "2026-07-28.md"
+        log.write_text("# log", encoding="utf-8")
+        asyncio.run(compiler.compile_daily_log(log, {"ingested_daily": {}}))
+    return seen["prompt"], kdir
+
+
+import re  # noqa: E402
+
+
+@pytest.mark.parametrize("module_name", ["ingest", "compile"])
+def test_prompt_paths_are_relative_to_the_knowledge_cwd(
+    module_name, tmp_path, monkeypatch,
+) -> None:
+    prompt, kdir = _prompt_for(module_name, tmp_path, monkeypatch)
+
+    # The cwd is stated explicitly.
+    assert config.COMPILER_AGENT_CWD_NOTE in prompt
+    assert "Your working directory is the knowledge base root" in prompt
+
+    # Outside that note (which maps the schema's `knowledge/` naming), no
+    # path the agent is told may start with knowledge/ ...
+    rest = prompt.replace(config.COMPILER_AGENT_CWD_NOTE, "")
+    assert not re.search(r"(?<![\w-])knowledge[/\\]", rest), (
+        "agent prompt names a knowledge/ path; with cwd = knowledge/ it would "
+        "write to knowledge/knowledge/"
+    )
+    # ... and no absolute path into the knowledge dir is handed out either.
+    assert str(kdir) not in rest and kdir.as_posix() not in rest
+
+    # The write targets are given relative to the cwd.
+    for target in ("concepts/", "connections/", "index.md", "log.md"):
+        assert f": {target}" in rest, f"File paths section lacks {target}"
+
+
+def test_agent_path_is_relative_to_knowledge_dir(tmp_path) -> None:
+    kdir = tmp_path / "knowledge"
+    assert config.agent_path(kdir / "concepts", kdir, is_dir=True) == "concepts/"
+    assert config.agent_path(kdir / "index.md", kdir) == "index.md"
+    outside = tmp_path / "elsewhere" / "x.md"
+    assert config.agent_path(outside, kdir) == str(outside)

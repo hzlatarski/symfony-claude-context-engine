@@ -26,7 +26,7 @@ from pathlib import Path
 import time
 
 import ingest_state
-from config import AGENTS_FILE, CLAUDE_BIN, CONCEPTS_DIR, CONNECTIONS_DIR, KNOWLEDGE_DIR, MODEL_INGEST, NO_WINDOW_CREATIONFLAGS, compiler_agent_cwd, compiler_agent_permission_args, now_iso
+from config import AGENTS_FILE, CLAUDE_BIN, CONCEPTS_DIR, CONNECTIONS_DIR, KNOWLEDGE_DIR, MODEL_INGEST, NO_WINDOW_CREATIONFLAGS, COMPILER_AGENT_CWD_NOTE, agent_path, compiler_agent_cwd, compiler_agent_permission_args, now_iso
 from source_handlers import get_handler
 from utils import (
     SourceGroup,
@@ -222,8 +222,16 @@ async def ingest_source_file(
     timestamp = now_iso()
     rel_source = f"sources/{group.id}/{file_path.name}"
 
+    # Paths as the agent must use them: relative to its cwd (the knowledge dir).
+    concepts_rel = agent_path(CONCEPTS_DIR, KNOWLEDGE_DIR, is_dir=True)
+    connections_rel = agent_path(CONNECTIONS_DIR, KNOWLEDGE_DIR, is_dir=True)
+    index_rel = agent_path(KNOWLEDGE_DIR / "index.md", KNOWLEDGE_DIR)
+    log_rel = agent_path(KNOWLEDGE_DIR / "log.md", KNOWLEDGE_DIR)
+
     prompt = f"""You are a knowledge compiler. Your job is to read a source document and
 extract knowledge into structured wiki articles.
+
+{COMPILER_AGENT_CWD_NOTE}
 
 ## Schema (AGENTS.md)
 
@@ -260,7 +268,7 @@ architectural patterns.
 
 1. **Extract key concepts** — Identify 2-5 distinct concepts worth their own article.
    A large design spec may warrant more; a small governance doc may warrant 1-2.
-2. **Create concept articles** in `knowledge/concepts/` — One .md file per concept
+2. **Create concept articles** in `{concepts_rel}` — One .md file per concept
    - Use the Truth + Timeline format from AGENTS.md:
      * `## Truth` section with TWO subsections:
        - `### Observed` — facts extracted DIRECTLY from the source. Every bullet
@@ -296,7 +304,7 @@ architectural patterns.
      Pick the MOST specific type that fits. When genuinely uncertain, default to `fact`.
      An unknown value here fails lint — use exactly one of the eight above.
    - Write Truth in encyclopedia style — dense, factual, no "we discovered"
-3. **Create connection articles** in `knowledge/connections/` if this source reveals
+3. **Create connection articles** in `{connections_rel}` if this source reveals
    non-obvious relationships between 2+ existing concepts in the wiki
 4. **Update existing articles — with skeptical verification** if this source adds
    new information to concepts already in the wiki:
@@ -317,9 +325,9 @@ architectural patterns.
    - **If the new info EXTENDS existing Truth** (adds non-conflicting detail):
      merge it into Key Points without changing confidence
    - Never overwrite a factual claim in Truth without running the above check
-5. **Update knowledge/index.md** — Add new entries to the table
+5. **Update {index_rel}** — Add new entries to the table
    - Each entry: `| [[path/slug]] | One-line summary | {rel_source} | {timestamp[:10]} |`
-6. **Append to knowledge/log.md** — Add a timestamped entry:
+6. **Append to {log_rel}** — Add a timestamped entry:
    ```
    ## [{timestamp}] ingest | {file_path.name}
    - Source: {rel_source}
@@ -345,10 +353,10 @@ architectural patterns.
   SYNTHESIZE all of them, not just reflect the latest one
 
 ### File paths (use these EXACT paths):
-- Write concept articles to: {CONCEPTS_DIR}
-- Write connection articles to: {CONNECTIONS_DIR}
-- Update index at: {KNOWLEDGE_DIR / 'index.md'}
-- Append log at: {KNOWLEDGE_DIR / 'log.md'}
+- Write concept articles to: {concepts_rel}
+- Write connection articles to: {connections_rel}
+- Update index at: {index_rel}
+- Append log at: {log_rel}
 """
 
     # Strip ANTHROPIC_API_KEY so claude uses subscription auth, not API credits
