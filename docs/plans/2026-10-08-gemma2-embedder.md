@@ -106,8 +106,12 @@ collection's write lock (`chroma_client.write_session`). All stores share one pr
 - AC-8.2 Every write function in vector_store and codebase_store reloads exactly once.
 
 **REQ-9 Damage can be found and repaired.** `scripts/vector_health.py` lists records whose vector
-is unreadable and, with `--repair`, re-embeds them (delete + re-add of the stored document and
-metadata). AC-9.1 On a copy of the live store: articles 392 -> 0 damaged, 392/392 self-retrieved.
+is unreadable and, with `--repair`, re-embeds them: vectors are computed from the stored document
+outside the write lock, then `upsert`ed in place. Nothing is deleted, so a crash mid-repair cannot
+lose a record. By default only the collections search reads are checked; a broken one is reported
+as UNREADABLE instead of hanging the run (`--all` checks every collection).
+AC-9.1 On a copy of the live store: articles 392 -> 0 damaged, 392/392 self-retrieved, still
+fixed after reopening.
 
 **REQ-10 Daily chunks are rebuilt.** The unreadable `daily_chunks` is replaced by
 `daily_chunks_v2` (own hash key `vector_daily_hashes_v2`), rebuilt from the daily files by
@@ -115,3 +119,36 @@ metadata). AC-9.1 On a copy of the live store: articles 392 -> 0 damaged, 392/39
 
 Cut-over order matters: merge first (old code would re-damage the store), then rebuild
 articles (Gemma) and daily (v2), then run `vector_health.py` as the check.
+
+### Review fixes folded in (Codex + Fable, 2026-10-08)
+
+- Hybrid fusion folds the `::v<16 hex>` suffix of versioned vector ids, so a zone found by both
+  BM25 and vector search counts once with two votes (it counted as two documents before).
+- dedup reads the slug from metadata. Stripping ids by hand made every versioned record look
+  like a ghost, and `dedup.py --prune` would have deleted live articles.
+- reindex saves the hash cache every 25 files, not only in `finally`: a killed process never
+  reaches `finally`, and a killed 35-minute rebuild must resume.
+- Gemma "identical" threshold is 0.995 (rank-matched value 0.9945, rounded up: lint escalates
+  "identical" to an error).
+
+### Cut-over runbook (step 7)
+
+All commands run in `.claude/memory-compiler` with `unset VIRTUAL_ENV`.
+
+1. Merge `feat/gemma2-embedder` into the live checkout. Do not touch other sessions' uncommitted
+   files.
+2. Stop or restart every long-lived process that imports the old code: memory-compiler MCP
+   servers (all projects share this checkout), `watch`, the scheduler. An old-code process left
+   running keeps the stale-index bug alive and can re-damage the rebuilt store.
+3. `uv run python scripts/embedder.py --download` (one time, ~170 MB).
+4. `uv run python scripts/reindex.py --articles-only` (~35 min CPU; resumes if stopped).
+5. `uv run python scripts/ingest_scenarios.py` (scenario articles go into the new collection too).
+6. `uv run python scripts/reindex.py --daily-only` (builds `daily_chunks_v2`).
+7. `uv run python scripts/vector_health.py` must exit 0.
+8. AC-7: counts match the article files; the 400-question benchmark through live
+   `hybrid_search` scores >= 86% top-5; measure the cold `user-prompt-submit` hook time.
+
+Rollback: `MC_EMBEDDER=minilm` switches articles back to the old `articles` collection and its
+own hash cache. It does **not** roll back daily search: `daily_chunks_v2` stays in use, because
+the old `daily_chunks` is unreadable. Old code after a `git revert` would read `daily_chunks`
+again and get no daily results.

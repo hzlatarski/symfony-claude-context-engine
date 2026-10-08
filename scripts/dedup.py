@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass, asdict
+from typing import Any
 
 import numpy as np
 
@@ -64,7 +66,8 @@ IDENTICAL_THRESHOLD = 0.97
 #   similar_to_text floor: MiniLM 0.55 passes 65.4% of top-5 hits for daily
 #     sections; Gemma passes the same share at 0.778.
 GEMMA_DEFAULT_THRESHOLD = 0.953
-GEMMA_IDENTICAL_THRESHOLD = 0.99
+# Rounded up, not down: lint escalates "identical" to an error.
+GEMMA_IDENTICAL_THRESHOLD = 0.995
 GEMMA_SIMILAR_FLOOR = 0.78
 MINILM_SIMILAR_FLOOR = 0.55
 
@@ -116,6 +119,19 @@ def article_exists(slug: str) -> bool:
     return (KNOWLEDGE_DIR / f"{slug}.md").exists()
 
 
+def _slug_of(id_: str, meta: dict[str, Any] | None) -> str:
+    """The article slug of a vector record.
+
+    Metadata first: ids are ``slug::zone`` or, after ``replace_article``,
+    ``slug::zone::v<16 hex>``. Stripping the id by hand turned every versioned
+    record into a "ghost" that ``--prune`` would have deleted.
+    """
+    slug = (meta or {}).get("slug")
+    if slug:
+        return str(slug)
+    return re.sub(r"::(observed|synthesized)(::v[0-9a-f]{16})?$", "", id_)
+
+
 def find_stale_vectors() -> list[str]:
     """Indexed slugs whose article file is gone — ghosts in the vector store.
 
@@ -126,8 +142,10 @@ def find_stale_vectors() -> list[str]:
     They also fabricate duplicate pairs against articles that no longer exist.
     """
     collection = vs._articles_collection()
-    got = collection.get(include=[])
-    indexed = {i.rsplit("::", 1)[0] for i in (got.get("ids") or [])}
+    got = collection.get(include=["metadatas"])
+    ids = got.get("ids") or []
+    metas = got.get("metadatas") or [None] * len(ids)
+    indexed = {_slug_of(id_, meta) for id_, meta in zip(ids, metas)}
     return sorted(slug for slug in indexed if not article_exists(slug))
 
 
@@ -160,8 +178,9 @@ def _load_observed_vectors() -> tuple[list[str], np.ndarray]:
 
     slugs: list[str] = []
     keep: list[int] = []
-    for idx, id_ in enumerate(ids):
-        slug = id_.replace("::observed", "")
+    metas = got.get("metadatas") or [None] * len(ids)
+    for idx, (id_, meta) in enumerate(zip(ids, metas)):
+        slug = _slug_of(id_, meta)
         if not article_exists(slug):
             continue
         slugs.append(slug)
@@ -273,7 +292,7 @@ def similar_to_text(text: str, limit: int = 5, threshold: float | None = None) -
                 continue
 
             meta = r.get("metadata") or {}
-            slug = str(r.get("slug") or r.get("id", "")).replace("::observed", "")
+            slug = r.get("slug") or _slug_of(str(r.get("id", "")), meta)
             candidate = {
                 "slug": slug,
                 "title": meta.get("title", ""),

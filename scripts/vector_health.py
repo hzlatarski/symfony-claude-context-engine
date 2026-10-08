@@ -8,11 +8,16 @@ article zones on 2026-10-08).
 
     uv run python scripts/vector_health.py            # check, exit 1 if damaged
     uv run python scripts/vector_health.py --repair   # re-embed damaged records
+    uv run python scripts/vector_health.py --all      # include unused collections
 
-Repair deletes each damaged record and adds it back with its stored document
-and metadata, so it is re-embedded into the index. Ids, texts and metadata
-do not change. Verified on a copy of the live store: 392 -> 0 unreadable,
-392/392 found again by searching their own text.
+Repair re-embeds each damaged record from its stored document and upserts it
+in place: nothing is deleted, and ids, texts and metadata do not change.
+Verified on a copy of the live store: 392 -> 0 unreadable, 392/392 found
+again by searching their own text, still fixed after reopening.
+
+Only the collections search reads are checked by default. Abandoned ones
+(the unreadable legacy ``daily_chunks``, MiniLM ``articles`` while Gemma is
+active) can hang on read, so they need ``--all`` or ``--collection``.
 """
 from __future__ import annotations
 
@@ -25,6 +30,8 @@ import config
 import embedder
 
 BATCH = 200
+
+Report = dict[str, tuple[int, list[str], "str | None"]]
 
 
 def unreadable_ids(collection: Any, ids: list[str], progress: bool = False) -> list[str]:
@@ -45,93 +52,126 @@ def unreadable_ids(collection: Any, ids: list[str], progress: bool = False) -> l
     for start in range(0, len(ids), BATCH):
         probe(ids[start : start + BATCH])
         if progress and (start // BATCH) % 25 == 0:
-            print(f"    checked {start + BATCH}/{len(ids)}, damaged so far {len(bad)}", flush=True)
+            print(f"    checked {min(start + BATCH, len(ids))}/{len(ids)}, damaged so far {len(bad)}", flush=True)
     return bad
 
 
-def _collections(only: str | None = None) -> list[tuple[str, Any]]:
-    """Every collection in the store, opened with the embedder that built it."""
-    client = chroma_client.get_client()
-    names = [c.name if hasattr(c, "name") else c for c in client.list_collections()]
-    if only:
-        names = [n for n in names if n == only]
-    opened = []
-    for name in names:
-        if name == config.CHROMA_COLLECTION_ARTICLES_GEMMA:
-            opened.append((name, client.get_collection(
-                name, embedding_function=embedder.GemmaChromaEmbeddingFunction()
-            )))
-        else:
-            opened.append((name, client.get_collection(name)))
-    return opened
+def in_use() -> list[str]:
+    """The collections live search reads."""
+    return [
+        config.articles_collection_name(),
+        config.CHROMA_COLLECTION_DAILY,
+        config.CHROMA_COLLECTION_CODEBASE,
+    ]
 
 
-def check(only: str | None = None) -> dict[str, tuple[int, list[str]]]:
-    report: dict[str, tuple[int, list[str]]] = {}
+def _names(client: Any) -> list[str]:
+    return sorted(c.name if hasattr(c, "name") else c for c in client.list_collections())
+
+
+def _open(client: Any, name: str) -> Any:
+    if name == config.CHROMA_COLLECTION_ARTICLES_GEMMA:
+        return client.get_collection(name, embedding_function=embedder.GemmaChromaEmbeddingFunction())
+    return client.get_collection(name)
+
+
+def check(names: list[str]) -> Report:
+    """name -> (records, damaged ids, error). One broken collection never
+    stops the report for the others."""
+    report: Report = {}
     with chroma_client.lock:
-        for name, collection in _collections(only):
-            ids = collection.get(include=[])["ids"]
-            print(f"  {name}: {len(ids)} records", flush=True)
-            report[name] = (len(ids), unreadable_ids(collection, ids, progress=True))
+        client = chroma_client.get_client()
+        existing = set(_names(client))
+        for name in names:
+            if name not in existing:
+                report[name] = (0, [], "missing (not built yet)")
+                continue
+            try:
+                collection = _open(client, name)
+                ids = collection.get(include=[])["ids"]
+                print(f"  {name}: {len(ids)} records", flush=True)
+                report[name] = (len(ids), unreadable_ids(collection, ids, progress=True), None)
+            except Exception as exc:
+                report[name] = (0, [], f"UNREADABLE: {type(exc).__name__}: {exc}"[:300])
     return report
 
 
+def _embed(name: str, docs: list[str], metas: list[Any]) -> list[Any]:
+    """New vectors from the stored text, made by the collection's own embedder."""
+    if name == config.CHROMA_COLLECTION_ARTICLES_GEMMA:
+        titles = [(m or {}).get("title") for m in metas]
+        return [list(v) for v in embedder.get_model(download=True).embed_documents(titles, docs)]
+    from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+
+    return [list(v) for v in DefaultEmbeddingFunction()(docs)]
+
+
 def repair_collection(name: str, damaged: list[str]) -> int:
-    """Delete + re-add damaged records under the safe write session."""
-    if not damaged:
-        return 0
+    """Re-embed damaged records in place with ``upsert``. Nothing is deleted.
+
+    Vectors are computed before the write lock is taken: Gemma needs about
+    1-2 s per long document, and other writers wait for this lock.
+    """
+    repaired = 0
     for start in range(0, len(damaged), BATCH):
         batch = damaged[start : start + BATCH]
+        with chroma_client.lock:
+            got = _open(chroma_client.get_client(), name).get(ids=batch, include=["documents", "metadatas"])
+        ids, docs = got["ids"], got["documents"]
+        metas = [m or None for m in got["metadatas"]]
+        if not ids:
+            continue
+        vectors = _embed(name, docs, metas)
         with chroma_client.write_session(name) as client:
-            if name == config.CHROMA_COLLECTION_ARTICLES_GEMMA:
-                collection = client.get_collection(
-                    name, embedding_function=embedder.GemmaChromaEmbeddingFunction()
-                )
-            else:
-                collection = client.get_collection(name)
-            got = collection.get(ids=batch, include=["documents", "metadatas"])
-            ids, docs = got["ids"], got["documents"]
-            metas = [m or None for m in got["metadatas"]]
-            extra: dict[str, Any] = {}
-            if name == config.CHROMA_COLLECTION_ARTICLES_GEMMA:
-                titles = [(m or {}).get("title") for m in metas]
-                extra["embeddings"] = list(embedder.get_model().embed_documents(titles, docs))
-            collection.delete(ids=ids)
-            collection.add(ids=ids, documents=docs, metadatas=metas, **extra)
-    return len(damaged)
+            _open(client, name).upsert(ids=ids, documents=docs, metadatas=metas, embeddings=vectors)
+        repaired += len(ids)
+    return repaired
 
 
-def _print(report: dict[str, tuple[int, list[str]]]) -> int:
-    damaged_total = 0
-    for name, (total, bad) in sorted(report.items()):
+def _print(report: Report) -> tuple[int, int]:
+    damaged_total = errors = 0
+    for name, (total, bad, error) in report.items():
         damaged_total += len(bad)
-        status = "ok" if not bad else f"{len(bad)} DAMAGED"
+        if error:
+            errors += error.startswith("UNREADABLE")
+            status = error
+        else:
+            status = "ok" if not bad else f"{len(bad)} DAMAGED"
         print(f"  {name:<22} {total:>7} records  {status}", flush=True)
-    return damaged_total
+    return damaged_total, errors
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check / repair missing Chroma vectors")
-    parser.add_argument("--repair", action="store_true", help="Re-embed damaged records")
+    parser.add_argument("--repair", action="store_true", help="Re-embed damaged records (upsert, no deletes)")
     parser.add_argument("--collection", help="Only this collection")
+    parser.add_argument("--all", action="store_true", help="Also check collections search does not use")
     args = parser.parse_args()
 
+    if args.collection:
+        names = [args.collection]
+    elif args.all:
+        with chroma_client.lock:
+            names = _names(chroma_client.get_client())
+    else:
+        names = in_use()
+
     print("Checking vector index health...", flush=True)
-    report = check(args.collection)
-    damaged = _print(report)
+    report = check(names)
+    damaged, errors = _print(report)
     if not damaged:
-        return 0
+        return 1 if errors else 0
     if not args.repair:
-        print(f"\n{damaged} records have no vector. Run with --repair to re-embed them.")
+        print(f"\n{damaged} records have no vector. Run with --repair to re-embed them.", flush=True)
         return 1
 
-    for name, (_total, bad) in report.items():
+    for name, (_total, bad, _error) in report.items():
         if bad:
             print(f"Repairing {len(bad)} records in {name}...", flush=True)
             repair_collection(name, bad)
-    print("\nRe-checking...")
-    remaining = _print(check(args.collection))
-    return 0 if not remaining else 1
+    print("\nRe-checking...", flush=True)
+    remaining, errors = _print(check([n for n, (_t, bad, _e) in report.items() if bad]))
+    return 0 if not remaining and not errors else 1
 
 
 if __name__ == "__main__":

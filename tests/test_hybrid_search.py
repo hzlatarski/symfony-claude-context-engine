@@ -191,3 +191,16 @@ def test_bm25_failure_is_not_swallowed(stub_backends, monkeypatch):
     monkeypatch.setattr(hybrid_search.bm25_store, "search_articles", broken)
     with pytest.raises(RuntimeError, match="bm25 bug"):
         hybrid_search.search_articles("anything", limit=5)
+
+
+def test_versioned_vector_id_and_bm25_id_fuse_as_one_document():
+    """replace_article ids carry ``::v<16hex>``; BM25 ids do not. Same zone = one doc."""
+    import hybrid_search
+
+    vec = [{"id": "concepts/a::observed::v0123456789abcdef", "slug": "concepts/a"},
+           {"id": "concepts/b::observed::v1111111111111111", "slug": "concepts/b"}]
+    bm25 = [{"id": "concepts/b::observed", "slug": "concepts/b"},
+            {"id": "concepts/c::observed", "slug": "concepts/c"}]
+    fused = hybrid_search.fuse_rankings([vec, bm25], limit=5)
+    assert [r["slug"] for r in fused] == ["concepts/b", "concepts/a", "concepts/c"]
+    assert fused[0]["rrf_score"] == pytest.approx(1 / 62 + 1 / 61)

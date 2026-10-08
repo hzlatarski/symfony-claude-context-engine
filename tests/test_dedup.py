@@ -144,6 +144,24 @@ class TestStaleVectors:
 
         assert dedup.find_stale_vectors() == ["concepts/ghost"]
 
+    def test_versioned_ids_of_live_articles_are_not_ghosts(self, monkeypatch):
+        """``replace_article`` writes ``slug::zone::v<hex>``. Those must map to
+        their slug, or ``--prune`` deletes every rebuilt article."""
+        class FakeCollection:
+            def get(self, include=None, where=None):
+                return {
+                    "ids": [
+                        "concepts/real::observed::v0123456789abcdef",
+                        "concepts/old::synthesized::vfedcba9876543210",
+                    ],
+                    "metadatas": [{"slug": "concepts/real"}, None],
+                }
+
+        monkeypatch.setattr(dedup.vs, "_articles_collection", lambda: FakeCollection())
+        monkeypatch.setattr(dedup, "article_exists", lambda slug: slug == "concepts/real")
+
+        assert dedup.find_stale_vectors() == ["concepts/old"]
+
     def test_prune_deletes_each_stale_slug_once(self, monkeypatch):
         deleted: list[str] = []
         monkeypatch.setattr(dedup, "find_stale_vectors", lambda: ["concepts/x", "concepts/y"])
@@ -263,7 +281,7 @@ class TestThresholdsFollowTheEmbedder:
 
         monkeypatch.setenv("MC_EMBEDDER", "gemma2-q4")
         assert dedup.default_threshold() == dedup.GEMMA_DEFAULT_THRESHOLD == 0.953
-        assert dedup.identical_threshold() == 0.99
+        assert dedup.identical_threshold() == 0.995
         assert dedup.similar_floor() == 0.78
 
     def test_minilm_keeps_its_values(self, monkeypatch):
@@ -294,3 +312,18 @@ class TestThresholdsFollowTheEmbedder:
         monkeypatch.setattr(dedup.vs, "search_articles", lambda **_kw: list(hits))
         slugs = [h["slug"] for h in dedup.similar_to_text("some source text")]
         assert slugs == ["concepts/near"]  # 0.80 passes 0.78; 0.70 does not
+
+
+def test_near_duplicates_use_metadata_slug_for_versioned_ids(monkeypatch):
+    class FakeCollection:
+        def get(self, include=None, where=None):
+            return {
+                "ids": ["concepts/a::observed::v0123456789abcdef", "concepts/b::observed::v1111111111111111"],
+                "embeddings": [[1.0, 0.0], [1.0, 0.0]],
+                "metadatas": [{"slug": "concepts/a"}, {"slug": "concepts/b"}],
+            }
+
+    monkeypatch.setattr(dedup.vs, "_articles_collection", lambda: FakeCollection())
+    monkeypatch.setattr(dedup, "article_exists", lambda slug: slug in {"concepts/a", "concepts/b"})
+    pairs = dedup.find_near_duplicates(threshold=0.9)
+    assert [(p.slug_a, p.slug_b) for p in pairs] == [("concepts/a", "concepts/b")]

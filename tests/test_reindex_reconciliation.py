@@ -125,3 +125,24 @@ def test_interrupted_gemma_rebuild_resumes(tmp_path, monkeypatch) -> None:
 
     assert reindex.reindex_articles() == (1, 2)
     assert calls == ["a", "b", "c", "c"]
+
+
+def test_hash_cache_is_saved_during_the_run_not_only_at_the_end(tmp_path, monkeypatch) -> None:
+    """A killed process never reaches ``finally``. Progress must already be on disk."""
+    import reindex
+    import utils
+
+    _setup(tmp_path, monkeypatch, ["a", "b", "c"])
+    utils.save_state({})
+    monkeypatch.setenv("MC_EMBEDDER", "gemma2-q4")
+    monkeypatch.setattr(reindex, "PERSIST_EVERY", 2)
+    on_disk_when_c_starts: list[set[str]] = []
+
+    def embed(path, quarantined):
+        if path.stem == "c":
+            saved = utils.load_state().get("vector_article_hashes_gemma2_q4", {})
+            on_disk_when_c_starts.append(set(saved))
+
+    monkeypatch.setattr(reindex, "embed_article_file", embed)
+    reindex.reindex_articles()
+    assert on_disk_when_c_starts == [{"concepts/a", "concepts/b"}]

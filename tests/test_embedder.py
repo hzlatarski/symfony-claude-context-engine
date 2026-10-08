@@ -45,10 +45,15 @@ def test_batch_order_is_preserved(model):
 
 
 def test_input_is_truncated_at_max_tokens(model):
-    long_text = "word " * (embedder.MAX_TOKENS * 3)
-    vector = model.encode([long_text])
-    assert vector.shape == (1, 768)
-    assert np.isfinite(vector).all()
+    """Text past MAX_TOKENS is cut off: a tail after it changes nothing.
+    The same tail on a short text moves the vector a lot (cosine ~0.82)."""
+    tail = " volcanoes erupt in iceland every spring"
+    long_text = "word " * (embedder.MAX_TOKENS * 2)
+    cut = model.encode([long_text, long_text + tail])
+    assert cut.shape == (2, 768) and np.isfinite(cut).all()
+    assert float((cut[0] * cut[1]).sum()) > 0.9999
+    short = model.encode(["word " * 50, "word " * 50 + tail])
+    assert float((short[0] * short[1]).sum()) < 0.95
 
 
 def test_matches_fp32_reference_vectors(model):
@@ -62,7 +67,8 @@ def test_matches_fp32_reference_vectors(model):
 def test_query_and_document_embeddings_differ(model):
     as_query = model.embed_queries(["stimulus naming"])
     as_doc = model.embed_documents([None], ["stimulus naming"])
-    assert float((as_query * as_doc).sum()) < 0.999
+    # Measured 0.973-0.979: the prefixes really change the vector.
+    assert float((as_query * as_doc).sum()) < 0.99
 
 
 def test_chroma_adapter_routes_queries_and_documents(model):

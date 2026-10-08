@@ -52,6 +52,10 @@ from vector_store import stats as vector_stats
 
 
 PROGRESS_EVERY = 50
+# ``finally`` saves the hash cache on an exception, but not when the process
+# is killed (closed terminal, TerminateProcess, sleep). Save it every N files
+# too, so a killed 35-minute rebuild resumes instead of starting again.
+PERSIST_EVERY = 25
 
 
 def reindex_articles(force: bool = False) -> tuple[int, int]:
@@ -86,6 +90,12 @@ def reindex_articles(force: bool = False) -> tuple[int, int]:
         vector_store.delete_article(slug)
         vector_hashes.pop(slug, None)
 
+    def persist(current: dict) -> None:
+        hashes = current.setdefault(hash_key, {})
+        for slug in removed:
+            hashes.pop(slug, None)
+        hashes.update(hash_updates)
+
     try:
         for article in articles:
             rel = str(article.relative_to(KNOWLEDGE_DIR)).replace("\\", "/")
@@ -100,16 +110,12 @@ def reindex_articles(force: bool = False) -> tuple[int, int]:
             vector_hashes[slug] = h
             hash_updates[slug] = h
             embedded += 1
+            if embedded % PERSIST_EVERY == 0:
+                update_state(persist)
             if embedded % PROGRESS_EVERY == 0:
                 # A full Gemma rebuild runs ~35 min on CPU; show it is alive.
                 print(f"  ... embedded {embedded} articles", flush=True)
     finally:
-        def persist(current: dict) -> None:
-            hashes = current.setdefault(hash_key, {})
-            for slug in removed:
-                hashes.pop(slug, None)
-            hashes.update(hash_updates)
-
         update_state(persist)
 
     if embedded:
@@ -147,6 +153,12 @@ def reindex_daily(force: bool = False) -> tuple[int, int]:
         vector_store.delete_chunks_for_daily(source)
         vector_hashes.pop(source, None)
 
+    def persist(current: dict) -> None:
+        hashes = current.setdefault(DAILY_HASHES_STATE_KEY, {})
+        for source in removed:
+            hashes.pop(source, None)
+        hashes.update(hash_updates)
+
     try:
         for daily in daily_files:
             rel = str(daily.relative_to(KNOWLEDGE_DIR)).replace("\\", "/")
@@ -165,13 +177,11 @@ def reindex_daily(force: bool = False) -> tuple[int, int]:
             vector_hashes[rel] = h
             hash_updates[rel] = h
             embedded += 1
+            if embedded % PERSIST_EVERY == 0:
+                update_state(persist)
+            if embedded % PROGRESS_EVERY == 0:
+                print(f"  ... embedded {embedded} daily files", flush=True)
     finally:
-        def persist(current: dict) -> None:
-            hashes = current.setdefault(DAILY_HASHES_STATE_KEY, {})
-            for source in removed:
-                hashes.pop(source, None)
-            hashes.update(hash_updates)
-
         update_state(persist)
 
     return embedded, skipped

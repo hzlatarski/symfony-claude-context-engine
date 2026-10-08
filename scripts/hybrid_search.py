@@ -13,6 +13,7 @@ the MCP tool layer can swap modes without caring about the backend.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import bm25_store
@@ -24,6 +25,15 @@ _log = logging.getLogger(__name__)
 # it only shifts how aggressively high ranks dominate, and empirically the
 # default serves generic retrieval well.
 _RRF_K = 60
+
+# replace_article stores ``slug::zone::v<16 hex>``; BM25 ids are ``slug::zone``.
+# Without folding the version off, the same zone counts as two documents and
+# never earns the cross-stream corroboration vote RRF exists for.
+_VERSION_SUFFIX = re.compile(r"::v[0-9a-f]{16}$")
+
+
+def _fusion_key(result_id: str) -> str:
+    return _VERSION_SUFFIX.sub("", result_id)
 
 # Oversample each path so documents the other path rescues still have a
 # rank slot to contribute from. Without the multiplier, an article ranked
@@ -59,17 +69,20 @@ def fuse_rankings(
         # on — the opposite of what RRF is for. The first (best) rank wins.
         counted: set[str] = set()
         for rank, result in enumerate(results, start=1):
-            rid = result["id"]
+            rid = _fusion_key(result["id"])
             if rid in counted:
                 continue
             counted.add(rid)
             scores[rid] = scores.get(rid, 0.0) + 1.0 / (_RRF_K + rank)
             merged.setdefault(rid, result)
 
-    ordered = sorted(merged.values(), key=lambda r: -scores[r["id"]])
-    for result in ordered:
-        result["rrf_score"] = scores[result["id"]]
-    return ordered[:limit]
+    ordered = sorted(merged, key=lambda rid: -scores[rid])
+    out = []
+    for rid in ordered:
+        result = merged[rid]
+        result["rrf_score"] = scores[rid]
+        out.append(result)
+    return out[:limit]
 
 
 def search_articles(
