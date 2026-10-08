@@ -88,3 +88,58 @@ def test_every_store_write_reloads_from_disk(tmp_path, monkeypatch):
         before = len(resets)
         write()
         assert len(resets) == before + 1, f"{name} wrote without reloading from disk"
+
+
+def test_long_lived_reader_sees_writes_from_other_processes(tmp_path):
+    """A running MCP server must not keep serving the index it loaded at start."""
+    store = tmp_path / "store"
+    assert _run("seed", store, "session").returncode == 0
+    reader = subprocess.Popen(
+        [sys.executable, str(WORKER), "reader", str(store), "session"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    assert reader.stdout.readline().strip() == "loaded"
+    assert _run("writer", store, "session").returncode == 0
+    (tmp_path / "go.flag").write_text("go")
+    out, err = reader.communicate(timeout=180)
+    assert json.loads(out.strip().splitlines()[-1]) == {"found": 20}, err
+
+
+def test_write_session_stops_the_replaced_system(tmp_path, monkeypatch):
+    """Each reload must free the old system, or every write leaks one."""
+    import chroma_client
+    import config
+
+    monkeypatch.setattr(config, "CHROMA_DB_DIR", tmp_path / "chroma")
+    chroma_client.reset()
+    old_system = chroma_client.get_client()._system
+    with chroma_client.write_session("anything"):
+        pass
+    assert old_system._running is False
+
+
+def test_reader_reloads_only_when_generation_changes(tmp_path, monkeypatch):
+    import os
+
+    import chroma_client
+    import config
+
+    monkeypatch.setattr(config, "CHROMA_DB_DIR", tmp_path / "chroma")
+    chroma_client.reset()
+    resets: list[int] = []
+    real_reset = chroma_client.reset
+    monkeypatch.setattr(chroma_client, "reset", lambda: (resets.append(1), real_reset())[1])
+
+    chroma_client.get_client()
+    chroma_client.get_client()
+    assert resets == []  # no write anywhere: keep the loaded index
+
+    marker = chroma_client._db_dir() / chroma_client._GENERATION_FILE
+    marker.write_text("another process wrote", encoding="utf-8")
+    # A fixed, clearly different mtime (Windows stores 100 ns ticks, so a
+    # tiny value would round to 0, the "no file" generation).
+    os.utime(marker, ns=(10**18, 10**18))
+    chroma_client.get_client()
+    assert resets == [1]
+    chroma_client.get_client()
+    assert resets == [1]  # reloaded once, then current again

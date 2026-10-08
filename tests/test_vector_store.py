@@ -137,17 +137,19 @@ class TestVectorStoreBasics:
                 "updated": "2026-07-28",
             },
         )
-        collection = store._articles_collection()
+        # Fetch a fresh handle on every call: a write reloads the store and
+        # stops the old one, so a handle held across a write is dead.
+        real = store.articles_collection
 
         class FailingCollection:
             def get(self, *args, **kwargs):
-                return collection.get(*args, **kwargs)
+                return real().get(*args, **kwargs)
 
             def upsert(self, *args, **kwargs):
                 raise RuntimeError("embedding failed")
 
             def delete(self, *args, **kwargs):
-                return collection.delete(*args, **kwargs)
+                return real().delete(*args, **kwargs)
 
         monkeypatch.setattr(store, "_articles_collection", FailingCollection)
         with pytest.raises(RuntimeError, match="embedding failed"):
@@ -163,7 +165,7 @@ class TestVectorStoreBasics:
                 },
             )
 
-        result = collection.get(
+        result = real().get(
             where={"slug": {"$eq": "concepts/durable"}},
             include=["documents"],
         )
@@ -570,3 +572,16 @@ class TestGemmaWrites:
             store.replace_article("concepts/keep", "Keep", {"observed": "v2"}, ARTICLE_META)
         got = store.articles_collection().get(include=["documents"])
         assert got["documents"] == ["complete v1"]
+
+
+class TestReadPathNeverCreates:
+    def test_search_before_rebuild_returns_empty_without_creating(self, fresh_store, monkeypatch, caplog):
+        monkeypatch.setenv("MC_EMBEDDER", "gemma2-q4")
+        fresh_store._missing_warned.clear()
+        with caplog.at_level("WARNING", logger="vector_store"):
+            assert fresh_store.search_articles("anything") == []
+            assert fresh_store.search_articles("again") == []
+        names = [c.name for c in fresh_store._get_client().list_collections()]
+        assert "articles_gemma2_q4" not in names
+        assert sum("reindex.py --articles-only" in r.getMessage() for r in caplog.records) == 1
+        assert fresh_store.stats()["articles"] == 0

@@ -57,6 +57,20 @@ elif role == "stale":
     while not GO.exists():
         time.sleep(0.1)
     write(held, [f"late-{i}" for i in range(15)], [f"late write {i} from a long-lived process" for i in range(15)])
+elif role == "reader":
+    # Long-lived reader (like the MCP server): loads, then searches again
+    # after another process wrote. Prints how many fresh docs it can find.
+    col = collection(chroma_client.get_client())
+    col.query(query_texts=["topic"], n_results=3)
+    print("loaded", flush=True)
+    while not GO.exists():
+        time.sleep(0.1)
+    col = collection(chroma_client.get_client())
+    found = sum(
+        f"fresh-{i}" in col.query(query_texts=[f"fresh note {i} about zebra{i}"], n_results=3)["ids"][0]
+        for i in range(20)
+    )
+    print(json.dumps({"found": found}), flush=True)
 elif role == "writer":
     write(None, FRESH, [f"fresh note {i} about zebra{i}" for i in range(20)])
 elif role == "check":

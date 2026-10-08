@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from typing import Any
 
 # chromadb (and the onnx + numpy chain it pulls in) is imported eagerly here,
@@ -35,6 +36,7 @@ from config import CHROMA_COLLECTION_DAILY
 # Shared with every store in the process; see chroma_client for why writes
 # go through chroma_client.write_session and never a long-held client.
 _lock = chroma_client.lock
+_log = logging.getLogger(__name__)
 CHROMA_UPSERT_BATCH_SIZE = 256
 
 
@@ -42,22 +44,43 @@ def _get_client():
     return chroma_client.get_client()
 
 
-def articles_collection(client: Any = None):
+def articles_collection(client: Any = None, create: bool = True):
     """The articles collection of the active embedder, opened with its own
     embedding function — the only way any module should reach it, so a
     query is never embedded by a different model than the stored vectors.
 
-    ``client`` lets linked_search open another project's store the same way.
+    Read paths pass ``create=False``: a search must not create an empty
+    collection (that would hide a missing rebuild behind silent BM25-only
+    results). Raises ``ArticlesIndexMissing`` instead.
     """
     client = client or _get_client()
     name = config.articles_collection_name()
-    if config.active_embedder() == config.EMBEDDER_MINILM:
-        return client.get_or_create_collection(name=name, metadata={"hnsw:space": "cosine"})
-    return client.get_or_create_collection(
-        name=name,
-        metadata={"hnsw:space": "cosine"},
-        embedding_function=embedder.GemmaChromaEmbeddingFunction(),
-    )
+    kwargs: dict[str, Any] = {}
+    if config.active_embedder() != config.EMBEDDER_MINILM:
+        kwargs["embedding_function"] = embedder.GemmaChromaEmbeddingFunction()
+    if create:
+        return client.get_or_create_collection(
+            name=name, metadata={"hnsw:space": "cosine"}, **kwargs
+        )
+    try:
+        return client.get_collection(name, **kwargs)
+    except Exception as exc:
+        if "does not exist" not in str(exc).lower() and "notfound" not in type(exc).__name__.lower():
+            raise
+        raise ArticlesIndexMissing(name) from exc
+
+
+class ArticlesIndexMissing(LookupError):
+    """The active embedder's articles collection has not been built yet."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            f"Articles vector index {name!r} does not exist yet. Build it with "
+            "`uv run python scripts/reindex.py --articles-only`."
+        )
+
+
+_missing_warned: set[str] = set()
 
 
 # Kept for existing callers and tests that patch it.
@@ -73,7 +96,7 @@ def _article_embeddings(titles: list[str], texts: list[str]) -> list[Any] | None
     """Title-aware document vectors for Gemma; None lets MiniLM embed as before."""
     if config.active_embedder() == config.EMBEDDER_MINILM:
         return None
-    return list(embedder.get_model().embed_documents(titles, texts))
+    return list(embedder.get_model(download=True).embed_documents(titles, texts))
 
 
 def _daily_collection():
@@ -381,7 +404,15 @@ def search_articles(
         conditions.append({"zone": {"$eq": zone_filter}})
 
     with _lock:
-        result = _articles_collection().query(
+        try:
+            collection = articles_collection(create=False)
+        except ArticlesIndexMissing as exc:
+            name = config.articles_collection_name()
+            if name not in _missing_warned:
+                _missing_warned.add(name)
+                _log.warning("%s Searching with BM25 only until then.", exc)
+            return []
+        result = collection.query(
             query_texts=[query],
             n_results=limit,
             where=_and_or_single(conditions),
@@ -505,7 +536,12 @@ def _flatten_results(result: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def stats() -> dict[str, int]:
-    return {
-        "articles": _articles_collection().count(),
-        "daily_chunks": _daily_collection().count(),
-    }
+    with _lock:
+        try:
+            articles = articles_collection(create=False).count()
+        except ArticlesIndexMissing:
+            articles = 0
+        return {
+            "articles": articles,
+            "daily_chunks": _daily_collection().count(),
+        }

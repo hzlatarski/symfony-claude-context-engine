@@ -67,8 +67,12 @@ def _model_present(directory: Path) -> bool:
     return all((directory / name).is_file() for name in MODEL_FILES)
 
 
-def ensure_model() -> Path:
+def ensure_model(download: bool = True) -> Path:
     """Return the model directory, downloading the pinned files once.
+
+    ``download=False`` (the search path) never touches the network: a search
+    runs inside the per-prompt hook's time budget, so a missing model must
+    fail fast and let BM25 answer, not wait on a lock or a 170 MB download.
 
     ``local_dir`` is required: files resolved through the Hugging Face symlink
     cache fail onnxruntime's external-data path check ("path escapes model
@@ -77,6 +81,12 @@ def ensure_model() -> Path:
     directory = model_dir()
     if _model_present(directory):
         return directory
+    if not download:
+        raise EmbedderUnavailable(
+            f"EmbeddingGemma 2 model files are missing from {directory}. Fix: run "
+            "`uv run python scripts/embedder.py --download` (a reindex also fetches "
+            "them), or set MC_EMBEDDER=minilm to use the old collection."
+        )
     directory.mkdir(parents=True, exist_ok=True)
     with FileLock(str(directory.parent / f".{MODEL_REVISION}.download.lock")):
         if _model_present(directory):
@@ -110,8 +120,7 @@ def query_text(query: str) -> str:
 class GemmaOnnx:
     """Thread-safe wrapper around one ONNX session."""
 
-    def __init__(self, directory: Path | None = None) -> None:
-        directory = directory or ensure_model()
+    def __init__(self, directory: Path) -> None:
         options = ort.SessionOptions()
         options.log_severity_level = 3
         self._session = ort.InferenceSession(
@@ -163,12 +172,13 @@ _model: GemmaOnnx | None = None
 _model_lock = threading.Lock()
 
 
-def get_model() -> GemmaOnnx:
+def get_model(download: bool = False) -> GemmaOnnx:
+    """The shared model. Only write paths pass ``download=True``."""
     global _model
     if _model is None:
         with _model_lock:
             if _model is None:
-                _model = GemmaOnnx()
+                _model = GemmaOnnx(ensure_model(download=download))
     return _model
 
 

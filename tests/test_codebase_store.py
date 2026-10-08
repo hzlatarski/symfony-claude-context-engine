@@ -4,6 +4,19 @@ from __future__ import annotations
 import pytest
 
 
+
+class _Fresh:
+    """Re-fetch the collection on every use. A write reloads the store and
+    stops the old handle, so a handle captured before a write is dead."""
+
+    def __init__(self, store):
+        # Bound now: tests later monkeypatch _codebase_collection with fakes
+        # that delegate back to this object.
+        self._get = store._codebase_collection
+
+    def __getattr__(self, name):
+        return getattr(self._get(), name)
+
 @pytest.fixture
 def store(tmp_path, monkeypatch):
     import config
@@ -78,7 +91,7 @@ class TestCodebaseStore:
             text="class FooOldImplementation {}",
             metadata={"file_type": "php", "start_line": 1, "end_line": 1},
         )
-        collection = store._codebase_collection()
+        collection = _Fresh(store)
 
         def fail_during_stage(prepared):
             chunk_id, text, metadata = prepared[0]
@@ -174,7 +187,7 @@ class TestCodebaseStore:
             },
         }]
         store.replace_chunks_for_file(rel, chunks)
-        collection = store._codebase_collection()
+        collection = _Fresh(store)
 
         def fail_after_overwriting_metadata(prepared):
             chunk_id, text, metadata = prepared[0]
@@ -212,7 +225,7 @@ class TestCodebaseStore:
             },
         }]
         store.replace_chunks_for_file(rel, chunks)
-        collection = store._codebase_collection()
+        collection = _Fresh(store)
         existing = collection.get(
             where={"rel_path": {"$eq": rel}},
             include=[],

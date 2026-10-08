@@ -30,6 +30,7 @@ from typing import Any
 import chromadb
 
 import chroma_client
+import config
 import embedder
 import hybrid_search
 from chroma_path import ensure_active_chroma_dir
@@ -69,23 +70,50 @@ def _client_for(project_root: Path) -> Any:
     return client
 
 
-def _linked_articles_collection(client: Any) -> Any:
-    """Open a sibling's articles with the embedder its vectors came from.
+def _linked_candidates() -> list[tuple[str, Any]]:
+    """Collections to try in a sibling store, best first.
 
-    Uses ``get_collection``, never ``get_or_create``: searching must not
-    create collections in another project's store. None when it has neither.
+    Follows MC_EMBEDDER, so ``minilm`` really is a rollback for linked search
+    too. Under Gemma the legacy collection is the fallback for a sibling that
+    has not migrated (or has only an empty, half-built Gemma collection).
     """
-    try:
-        return client.get_collection(
-            CHROMA_COLLECTION_ARTICLES_GEMMA,
-            embedding_function=embedder.GemmaChromaEmbeddingFunction(),
-        )
-    except Exception:
-        pass
-    try:
-        return client.get_collection(CHROMA_COLLECTION_ARTICLES)
-    except Exception:
-        return None
+    legacy = (CHROMA_COLLECTION_ARTICLES, None)
+    if config.active_embedder() == config.EMBEDDER_MINILM:
+        return [legacy]
+    return [(CHROMA_COLLECTION_ARTICLES_GEMMA, embedder.GemmaChromaEmbeddingFunction()), legacy]
+
+
+def _open(client: Any, name: str, ef: Any) -> Any:
+    """``get_collection``, never ``get_or_create``: searching must not create
+    collections in another project's store."""
+    if ef is None:
+        return client.get_collection(name)
+    return client.get_collection(name, embedding_function=ef)
+
+
+def _linked_articles_collection(client: Any) -> Any:
+    """The first non-empty candidate collection, or None."""
+    for name, ef in _linked_candidates():
+        try:
+            collection = _open(client, name, ef)
+            if collection.count() > 0:
+                return collection
+        except Exception:
+            continue
+    return None
+
+
+def _query_linked(client: Any, query: str, pool: int, where: Any) -> Any:
+    """Query the best candidate; fall back to the next one if it errors."""
+    for name, ef in _linked_candidates():
+        try:
+            collection = _open(client, name, ef)
+            if collection.count() == 0:
+                continue
+            return collection.query(query_texts=[query], n_results=pool, where=where)
+        except Exception:
+            continue
+    return None
 
 
 def _build_where(
@@ -180,15 +208,14 @@ def search_articles_linked(
         include_quarantined=include_quarantined,
     )
     for project_path in LINKED_PROJECTS:
-        client = _client_for(project_path)
-        if client is None:
-            continue
-        coll = _linked_articles_collection(client)
-        if coll is None:
-            continue
-        try:
-            res = coll.query(query_texts=[query], n_results=pool, where=where)
-        except Exception:
+        # Held per project: a local write's reset() must not stop the
+        # system under a query that is still running.
+        with chroma_client.lock:
+            client = _client_for(project_path)
+            if client is None:
+                continue
+            res = _query_linked(client, query, pool, where)
+        if res is None:
             continue
         label = project_path.name or str(project_path)
         linked_by_project[label].extend(_flatten(res, label))

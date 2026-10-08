@@ -91,3 +91,38 @@ def test_linked_search_merges_a_legacy_sibling(tmp_path, monkeypatch, fresh_chro
 
     hits = linked_search.search_articles_linked(query="stimulus naming", limit=3)
     assert [(h["project"], h["slug"]) for h in hits] == [("legacy", "concepts/x")]
+
+
+def test_minilm_rollback_queries_the_legacy_collection(tmp_path, fresh_chroma, monkeypatch):
+    import embedder
+    import linked_search
+
+    _, client = _sibling(tmp_path, "both")
+    client.get_or_create_collection("articles", metadata={"hnsw:space": "cosine"}).add(
+        ids=["legacy::observed"], documents=["stimulus naming rules"],
+    )
+    client.get_or_create_collection(
+        "articles_gemma2_q4", metadata={"hnsw:space": "cosine"},
+        embedding_function=embedder.GemmaChromaEmbeddingFunction(),
+    ).add(ids=["gemma::observed"], documents=["stimulus naming rules"])
+    monkeypatch.setenv("MC_EMBEDDER", "minilm")
+    assert linked_search._linked_articles_collection(client).name == "articles"
+    monkeypatch.setenv("MC_EMBEDDER", "gemma2-q4")
+    assert linked_search._linked_articles_collection(client).name == "articles_gemma2_q4"
+
+
+def test_empty_gemma_collection_falls_back_to_legacy(tmp_path, fresh_chroma, monkeypatch):
+    import embedder
+    import linked_search
+
+    monkeypatch.setenv("MC_EMBEDDER", "gemma2-q4")
+    _, client = _sibling(tmp_path, "half-migrated")
+    client.get_or_create_collection("articles", metadata={"hnsw:space": "cosine"}).add(
+        ids=["legacy::observed"], documents=["stimulus naming rules"],
+    )
+    client.get_or_create_collection(
+        "articles_gemma2_q4", metadata={"hnsw:space": "cosine"},
+        embedding_function=embedder.GemmaChromaEmbeddingFunction(),
+    )
+    res = linked_search._query_linked(client, "stimulus", 1, None)
+    assert res["ids"] == [["legacy::observed"]]

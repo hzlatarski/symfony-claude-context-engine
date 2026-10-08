@@ -160,11 +160,12 @@ def search_codebase(
     elif conditions:
         where = {"$and": conditions}
 
-    result = _codebase_collection().query(
-        query_texts=[query],
-        n_results=limit,
-        where=where,
-    )
+    with _lock:
+        result = _codebase_collection().query(
+            query_texts=[query],
+            n_results=limit,
+            where=where,
+        )
     return _flatten_results(result)
 
 
@@ -186,7 +187,8 @@ def _flatten_results(result: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def stats() -> dict[str, int]:
-    return {"codebase_chunks": _codebase_collection().count()}
+    with _lock:
+        return {"codebase_chunks": _codebase_collection().count()}
 
 
 def type_stats() -> dict[str, int]:
@@ -194,10 +196,11 @@ def type_stats() -> dict[str, int]:
     counts: dict[str, int] = {}
     for ft in ("php", "js", "twig", "yaml"):
         try:
-            result = _codebase_collection().get(
-                where={"file_type": {"$eq": ft}},
-                include=[],
-            )
+            with _lock:
+                result = _codebase_collection().get(
+                    where={"file_type": {"$eq": ft}},
+                    include=[],
+                )
             counts[ft] = len(result["ids"])
         except Exception:
             counts[ft] = 0

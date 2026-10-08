@@ -24,6 +24,7 @@ system cache invalidates every client object that came from it.
 from __future__ import annotations
 
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -41,7 +42,13 @@ lock = threading.RLock()
 
 _client: Any = None
 _client_dir: Path | None = None
+_client_generation: int = -1
 _resolved: dict[Path, Path] = {}
+
+# Touched after every write. A long-lived reader (the MCP server) compares it
+# before each use and reloads when another process has written, otherwise it
+# keeps serving the index it loaded at start and never sees new vectors.
+_GENERATION_FILE = ".write-generation"
 
 
 def _db_dir() -> Path:
@@ -58,29 +65,72 @@ def _alive(client: Any) -> bool:
     return getattr(client, "_identifier", None) in SharedSystemClient._identifier_to_system
 
 
+def _generation(db_dir: Path) -> int:
+    try:
+        return (db_dir / _GENERATION_FILE).stat().st_mtime_ns
+    except FileNotFoundError:
+        return 0
+
+
+def _bump_generation(db_dir: Path) -> int:
+    marker = db_dir / _GENERATION_FILE
+    marker.write_text(str(time.time_ns()), encoding="utf-8")
+    return _generation(db_dir)
+
+
 def get_client() -> Any:
-    global _client, _client_dir
+    """The process client, reloaded first if any process wrote since it loaded."""
+    global _client, _client_dir, _client_generation
     with lock:
         db_dir = _db_dir()
-        if _client is None or _client_dir != db_dir or not _alive(_client):
+        generation = _generation(db_dir)
+        stale = _client is not None and (
+            _client_dir != db_dir or not _alive(_client) or generation != _client_generation
+        )
+        if stale:
+            reset()
+        if _client is None:
+            # Read the generation BEFORE loading, so a write that lands during
+            # the load is caught by the next call rather than missed.
             _client = chromadb.PersistentClient(path=str(db_dir))
             _client_dir = db_dir
+            _client_generation = generation
         return _client
 
 
 def reset() -> None:
-    """Drop every in-memory index in this process; the next use reloads from disk."""
-    global _client, _client_dir
+    """Drop every in-memory index in this process; the next use reloads from disk.
+
+    clear_system_cache() only forgets the systems; stopping them is what frees
+    their sqlite connection, threads and HNSW copies. Without it each write
+    leaked a whole system until the cyclic GC ran (~1.6 GB after 100 writes).
+    """
+    global _client, _client_dir, _client_generation
     with lock:
+        systems = list(SharedSystemClient._identifier_to_system.values())
         SharedSystemClient.clear_system_cache()
+        for system in systems:
+            try:
+                system.stop()
+            except Exception:  # an already-stopped or half-built system
+                pass
         _client = None
         _client_dir = None
+        _client_generation = -1
 
 
 @contextmanager
 def write_session(collection: str) -> Iterator[Any]:
     """Cross-process write lock + a client reloaded from disk inside it."""
+    global _client_generation
     with chroma_write_lock(collection):
         with lock:
             reset()
-            yield get_client()
+            client = get_client()
+            try:
+                yield client
+            finally:
+                # Even a failed write may have changed the store. Tell
+                # long-lived readers in other processes to reload; this
+                # process already holds the post-write state, so it does not.
+                _client_generation = _bump_generation(_db_dir())

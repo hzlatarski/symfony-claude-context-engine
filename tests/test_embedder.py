@@ -117,3 +117,16 @@ def test_model_is_downloaded_with_local_dir(tmp_path, monkeypatch):
     calls.clear()
     embedder.ensure_model()
     assert calls == []  # present files are never fetched again
+
+
+def test_search_path_never_downloads(tmp_path, monkeypatch):
+    """A missing model must fail fast inside the prompt hook, not fetch 170 MB."""
+    monkeypatch.setenv("MC_EMBEDDER_CACHE", str(tmp_path))
+    import huggingface_hub
+
+    calls = []
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(embedder, "_model", None)
+    with pytest.raises(embedder.EmbedderUnavailable, match="scripts/embedder.py --download"):
+        embedder.get_model()
+    assert calls == []
