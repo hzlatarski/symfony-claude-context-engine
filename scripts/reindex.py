@@ -9,11 +9,15 @@ Modes
 
 State
 -----
-Hash cache lives in ``state.json`` under two keys that are created on first
-run:
+Hash cache lives in ``state.json`` under keys that are created on first
+run. Article hashes are kept per embedder (see
+``config.article_hashes_state_key``), so switching ``MC_EMBEDDER`` makes the
+next run embed every article into that embedder's collection, and an
+interrupted run resumes where it stopped:
 
-    "vector_article_hashes": {"concepts/foo": "abc123...", ...}
-    "vector_daily_hashes":   {"daily/2026-04-12.md": "def456...", ...}
+    "vector_article_hashes_gemma2_q4": {"concepts/foo": "abc123...", ...}
+    "vector_article_hashes":           {...}   # MiniLM (legacy collection)
+    "vector_daily_hashes":             {"daily/2026-04-12.md": "def456...", ...}
 
 A file hash changes ⇒ its slug is embedded (or re-embedded) and the cache
 is updated. Delete the cache entries manually if you suspect drift between
@@ -31,7 +35,7 @@ import sys
 
 from filelock import FileLock
 
-from config import KNOWLEDGE_DIR
+from config import KNOWLEDGE_DIR, article_hashes_state_key
 from utils import (
     embed_article_file,
     embed_daily_file,
@@ -47,6 +51,9 @@ from utils import (
 from vector_store import stats as vector_stats
 
 
+PROGRESS_EVERY = 50
+
+
 def reindex_articles(force: bool = False) -> tuple[int, int]:
     """Re-embed changed (or all, if force) articles via ``embed_article_file``.
 
@@ -60,7 +67,8 @@ def reindex_articles(force: bool = False) -> tuple[int, int]:
     handled by the state.json mtime sentinel inside ``bm25_store``.
     """
     state = load_state()
-    vector_hashes = state.setdefault("vector_article_hashes", {})
+    hash_key = article_hashes_state_key()
+    vector_hashes = state.setdefault(hash_key, {})
     quarantined = load_contradictions()  # hoist outside the loop
 
     embedded = 0
@@ -92,9 +100,12 @@ def reindex_articles(force: bool = False) -> tuple[int, int]:
             vector_hashes[slug] = h
             hash_updates[slug] = h
             embedded += 1
+            if embedded % PROGRESS_EVERY == 0:
+                # A full Gemma rebuild runs ~35 min on CPU; show it is alive.
+                print(f"  ... embedded {embedded} articles", flush=True)
     finally:
         def persist(current: dict) -> None:
-            hashes = current.setdefault("vector_article_hashes", {})
+            hashes = current.setdefault(hash_key, {})
             for slug in removed:
                 hashes.pop(slug, None)
             hashes.update(hash_updates)

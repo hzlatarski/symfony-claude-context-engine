@@ -64,6 +64,19 @@ def articles_collection_name(embedder: str | None = None) -> str:
     if embedder == EMBEDDER_MINILM:
         return CHROMA_COLLECTION_ARTICLES
     return CHROMA_COLLECTION_ARTICLES_GEMMA
+
+
+def article_hashes_state_key(embedder: str | None = None) -> str:
+    """state.json key for "this article is already in the active collection".
+
+    One key per embedder: a shared key would let an incremental reindex skip
+    every unchanged article and leave a newly switched-in collection nearly
+    empty. MiniLM keeps the legacy key so its existing cache stays valid.
+    """
+    embedder = embedder or active_embedder()
+    if embedder == EMBEDDER_MINILM:
+        return "vector_article_hashes"
+    return "vector_article_hashes_gemma2_q4"
 CHROMA_COLLECTION_CODEBASE = "codebase"
 
 # Cross-process file locks for Chroma writes. One lock file per collection
