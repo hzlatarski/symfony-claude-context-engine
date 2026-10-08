@@ -19,7 +19,7 @@ class FakeCollection:
         self.deleted, self.upserted = [], []
 
     def get(self, ids=None, include=()):
-        ids = list(self.records) if ids is None else ids
+        ids = list(self.records) if ids is None else [i for i in ids if i in self.records]
         if "embeddings" in include and self.lost.intersection(ids):
             raise RuntimeError("Error executing plan: Internal error: Error finding id")
         return {
@@ -81,6 +81,8 @@ def fake_store(monkeypatch):
 
         def fake_embed(name, docs, metas):
             state["embedded_in_session"].append(state["in_session"])
+            for hook in state.get("during_embed", []):
+                hook()
             return [[0.5] * 4 for _ in docs]
 
         monkeypatch.setattr(vector_health, "_embed", fake_embed)
@@ -122,7 +124,7 @@ def test_gemma_embed_uses_titles(monkeypatch):
     monkeypatch.setattr(vector_health.embedder, "get_model", lambda download=False: Model())
     out = vector_health._embed(config.CHROMA_COLLECTION_ARTICLES_GEMMA, ["doc x"], [{"title": "Tx"}])
     assert seen == [(["Tx"], ["doc x"])]
-    assert out == [[0.0] * 768]
+    assert [list(map(float, v)) for v in out] == [[0.0] * 768]
 
 
 def test_nothing_damaged_means_no_writes(fake_store):
@@ -147,3 +149,50 @@ def test_broken_or_missing_collection_is_reported_not_raised(fake_store):
     assert report["daily_chunks_v2"][2].startswith("UNREADABLE")
     assert report["articles_gemma2_q4"][2] == "missing (not built yet)"
     assert report["codebase"] == (1, ["a"], None)
+
+
+def test_repair_never_resurrects_or_reverts_a_concurrent_write(fake_store):
+    """Codex review 2, P1: the snapshot is taken before the lock."""
+    col = FakeCollection(["a", "b", "c"], {"a", "b", "c"})
+    state = fake_store({"codebase": col})
+
+    def other_writer():
+        del col.records["a"]  # deleted by another process
+        col.records["b"] = ("doc b v2", {"title": "Tb"})  # rewritten by another process
+
+    state["during_embed"] = [other_writer]
+    assert vector_health.repair_collection("codebase", ["a", "b", "c"]) == 1
+    assert "a" not in col.records
+    assert col.records["b"][0] == "doc b v2"
+    assert [u[0] for u in col.upserted] == [["c"]]
+
+
+def test_repair_exit_code_counts_collections_that_were_unreadable(fake_store, monkeypatch, capsys):
+    """Codex review 2, P2: fixing one collection must not hide a broken one."""
+    fake_store({"articles_gemma2_q4": FakeCollection(["a"], {"a"}), "daily_chunks_v2": BrokenCollection()})
+    monkeypatch.setattr(vector_health, "in_use", lambda: ["articles_gemma2_q4", "daily_chunks_v2"])
+    monkeypatch.setattr("sys.argv", ["vector_health.py", "--repair"])
+    assert vector_health.main() == 1
+    assert "UNREADABLE" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("name", ["codebase", config.CHROMA_COLLECTION_ARTICLES_GEMMA])
+def test_embed_output_is_accepted_by_chroma(name, monkeypatch):
+    """The fake-store tests stub _embed; this checks the real output shape
+    against Chroma's own validator (a live-copy run failed on it)."""
+    import numpy as np
+    from chromadb.api.types import normalize_embeddings
+
+    class Model:
+        def embed_documents(self, titles, texts):
+            return np.ones((len(texts), 768), dtype=np.float32)
+
+    class DefaultEF:
+        def __call__(self, docs):
+            return [np.ones(384, dtype=np.float32) for _ in docs]
+
+    monkeypatch.setattr(vector_health.embedder, "get_model", lambda download=False: Model())
+    import chromadb.utils.embedding_functions as efs
+    monkeypatch.setattr(efs, "DefaultEmbeddingFunction", DefaultEF)
+    vectors = vector_health._embed(name, ["one", "two"], [{"title": "A"}, None])
+    assert len(normalize_embeddings(vectors)) == 2

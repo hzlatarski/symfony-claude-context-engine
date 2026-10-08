@@ -25,6 +25,8 @@ import argparse
 import sys
 from typing import Any
 
+import numpy as np
+
 import chroma_client
 import config
 import embedder
@@ -100,10 +102,11 @@ def _embed(name: str, docs: list[str], metas: list[Any]) -> list[Any]:
     """New vectors from the stored text, made by the collection's own embedder."""
     if name == config.CHROMA_COLLECTION_ARTICLES_GEMMA:
         titles = [(m or {}).get("title") for m in metas]
-        return [list(v) for v in embedder.get_model(download=True).embed_documents(titles, docs)]
+        return list(np.asarray(embedder.get_model(download=True).embed_documents(titles, docs), dtype=np.float32))
     from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 
-    return [list(v) for v in DefaultEmbeddingFunction()(docs)]
+    # A list of numpy rows: Chroma rejects lists of np.float32 scalars.
+    return list(np.asarray(DefaultEmbeddingFunction()(docs), dtype=np.float32))
 
 
 def repair_collection(name: str, damaged: list[str]) -> int:
@@ -123,8 +126,24 @@ def repair_collection(name: str, damaged: list[str]) -> int:
             continue
         vectors = _embed(name, docs, metas)
         with chroma_client.write_session(name) as client:
-            _open(client, name).upsert(ids=ids, documents=docs, metadatas=metas, embeddings=vectors)
-        repaired += len(ids)
+            collection = _open(client, name)
+            # The snapshot is from before the lock. A writer may have deleted
+            # or rewritten a record meanwhile; upserting the old copy would
+            # resurrect or revert it. Write back only what is still unchanged.
+            now = collection.get(ids=ids, include=["documents", "metadatas"])
+            current = {
+                i: (d, m or None)
+                for i, d, m in zip(now["ids"], now["documents"], now["metadatas"])
+            }
+            keep = [k for k, i in enumerate(ids) if current.get(i) == (docs[k], metas[k])]
+            if keep:
+                collection.upsert(
+                    ids=[ids[k] for k in keep],
+                    documents=[docs[k] for k in keep],
+                    metadatas=[metas[k] for k in keep],
+                    embeddings=[vectors[k] for k in keep],
+                )
+        repaired += len(keep)
     return repaired
 
 
@@ -170,8 +189,10 @@ def main() -> int:
             print(f"Repairing {len(bad)} records in {name}...", flush=True)
             repair_collection(name, bad)
     print("\nRe-checking...", flush=True)
-    remaining, errors = _print(check([n for n, (_t, bad, _e) in report.items() if bad]))
-    return 0 if not remaining and not errors else 1
+    remaining, recheck_errors = _print(check([n for n, (_t, bad, _e) in report.items() if bad]))
+    # Collections that were UNREADABLE before are not repaired here; they
+    # still count, or a fixed articles index would hide a broken daily one.
+    return 0 if not remaining and not errors and not recheck_errors else 1
 
 
 if __name__ == "__main__":

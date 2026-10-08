@@ -143,3 +143,27 @@ def test_reader_reloads_only_when_generation_changes(tmp_path, monkeypatch):
     assert resets == [1]
     chroma_client.get_client()
     assert resets == [1]  # reloaded once, then current again
+
+
+def test_other_writer_bumping_the_marker_does_not_reload_inside_a_session(tmp_path, monkeypatch):
+    """Codex review 2, P1: a marker bump from another process mid-session must
+    not stop the system under handles the session still uses."""
+    import os
+
+    import chroma_client
+    import config
+
+    monkeypatch.setattr(config, "CHROMA_DB_DIR", tmp_path / "chroma")
+    chroma_client.reset()
+    with chroma_client.write_session("codebase") as client:
+        col = client.get_or_create_collection("codebase")
+        col.add(ids=["a"], documents=["first"], embeddings=[[0.1, 0.2, 0.3]])
+        marker = chroma_client._db_dir() / chroma_client._GENERATION_FILE
+        marker.write_text("another process wrote", encoding="utf-8")
+        os.utime(marker, ns=(10**18, 10**18))
+        assert chroma_client.get_client() is client
+        with chroma_client.write_session("articles"):  # nested: same client
+            pass
+        col.add(ids=["b"], documents=["second"], embeddings=[[0.3, 0.2, 0.1]])
+        assert col.count() == 2
+    assert chroma_client._session_depth == 0

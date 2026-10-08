@@ -49,6 +49,11 @@ _resolved: dict[Path, Path] = {}
 # before each use and reloads when another process has written, otherwise it
 # keeps serving the index it loaded at start and never sees new vectors.
 _GENERATION_FILE = ".write-generation"
+# >0 while this process is inside write_session. The session already holds a
+# client reloaded under the write lock; reloading again because ANOTHER
+# collection's writer bumped the marker would stop the system under the
+# caller's open collection handles (they fail with "no attribute 'bindings'").
+_session_depth = 0
 
 
 def _db_dir() -> Path:
@@ -82,6 +87,8 @@ def get_client() -> Any:
     """The process client, reloaded first if any process wrote since it loaded."""
     global _client, _client_dir, _client_generation
     with lock:
+        if _session_depth and _client is not None and _alive(_client):
+            return _client
         db_dir = _db_dir()
         generation = _generation(db_dir)
         stale = _client is not None and (
@@ -121,15 +128,23 @@ def reset() -> None:
 
 @contextmanager
 def write_session(collection: str) -> Iterator[Any]:
-    """Cross-process write lock + a client reloaded from disk inside it."""
-    global _client_generation
+    """Cross-process write lock + a client reloaded from disk inside it.
+
+    The client stays the same for the whole session, also across nested
+    sessions on the same thread: get_client() does not reload while a session
+    is open, so handles taken inside it stay valid.
+    """
+    global _client_generation, _session_depth
     with chroma_write_lock(collection):
         with lock:
-            reset()
+            if not _session_depth:
+                reset()
             client = get_client()
+            _session_depth += 1
             try:
                 yield client
             finally:
+                _session_depth -= 1
                 # Even a failed write may have changed the store. Tell
                 # long-lived readers in other processes to reload; this
                 # process already holds the post-write state, so it does not.
