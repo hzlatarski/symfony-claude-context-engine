@@ -42,7 +42,14 @@ CHROMA_DB_DIR = KNOWLEDGE_DIR / "chroma" / "active"
 # MC_EMBEDDER=minilm is an instant rollback.
 CHROMA_COLLECTION_ARTICLES = "articles"
 CHROMA_COLLECTION_ARTICLES_GEMMA = "articles_gemma2_q4"
-CHROMA_COLLECTION_DAILY = "daily_chunks"
+# The original "daily_chunks" collection is unrecoverable: stale-index
+# writes (see chroma_client) left its index ~8,100 log entries behind with a
+# log Chroma can no longer apply, so every read of it hangs or fails. It is
+# rebuilt from the daily files under a new name and left in place, unused,
+# rather than deleted. The hash-cache key changes with it so the next
+# reindex embeds every daily file into the new collection.
+CHROMA_COLLECTION_DAILY = "daily_chunks_v2"
+DAILY_HASHES_STATE_KEY = "vector_daily_hashes_v2"
 
 # Which embedder serves the articles collection. Vectors from different
 # embedders are not comparable, so each one owns its own collection.

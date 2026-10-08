@@ -17,7 +17,7 @@ interrupted run resumes where it stopped:
 
     "vector_article_hashes_gemma2_q4": {"concepts/foo": "abc123...", ...}
     "vector_article_hashes":           {...}   # MiniLM (legacy collection)
-    "vector_daily_hashes":             {"daily/2026-04-12.md": "def456...", ...}
+    "vector_daily_hashes_v2":          {"daily/2026-04-12.md": "def456...", ...}
 
 A file hash changes ⇒ its slug is embedded (or re-embedded) and the cache
 is updated. Delete the cache entries manually if you suspect drift between
@@ -35,7 +35,7 @@ import sys
 
 from filelock import FileLock
 
-from config import KNOWLEDGE_DIR, article_hashes_state_key
+from config import DAILY_HASHES_STATE_KEY, KNOWLEDGE_DIR, article_hashes_state_key
 from utils import (
     embed_article_file,
     embed_daily_file,
@@ -130,7 +130,7 @@ def reindex_daily(force: bool = False) -> tuple[int, int]:
     landed yet — ``main()`` catches this specifically.
     """
     state = load_state()
-    vector_hashes = state.setdefault("vector_daily_hashes", {})
+    vector_hashes = state.setdefault(DAILY_HASHES_STATE_KEY, {})
 
     embedded = 0
     skipped = 0
@@ -167,7 +167,7 @@ def reindex_daily(force: bool = False) -> tuple[int, int]:
             embedded += 1
     finally:
         def persist(current: dict) -> None:
-            hashes = current.setdefault("vector_daily_hashes", {})
+            hashes = current.setdefault(DAILY_HASHES_STATE_KEY, {})
             for source in removed:
                 hashes.pop(source, None)
             hashes.update(hash_updates)

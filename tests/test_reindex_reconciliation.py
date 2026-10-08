@@ -40,7 +40,7 @@ def test_daily_reindex_deletes_missing_sources(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(utils, "STATE_FILE", tmp_path / "state.json")
     utils.save_state({
-        "vector_daily_hashes": {
+        "vector_daily_hashes_v2": {
             "daily/deleted.md": "old",
             "daily/transcripts/deleted.jsonl": "old",
         },
@@ -56,7 +56,7 @@ def test_daily_reindex_deletes_missing_sources(tmp_path, monkeypatch) -> None:
         "daily/deleted.md",
         "daily/transcripts/deleted.jsonl",
     ]
-    assert utils.load_state()["vector_daily_hashes"] == {}
+    assert utils.load_state()["vector_daily_hashes_v2"] == {}
 
 
 def _articles(tmp_path, names):
