@@ -29,6 +29,7 @@ from typing import Any
 
 import chromadb
 
+import chroma_client
 import embedder
 import hybrid_search
 from chroma_path import ensure_active_chroma_dir
@@ -59,7 +60,9 @@ def _client_for(project_root: Path) -> Any:
     chroma_path = ensure_active_chroma_dir(chroma_root)
     key = str(chroma_path.resolve())
     cached = _client_cache.get(key)
-    if cached is not None:
+    # A local write resets Chroma's process-wide cache (chroma_client.reset),
+    # which orphans every client object, including these read-only ones.
+    if cached is not None and chroma_client._alive(cached):
         return cached
     client = chromadb.PersistentClient(path=str(chroma_path))
     _client_cache[key] = client

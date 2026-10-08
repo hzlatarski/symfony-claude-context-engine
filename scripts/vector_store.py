@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import threading
 from typing import Any
 
 # chromadb (and the onnx + numpy chain it pulls in) is imported eagerly here,
@@ -26,31 +25,21 @@ from typing import Any
 # lock against the main thread (blocked in FastMCP's event loop). Symptom was
 # a >99s hang on the first search_knowledge call. Eager import costs ~1s of
 # startup but the module is then in sys.modules and threaded use is safe.
-import chromadb
+import chromadb  # noqa: F401
 
+import chroma_client
 import config
 import embedder
-from chroma_lock import chroma_write_lock
-from chroma_path import ensure_configured_chroma_dir
 from config import CHROMA_COLLECTION_DAILY
 
-_client: Any = None
-_lock = threading.RLock()
+# Shared with every store in the process; see chroma_client for why writes
+# go through chroma_client.write_session and never a long-held client.
+_lock = chroma_client.lock
 CHROMA_UPSERT_BATCH_SIZE = 256
 
 
 def _get_client():
-    global _client
-    if _client is not None:
-        return _client
-    with _lock:
-        if _client is not None:
-            return _client
-        import config
-
-        db_dir = ensure_configured_chroma_dir(config.CHROMA_DB_DIR)
-        _client = chromadb.PersistentClient(path=str(db_dir))
-    return _client
+    return chroma_client.get_client()
 
 
 def articles_collection(client: Any = None):
@@ -170,7 +159,7 @@ def upsert_article(
     flat.update({"slug": slug, "title": title, "zone": zone})
 
     embeddings = _article_embeddings([title], [text])
-    with chroma_write_lock(_articles_lock_name()):
+    with chroma_client.write_session(_articles_lock_name()):
         _articles_collection().upsert(
             ids=[_composite_id(slug, zone)],
             documents=[text],
@@ -212,7 +201,7 @@ def replace_article(
         if prepared
         else None
     )
-    with chroma_write_lock(_articles_lock_name()):
+    with chroma_client.write_session(_articles_lock_name()):
         collection = _articles_collection()
         old = collection.get(
             where={"slug": {"$eq": slug}},
@@ -260,7 +249,7 @@ def upsert_chunk(
     if date_int is not None:
         flat["date_int"] = date_int
 
-    with chroma_write_lock(CHROMA_COLLECTION_DAILY):
+    with chroma_client.write_session(CHROMA_COLLECTION_DAILY):
         _daily_collection().upsert(ids=[chunk_id], documents=[text], metadatas=[flat])
 
 
@@ -270,7 +259,7 @@ def upsert_chunks(chunks: list[dict[str, Any]]) -> None:
     if not prepared:
         return
 
-    with chroma_write_lock(CHROMA_COLLECTION_DAILY):
+    with chroma_client.write_session(CHROMA_COLLECTION_DAILY):
         _upsert_prepared_chunks(prepared)
 
 
@@ -350,7 +339,7 @@ def replace_chunks_for_source(
         (chunk_id, text, {**metadata, "source_file": pending_source})
         for chunk_id, text, metadata in prepared
     ]
-    with chroma_write_lock(CHROMA_COLLECTION_DAILY):
+    with chroma_client.write_session(CHROMA_COLLECTION_DAILY):
         collection = _daily_collection()
         if staged:
             _upsert_prepared_chunks(staged)
@@ -362,13 +351,13 @@ def replace_chunks_for_source(
 
 def delete_article(slug: str) -> None:
     """Remove both zones of an article, if present."""
-    with chroma_write_lock(_articles_lock_name()):
+    with chroma_client.write_session(_articles_lock_name()):
         _articles_collection().delete(where={"slug": {"$eq": slug}})
 
 
 def delete_chunks_for_daily(source_file: str) -> None:
     """Remove all chunks belonging to a daily file before re-chunking it."""
-    with chroma_write_lock(CHROMA_COLLECTION_DAILY):
+    with chroma_client.write_session(CHROMA_COLLECTION_DAILY):
         _daily_collection().delete(where={"source_file": {"$eq": source_file}})
 
 

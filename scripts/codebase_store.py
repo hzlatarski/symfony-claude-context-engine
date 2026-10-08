@@ -8,42 +8,25 @@ Collection: codebase
             symbols (comma-joined PHP class/method names)
   chunk_id: "{rel_path}::{chunk_index}"
 
-Uses the same ChromaDB PersistentClient path as vector_store
-(config.CHROMA_DB_DIR). ChromaDB deduplicates the backend connection
-via its SharedSystemClient registry, so two modules holding separate
-_client singletons pointing to the same db dir is safe.
+Shares vector_store's process-wide client (chroma_client). Writes go through
+chroma_client.write_session, which reloads the index from disk under the
+write lock so no process saves a stale copy over another's vectors.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-import threading
 from typing import Any
 
-from chroma_lock import chroma_write_lock
-from chroma_path import ensure_configured_chroma_dir
+import chroma_client
 from config import CHROMA_COLLECTION_CODEBASE
 
-_client: Any = None
-# RLock (not Lock) so callers that hold it across a _get_client() call do not
-# self-deadlock on the lazy init path. Mirrors vector_store.py.
-_lock = threading.RLock()
+_lock = chroma_client.lock
 CHROMA_UPSERT_BATCH_SIZE = 256
 
 
 def _get_client():
-    global _client
-    if _client is not None:
-        return _client
-    with _lock:
-        if _client is not None:
-            return _client
-        import chromadb
-        import config
-
-        db_dir = ensure_configured_chroma_dir(config.CHROMA_DB_DIR)
-        _client = chromadb.PersistentClient(path=str(db_dir))
-    return _client
+    return chroma_client.get_client()
 
 
 def _codebase_collection():
@@ -67,13 +50,13 @@ def upsert_chunk(
         if isinstance(v, (str, int, float, bool)) or v is None
     }
     flat["rel_path"] = rel_path
-    with chroma_write_lock(CHROMA_COLLECTION_CODEBASE):
+    with chroma_client.write_session(CHROMA_COLLECTION_CODEBASE):
         _codebase_collection().upsert(ids=[chunk_id], documents=[text], metadatas=[flat])
 
 
 def delete_chunks_for_file(rel_path: str) -> None:
     """Remove all chunks for a file before re-chunking it."""
-    with chroma_write_lock(CHROMA_COLLECTION_CODEBASE):
+    with chroma_client.write_session(CHROMA_COLLECTION_CODEBASE):
         _codebase_collection().delete(where={"rel_path": {"$eq": rel_path}})
 
 
@@ -119,7 +102,7 @@ def replace_chunks_for_file(
             (f"{chunk['chunk_id']}::v{digest}", text, metadata)
         )
 
-    with chroma_write_lock(CHROMA_COLLECTION_CODEBASE):
+    with chroma_client.write_session(CHROMA_COLLECTION_CODEBASE):
         collection = _codebase_collection()
         old = collection.get(
             where={"rel_path": {"$eq": rel_path}},

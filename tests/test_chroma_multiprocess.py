@@ -1,0 +1,90 @@
+"""Cross-process writes must never erase another process's vectors.
+
+Reproduces the 2026-10-08 live-store loss (see scripts/chroma_client.py):
+a process loads the index, another process writes and saves, then the first
+process writes. Runs real processes because the bug only exists between them.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+WORKER = Path(__file__).parent / "fixtures" / "chroma_mp_worker.py"
+
+
+def _run(role: str, store: Path, mode: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(WORKER), role, str(store), mode],
+        capture_output=True, text=True, timeout=180,
+    )
+
+
+def _scenario(tmp_path: Path, mode: str) -> dict:
+    store = tmp_path / "store"
+    assert _run("seed", store, mode).returncode == 0
+    stale = subprocess.Popen(
+        [sys.executable, str(WORKER), "stale", str(store), mode],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    assert stale.stdout.readline().strip() == "loaded"
+    writer = _run("writer", store, mode)
+    assert writer.returncode == 0, writer.stderr
+    (tmp_path / "go.flag").write_text("go")
+    stale.wait(timeout=180)
+    check = _run("check", store, mode)
+    if check.returncode != 0:  # a corrupted store can crash the reader outright
+        return {"crashed": True, "unreadable": None, "self_hits": 0}
+    return json.loads(check.stdout.strip().splitlines()[-1])
+
+
+def test_write_session_keeps_other_process_vectors(tmp_path):
+    result = _scenario(tmp_path, "session")
+    assert result.get("crashed") is None, result
+    assert result["unreadable"] == []
+    assert result["self_hits"] == 20
+    assert result["count"] == 85
+
+
+def test_harness_detects_the_bug_without_write_session(tmp_path):
+    """Guards the test itself: the pre-fix write path must still fail here."""
+    result = _scenario(tmp_path, "naive")
+    lost = result.get("crashed") or bool(result["unreadable"]) or result["self_hits"] < 20
+    assert lost, result
+
+
+def test_every_store_write_reloads_from_disk(tmp_path, monkeypatch):
+    """Each write path must use chroma_client.write_session (reset under lock)."""
+    import chroma_client
+    import codebase_store
+    import config
+    import vector_store
+
+    monkeypatch.setenv("MC_EMBEDDER", "minilm")  # fast; the path is what matters
+    monkeypatch.setattr(config, "CHROMA_DB_DIR", tmp_path / "chroma")
+    chroma_client.reset()
+    resets: list[str] = []
+    real_reset = chroma_client.reset
+    monkeypatch.setattr(chroma_client, "reset", lambda: (resets.append("r"), real_reset())[1])
+
+    meta = {"type": "fact", "confidence": 0.9, "quarantined": False, "updated": "2026-10-08"}
+    chunk = {"chunk_id": "d#1", "source_file": "daily/x.md", "text": "t", "metadata": {"date": "2026-10-08"}}
+    writes = {
+        "upsert_article": lambda: vector_store.upsert_article("concepts/a", "A", "observed", "x", meta),
+        "replace_article": lambda: vector_store.replace_article("concepts/a", "A", {"observed": "y"}, meta),
+        "delete_article": lambda: vector_store.delete_article("concepts/a"),
+        "upsert_chunk": lambda: vector_store.upsert_chunk("d#0", "daily/x.md", "t", {"date": "2026-10-08"}),
+        "upsert_chunks": lambda: vector_store.upsert_chunks([chunk]),
+        "replace_chunks_for_source": lambda: vector_store.replace_chunks_for_source("daily/x.md", [chunk]),
+        "delete_chunks_for_daily": lambda: vector_store.delete_chunks_for_daily("daily/x.md"),
+        "codebase.upsert_chunk": lambda: codebase_store.upsert_chunk("f::0", "f.php", "code", {}),
+        "codebase.replace_chunks_for_file": lambda: codebase_store.replace_chunks_for_file(
+            "f.php", [{"chunk_id": "f::0", "text": "code", "metadata": {}}]
+        ),
+        "codebase.delete_chunks_for_file": lambda: codebase_store.delete_chunks_for_file("f.php"),
+    }
+    for name, write in writes.items():
+        before = len(resets)
+        write()
+        assert len(resets) == before + 1, f"{name} wrote without reloading from disk"
