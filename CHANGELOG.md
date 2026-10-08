@@ -4,6 +4,30 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [0.14.0] — 2026-10-08
+
+EmbeddingGemma 2 replaces MiniLM for article search, and a cross-process bug that silently erased vectors is fixed. Measured on 400 English questions against the real knowledge base: hybrid top-5 recall rose from **81.0% to 88.8%** (48 questions won, 17 lost, p < 0.001). Also ships the entity-extraction work (`find_entity`) that was on `feat/kb-expand-neighbors`.
+
+### Added
+
+- **EmbeddingGemma 2 embedder** (`scripts/embedder.py`) — ONNX q4 build, pinned revision, CPU-only, loads in ~1 s (PyTorch needed ~15 s, too slow for the prompt hook). Uses the model's query/document prefixes. Articles go into a new collection, `articles_gemma2_q4`; the old `articles` stays untouched. `MC_EMBEDDER=minilm` rolls back.
+- **`scripts/vector_health.py`** — finds records whose vector is missing from the index and, with `--repair`, re-embeds them in place (upsert, never delete).
+- **Entity extraction + `find_entity` MCP tool** — hosts, commands, roles, env vars, URLs, services and paths named in article prose, linked to the notes that mention them.
+- **Migration `v0.14.0`** — downloads the model during `upgrade.py`.
+
+### Fixed
+
+- **Lost vectors.** A process that loaded the HNSW index early and wrote late (compile/ingest waiting on the LLM) saved its stale copy over newer data. In AiTutor this left 392 of 2,503 article zones unsearchable and made `daily_chunks` unreadable (`search_raw_daily` hung). Every write now reloads the index from disk under the per-collection lock (`chroma_client.write_session`); long-lived readers reload when another process wrote. Proven with real multi-process tests.
+- Daily chunks are rebuilt into `daily_chunks_v2`; the broken collection is left in place.
+- Hybrid search fused the same zone twice when the vector id carried a `::v<hash>` suffix.
+- `dedup.py --prune` would have treated every rebuilt article as a ghost and deleted it.
+- Vector search falls back to BM25 instead of failing when the model cannot load; read paths never create collections or download the model.
+- `reindex.py` saves its progress every 25 files, so a stopped rebuild resumes.
+
+### Upgrade notes
+
+After `upgrade.py`, restart the project's Claude Code sessions, then run `reindex.py --articles-only` (~35 min CPU on a large KB), `ingest_scenarios.py` if used, `reindex.py --daily-only`, and `vector_health.py`. Until then search uses BM25 alone and daily search is empty.
+
 ## [0.13.0] — 2026-08-29
 
 One change from a session evaluating the GraphRAG multi-hop-reasoning pattern ([The New Stack, 2026-08-27](https://thenewstack.io/graphrag-multi-hop-reasoning-python/)). The article's thesis — plain vector RAG misses multi-hop questions, so pair vector search with a knowledge graph and traverse it — is already this engine's architecture: the unified graph (article `[[wikilinks]]` + code call graph) plus `get_unified_neighbors` / `trace_path`. The one transferable idea was collapsing the two steps a relationship question needs (`search_knowledge`, then a neighbour walk on the *other* MCP server) into a single call. Measuring first showed the graph is dense enough to pay off — 961 articles, 5,470 `[[wikilink]]` edges, only 3 orphans — and, unlike the article's LLM-per-chunk Neo4j pipeline, the edges here are already free and deterministic, so nothing new is billed or parsed.
@@ -27,6 +51,19 @@ One change from a session evaluating [CodeGraph](https://github.com/colbymchenry
 ### Notes
 
 - Adversarial review ran on **Codex** (read-only), which found 5 correctness issues by reasoning about crafted inputs. All were fixed with a regression test each: a Windows-backslash path (`src\Entity\User.php`) mis-classified as a class because `\` was read as a namespace separator before the file-suffix check (now normalises separators first); a verb mismatch (`GET` on a POST-only route) printing a success header the trace then contradicted (now rejected up front); a typo'd method symbol (`Foo::noSuchMethod`) presenting as a clean class hit (now flagged with a note while still showing the class); case-sensitive class resolution (`accesscontrolservice` / `User.PHP` failing, though PHP class names and Windows paths are case-insensitive — now a case-insensitive fallback after exact match); and the Twig related-knowledge seed dropping articles that cite the template as a `file:templates/...` node rather than `template:...` (now seeds both). 45/45 `test_mcp_server.py` tests pass; 13 are new for `explore`.
+## [0.11.1] — 2026-10-01
+
+One security fix. `ingest.py` and `compile.py` hand `claude -p` untrusted text — call transcripts, attached documents, session logs — and ran it with `--dangerously-skip-permissions` from the host project root. A prompt-injected line in any source could have made the agent run shell commands, read secrets such as `.env.local`, or edit any file in the host project.
+
+### Fixed
+
+- **The wiki-compiling agent now runs with least privilege instead of `--dangerously-skip-permissions`.** Both call sites share one helper, `config.compiler_agent_permission_args()`, and run the agent with `cwd` = the knowledge directory (`config.compiler_agent_cwd()`). Everything the agent needs is inlined in its prompt or lives under `knowledge/`, so the session gets only `--tools Read,Glob,Grep,Write,Edit`, one allow rule `Edit(./**)` (Edit rules cover Write; reads need no rule inside the working directory), an explicit `--disallowedTools Bash,PowerShell,WebFetch,WebSearch`, `--permission-mode dontAsk` (anything that would prompt is denied, never hangs), `--strict-mcp-config` with an empty `--mcp-config` (no MCP servers or connectors), and `--setting-sources ""` (no user/project/local settings, so no hooks or allow-rules leak in). Subscription auth (`ANTHROPIC_API_KEY` stripped), `--max-turns 30`, models, prompts and output checks are unchanged. The helper refuses to run when the knowledge directory resolves to the project root or above it (e.g. a `knowledge` junction pointing upward), which would otherwise widen the sandbox to the whole project; the refusal is an ordinary, retried failure.
+
+### Notes
+
+- Verified on Claude Code 2.1.267 with real runs in a throwaway host project: a markdown source was ingested into `knowledge/concepts/` and recorded in `state.json`; a source carrying an injected instruction (run Bash, write `C:/temp/escape.txt`, read `.env.local`, plant `src/injected.php`) produced no file outside `knowledge/`. A direct probe that told the agent to attempt each forbidden action showed Bash and WebFetch absent from the session, writes to the host project and `C:/temp` denied, reads/greps of `../.env.local` and `../docs` denied, and a write inside `knowledge/` allowed. Needs a Claude Code version that knows `dontAsk` and an empty `--setting-sources`; an older CLI rejects the flags with a non-zero exit, which both call sites already treat as a failure (never as success).
+- Adversarial review ran on Codex (two passes). It found that the first draft — host root as cwd with a path-scoped `Edit(./knowledge/**)` rule — still let the agent read host secrets, and that interpolating the knowledge path into the rule could be widened by a junction or by glob metacharacters in directory names; the cwd change and the constant rule close those.
+- **Agent prompts now name paths relative to the agent's cwd.** With cwd = `knowledge/`, the old `knowledge/concepts/` / `knowledge/index.md` wording would have pointed at `knowledge/knowledge/...`. The ingest and compile prompts now say `concepts/`, `connections/`, `index.md` and `log.md` (computed by `config.agent_path()`, relative to the knowledge dir, in place of absolute paths too), and open with `config.COMPILER_AGENT_CWD_NOTE`: "Your working directory is the knowledge base root; all paths are relative to it", which also maps the inlined AGENTS.md schema's `knowledge/...` naming. A regression test fails if any agent prompt names a `knowledge/` path or an absolute path into the knowledge dir.
 
 ## [0.11.0] — 2026-08-16
 
