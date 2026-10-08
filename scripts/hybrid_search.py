@@ -12,10 +12,13 @@ the MCP tool layer can swap modes without caring about the backend.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import bm25_store
 import vector_store
+
+_log = logging.getLogger(__name__)
 
 # RRF constant from Cormack et al. 2009. 60 is the canonical value — moving
 # it only shifts how aggressively high ranks dominate, and empirically the
@@ -94,8 +97,15 @@ def search_articles(
         "include_quarantined": include_quarantined,
     }
 
-    vec_results = vector_store.search_articles(query=query, **filters)
     bm25_results = bm25_store.search_articles(query=query, **filters)
+    try:
+        vec_results = vector_store.search_articles(query=query, **filters)
+    except Exception as exc:
+        # The embedder is a local model with files on disk; if it cannot load
+        # (first run offline, corrupt download) keyword search still answers.
+        # BM25 alone scored within ~1 point of today's hybrid on the benchmark.
+        _log.warning("vector search failed, using BM25 only: %s: %s", type(exc).__name__, exc)
+        vec_results = []
 
     # Vector first so its payload wins on a first-seen tie; both shapes
     # carry the same slug/text, but the vector path has richer metadata.

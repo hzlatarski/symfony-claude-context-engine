@@ -154,3 +154,40 @@ class TestRRFFusion:
             assert calls[side]["include_quarantined"] is True
             # Pool must be larger than limit so RRF has candidates to fuse.
             assert calls[side]["limit"] >= 4
+
+
+def test_vector_failure_falls_back_to_bm25(stub_backends, monkeypatch, caplog):
+    """REQ-4.1: a broken embedder degrades search to keywords, never to an error."""
+    import hybrid_search
+    import vector_store
+
+    _, set_bm25 = stub_backends
+    set_bm25([_make_result("concepts/kw-1"), _make_result("concepts/kw-2")])
+
+    def broken(**_kwargs):
+        raise RuntimeError("model files missing")
+
+    monkeypatch.setattr(vector_store, "search_articles", broken)
+    monkeypatch.setattr(hybrid_search.vector_store, "search_articles", broken)
+
+    with caplog.at_level("WARNING", logger="hybrid_search"):
+        results = hybrid_search.search_articles("anything", limit=5)
+
+    assert [r["slug"] for r in results] == ["concepts/kw-1", "concepts/kw-2"]
+    assert len(caplog.records) == 1
+    assert "BM25 only" in caplog.records[0].getMessage()
+    assert "model files missing" in caplog.records[0].getMessage()
+
+
+def test_bm25_failure_is_not_swallowed(stub_backends, monkeypatch):
+    """Only the vector path degrades; a BM25 bug must still surface."""
+    import bm25_store
+    import hybrid_search
+
+    def broken(**_kwargs):
+        raise RuntimeError("bm25 bug")
+
+    monkeypatch.setattr(bm25_store, "search_articles", broken)
+    monkeypatch.setattr(hybrid_search.bm25_store, "search_articles", broken)
+    with pytest.raises(RuntimeError, match="bm25 bug"):
+        hybrid_search.search_articles("anything", limit=5)
