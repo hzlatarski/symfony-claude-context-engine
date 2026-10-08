@@ -7,8 +7,10 @@ Two collections:
 - daily_chunks: raw daily-log chunks, never summarized. One document per H2
                 section. Metadata filter on date.
 
-Uses ChromaDB's default ONNX embedder (all-MiniLM-L6-v2) — fully local,
-no API key, ~90 MB one-time download on first instantiation.
+Articles use EmbeddingGemma 2 (ONNX q4, see embedder.py) in the
+``articles_gemma2_q4`` collection. ``MC_EMBEDDER=minilm`` switches back to the
+legacy ``articles`` collection and Chroma's default all-MiniLM-L6-v2. Daily
+chunks still use the default embedder. All embedders are local, no API key.
 """
 from __future__ import annotations
 
@@ -26,12 +28,11 @@ from typing import Any
 # startup but the module is then in sys.modules and threaded use is safe.
 import chromadb
 
+import config
+import embedder
 from chroma_lock import chroma_write_lock
 from chroma_path import ensure_configured_chroma_dir
-from config import (
-    CHROMA_COLLECTION_ARTICLES,
-    CHROMA_COLLECTION_DAILY,
-)
+from config import CHROMA_COLLECTION_DAILY
 
 _client: Any = None
 _lock = threading.RLock()
@@ -52,11 +53,38 @@ def _get_client():
     return _client
 
 
-def _articles_collection():
-    return _get_client().get_or_create_collection(
-        name=CHROMA_COLLECTION_ARTICLES,
+def articles_collection(client: Any = None):
+    """The articles collection of the active embedder, opened with its own
+    embedding function — the only way any module should reach it, so a
+    query is never embedded by a different model than the stored vectors.
+
+    ``client`` lets linked_search open another project's store the same way.
+    """
+    client = client or _get_client()
+    name = config.articles_collection_name()
+    if config.active_embedder() == config.EMBEDDER_MINILM:
+        return client.get_or_create_collection(name=name, metadata={"hnsw:space": "cosine"})
+    return client.get_or_create_collection(
+        name=name,
         metadata={"hnsw:space": "cosine"},
+        embedding_function=embedder.GemmaChromaEmbeddingFunction(),
     )
+
+
+# Kept for existing callers and tests that patch it.
+def _articles_collection():
+    return articles_collection()
+
+
+def _articles_lock_name() -> str:
+    return config.articles_collection_name()
+
+
+def _article_embeddings(titles: list[str], texts: list[str]) -> list[Any] | None:
+    """Title-aware document vectors for Gemma; None lets MiniLM embed as before."""
+    if config.active_embedder() == config.EMBEDDER_MINILM:
+        return None
+    return list(embedder.get_model().embed_documents(titles, texts))
 
 
 def _daily_collection():
@@ -141,11 +169,13 @@ def upsert_article(
     flat = _flatten_metadata(metadata)
     flat.update({"slug": slug, "title": title, "zone": zone})
 
-    with chroma_write_lock(CHROMA_COLLECTION_ARTICLES):
+    embeddings = _article_embeddings([title], [text])
+    with chroma_write_lock(_articles_lock_name()):
         _articles_collection().upsert(
             ids=[_composite_id(slug, zone)],
             documents=[text],
             metadatas=[flat],
+            **({"embeddings": embeddings} if embeddings is not None else {}),
         )
 
 
@@ -175,7 +205,14 @@ def replace_article(
             (f"{_composite_id(slug, zone)}::v{digest}", text, flat)
         )
 
-    with chroma_write_lock(CHROMA_COLLECTION_ARTICLES):
+    # Embed before taking the write lock: it is the slow part, and a failure
+    # here leaves the previous generation untouched.
+    embeddings = (
+        _article_embeddings([title] * len(prepared), [item[1] for item in prepared])
+        if prepared
+        else None
+    )
+    with chroma_write_lock(_articles_lock_name()):
         collection = _articles_collection()
         old = collection.get(
             where={"slug": {"$eq": slug}},
@@ -190,6 +227,7 @@ def replace_article(
                     ids=new_ids,
                     documents=[item[1] for item in prepared],
                     metadatas=[item[2] for item in prepared],
+                    **({"embeddings": embeddings} if embeddings is not None else {}),
                 )
         except Exception:
             if fresh_ids:
@@ -324,7 +362,7 @@ def replace_chunks_for_source(
 
 def delete_article(slug: str) -> None:
     """Remove both zones of an article, if present."""
-    with chroma_write_lock(CHROMA_COLLECTION_ARTICLES):
+    with chroma_write_lock(_articles_lock_name()):
         _articles_collection().delete(where={"slug": {"$eq": slug}})
 
 

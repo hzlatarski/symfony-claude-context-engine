@@ -4,9 +4,9 @@ from __future__ import annotations
 import pytest
 
 
-@pytest.fixture
-def store(tmp_path, monkeypatch):
-    """Isolated Chroma store rooted at tmp_path for each test.
+@pytest.fixture(params=["gemma2-q4", "minilm"])
+def store(request, tmp_path, monkeypatch):
+    """Isolated Chroma store rooted at tmp_path for each test, once per embedder.
 
     The memory-compiler's scripts directory is on pythonpath, so every
     script in the codebase uses `from config import ...` / `import config`
@@ -18,6 +18,7 @@ def store(tmp_path, monkeypatch):
     import config
     import vector_store
 
+    monkeypatch.setenv("MC_EMBEDDER", request.param)
     monkeypatch.setattr(config, "CHROMA_DB_DIR", tmp_path / "chroma")
     # Clear ChromaDB's process-global SharedSystemClient registry so
     # the next PersistentClient actually builds a fresh backend at
@@ -452,3 +453,120 @@ class TestVectorStoreBasics:
                 text="x",
                 metadata={"type": "fact", "confidence": 0.9, "quarantined": False, "updated": "2026-04-12"},
             )
+
+
+ARTICLE_META = {"type": "fact", "confidence": 0.9, "quarantined": False, "updated": "2026-10-08"}
+
+
+@pytest.fixture
+def fresh_store(tmp_path, monkeypatch):
+    """A store whose embedder each test sets itself."""
+    import config
+    import vector_store
+
+    monkeypatch.setattr(config, "CHROMA_DB_DIR", tmp_path / "chroma")
+    try:
+        from chromadb.api.shared_system_client import SharedSystemClient
+        SharedSystemClient._identifier_to_system = {}
+    except (ImportError, AttributeError):
+        pass
+    vector_store._client = None
+    return vector_store
+
+
+class TestEmbedderSwitch:
+    def test_collection_name_follows_embedder(self, monkeypatch):
+        import config
+
+        monkeypatch.delenv("MC_EMBEDDER", raising=False)
+        assert config.articles_collection_name() == "articles_gemma2_q4"
+        monkeypatch.setenv("MC_EMBEDDER", "minilm")
+        assert config.articles_collection_name() == "articles"
+        monkeypatch.setenv("MC_EMBEDDER", " Gemma2-Q4 ")
+        assert config.articles_collection_name() == "articles_gemma2_q4"
+
+    def test_unknown_embedder_is_rejected(self, monkeypatch):
+        import config
+
+        monkeypatch.setenv("MC_EMBEDDER", "openai")
+        with pytest.raises(ValueError, match="MC_EMBEDDER"):
+            config.active_embedder()
+
+    def test_gemma_writes_never_touch_the_legacy_collection(self, fresh_store, monkeypatch):
+        """AC-2.2: rollback finds the MiniLM collection exactly as it was."""
+        monkeypatch.setenv("MC_EMBEDDER", "minilm")
+        fresh_store.upsert_article("concepts/old", "Old", "observed", "legacy text", ARTICLE_META)
+        monkeypatch.setenv("MC_EMBEDDER", "gemma2-q4")
+        fresh_store.upsert_article("concepts/new", "New", "observed", "gemma text", ARTICLE_META)
+        fresh_store.delete_article("concepts/old")
+
+        assert fresh_store.stats()["articles"] == 1
+        monkeypatch.setenv("MC_EMBEDDER", "minilm")
+        legacy = fresh_store.articles_collection().get(include=["documents"])
+        assert legacy["ids"] == ["concepts/old::observed"]
+        assert legacy["documents"] == ["legacy text"]
+
+    def test_gemma_collection_vectors_are_768d(self, fresh_store, monkeypatch):
+        monkeypatch.setenv("MC_EMBEDDER", "gemma2-q4")
+        fresh_store.upsert_article("concepts/a", "A", "observed", "some text", ARTICLE_META)
+        got = fresh_store.articles_collection().get(include=["embeddings"])
+        assert len(got["embeddings"][0]) == 768
+
+
+class TestGemmaWrites:
+    @pytest.fixture
+    def spy(self, fresh_store, monkeypatch):
+        import embedder
+
+        monkeypatch.setenv("MC_EMBEDDER", "gemma2-q4")
+        model = embedder.get_model()
+        calls = {"documents": [], "queries": []}
+        real_docs, real_queries = model.embed_documents, model.embed_queries
+
+        def docs(titles, texts):
+            calls["documents"].append((list(titles), list(texts)))
+            return real_docs(titles, texts)
+
+        def queries(qs):
+            calls["queries"].append(list(qs))
+            return real_queries(qs)
+
+        monkeypatch.setattr(model, "embed_documents", docs)
+        monkeypatch.setattr(model, "embed_queries", queries)
+        return fresh_store, calls
+
+    def test_upsert_embeds_title_with_text_but_stores_plain_text(self, spy):
+        """REQ-3: titles shape the vector; results keep their old shape."""
+        store, calls = spy
+        store.upsert_article("concepts/lock", "Bridge Session Lock", "observed", "per-session flock", ARTICLE_META)
+        assert calls["documents"] == [(["Bridge Session Lock"], ["per-session flock"])]
+        got = store.articles_collection().get(include=["documents"])
+        assert got["documents"] == ["per-session flock"]
+
+    def test_replace_embeds_every_zone_with_the_title(self, spy):
+        store, calls = spy
+        store.replace_article(
+            "concepts/two", "Two Zones", {"observed": "obs", "synthesized": "syn"}, ARTICLE_META
+        )
+        assert calls["documents"] == [(["Two Zones", "Two Zones"], ["obs", "syn"])]
+
+    def test_search_embeds_the_query_with_the_query_prefix(self, spy):
+        store, calls = spy
+        store.upsert_article("concepts/lock", "Lock", "observed", "per-session flock", ARTICLE_META)
+        store.search_articles("how are bridge callbacks serialized", limit=1)
+        assert calls["queries"] == [["how are bridge callbacks serialized"]]
+
+    def test_embedding_failure_leaves_previous_generation(self, spy, monkeypatch):
+        import embedder
+
+        store, _ = spy
+        store.replace_article("concepts/keep", "Keep", {"observed": "complete v1"}, ARTICLE_META)
+
+        def broken(*_args, **_kwargs):
+            raise RuntimeError("model crashed")
+
+        monkeypatch.setattr(embedder.get_model(), "embed_documents", broken)
+        with pytest.raises(RuntimeError, match="model crashed"):
+            store.replace_article("concepts/keep", "Keep", {"observed": "v2"}, ARTICLE_META)
+        got = store.articles_collection().get(include=["documents"])
+        assert got["documents"] == ["complete v1"]

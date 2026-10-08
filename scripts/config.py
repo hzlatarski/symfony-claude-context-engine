@@ -1,5 +1,6 @@
 """Path constants and configuration for the personal knowledge base."""
 
+import os
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -37,8 +38,32 @@ SOURCES_FILE = ROOT_DIR / "sources.yaml"
 # Keep the active database in a replaceable child directory so a verified
 # rebuild can be switched in without deleting the previous recovery copy.
 CHROMA_DB_DIR = KNOWLEDGE_DIR / "chroma" / "active"
+# Legacy MiniLM collection. Kept, never written by the Gemma embedder, so
+# MC_EMBEDDER=minilm is an instant rollback.
 CHROMA_COLLECTION_ARTICLES = "articles"
+CHROMA_COLLECTION_ARTICLES_GEMMA = "articles_gemma2_q4"
 CHROMA_COLLECTION_DAILY = "daily_chunks"
+
+# Which embedder serves the articles collection. Vectors from different
+# embedders are not comparable, so each one owns its own collection.
+EMBEDDER_GEMMA = "gemma2-q4"
+EMBEDDER_MINILM = "minilm"
+EMBEDDERS = (EMBEDDER_GEMMA, EMBEDDER_MINILM)
+
+
+def active_embedder() -> str:
+    """Read at call time so a changed MC_EMBEDDER needs no code reload."""
+    value = os.environ.get("MC_EMBEDDER", EMBEDDER_GEMMA).strip().lower()
+    if value not in EMBEDDERS:
+        raise ValueError(f"MC_EMBEDDER must be one of {EMBEDDERS}, got {value!r}")
+    return value
+
+
+def articles_collection_name(embedder: str | None = None) -> str:
+    embedder = embedder or active_embedder()
+    if embedder == EMBEDDER_MINILM:
+        return CHROMA_COLLECTION_ARTICLES
+    return CHROMA_COLLECTION_ARTICLES_GEMMA
 CHROMA_COLLECTION_CODEBASE = "codebase"
 
 # Cross-process file locks for Chroma writes. One lock file per collection
