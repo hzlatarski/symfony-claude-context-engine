@@ -253,3 +253,44 @@ class TestChunkedQuery:
 
         assert len(out) == 1, "the same article must not be listed twice"
         assert out[0]["similarity"] == pytest.approx(0.95)
+
+
+class TestThresholdsFollowTheEmbedder:
+    """REQ-6: MiniLM cut-offs would flag far too much under Gemma's higher scores."""
+
+    def test_gemma_uses_calibrated_values(self, monkeypatch):
+        import dedup
+
+        monkeypatch.setenv("MC_EMBEDDER", "gemma2-q4")
+        assert dedup.default_threshold() == dedup.GEMMA_DEFAULT_THRESHOLD == 0.953
+        assert dedup.identical_threshold() == 0.99
+        assert dedup.similar_floor() == 0.78
+
+    def test_minilm_keeps_its_values(self, monkeypatch):
+        import dedup
+
+        monkeypatch.setenv("MC_EMBEDDER", "minilm")
+        assert dedup.default_threshold() == 0.88
+        assert dedup.identical_threshold() == 0.97
+        assert dedup.similar_floor() == 0.55
+
+    def test_identical_flag_follows_the_embedder(self, monkeypatch):
+        import dedup
+
+        pair = dedup.DuplicatePair("concepts/a", "concepts/b", 0.98)
+        monkeypatch.setenv("MC_EMBEDDER", "minilm")
+        assert pair.identical
+        monkeypatch.setenv("MC_EMBEDDER", "gemma2-q4")
+        assert not pair.identical
+
+    def test_similar_to_text_defaults_to_the_embedder_floor(self, monkeypatch):
+        import dedup
+
+        monkeypatch.setenv("MC_EMBEDDER", "gemma2-q4")
+        hits = [
+            {"slug": "concepts/near", "distance": 0.20, "metadata": {"title": "Near"}},
+            {"slug": "concepts/far", "distance": 0.30, "metadata": {"title": "Far"}},
+        ]
+        monkeypatch.setattr(dedup.vs, "search_articles", lambda **_kw: list(hits))
+        slugs = [h["slug"] for h in dedup.similar_to_text("some source text")]
+        assert slugs == ["concepts/near"]  # 0.80 passes 0.78; 0.70 does not

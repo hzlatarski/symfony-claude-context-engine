@@ -32,6 +32,7 @@ from dataclasses import dataclass, asdict
 
 import numpy as np
 
+import config
 import vector_store as vs
 from config import KNOWLEDGE_DIR
 
@@ -51,6 +52,38 @@ DEFAULT_THRESHOLD = 0.88
 # separately because these need no judgement call — one of them is redundant.
 IDENTICAL_THRESHOLD = 0.97
 
+# EmbeddingGemma 2 scores everything higher (a typical related pair is ~0.79
+# where MiniLM gives ~0.58), so its cut-offs differ. Calibrated 2026-10-08 on
+# the live 1,351 Observed-zone articles by matching rank, i.e. same number of
+# reported pairs (C:/tmp/embtest/calibrate_dedup.py):
+#   MiniLM 0.88 -> 47 pairs  == Gemma 0.953 -> 47 pairs (17 shared). The
+#     Gemma-only pairs read as real duplicates (e.g. *-social-calibration-plan
+#     vs *-social-calibration, both gdpr-s3-403 notes); several MiniLM-only
+#     pairs were distinct lessons (deception-detection phase-3 trio).
+#   MiniLM 0.97 -> 2 pairs   == Gemma 0.9945.
+#   similar_to_text floor: MiniLM 0.55 passes 65.4% of top-5 hits for daily
+#     sections; Gemma passes the same share at 0.778.
+GEMMA_DEFAULT_THRESHOLD = 0.953
+GEMMA_IDENTICAL_THRESHOLD = 0.99
+GEMMA_SIMILAR_FLOOR = 0.78
+MINILM_SIMILAR_FLOOR = 0.55
+
+
+def _gemma() -> bool:
+    return config.active_embedder() == config.EMBEDDER_GEMMA
+
+
+def default_threshold() -> float:
+    return GEMMA_DEFAULT_THRESHOLD if _gemma() else DEFAULT_THRESHOLD
+
+
+def identical_threshold() -> float:
+    return GEMMA_IDENTICAL_THRESHOLD if _gemma() else IDENTICAL_THRESHOLD
+
+
+def similar_floor() -> float:
+    return GEMMA_SIMILAR_FLOOR if _gemma() else MINILM_SIMILAR_FLOOR
+
 
 @dataclass(frozen=True)
 class DuplicatePair:
@@ -62,7 +95,7 @@ class DuplicatePair:
 
     @property
     def identical(self) -> bool:
-        return self.similarity >= IDENTICAL_THRESHOLD
+        return self.similarity >= identical_threshold()
 
     def __str__(self) -> str:
         mark = "IDENTICAL" if self.identical else "near-dup "
@@ -142,12 +175,15 @@ def _load_observed_vectors() -> tuple[list[str], np.ndarray]:
 
 
 def find_near_duplicates(
-    threshold: float = DEFAULT_THRESHOLD,
+    threshold: float | None = None,
 ) -> list[DuplicatePair]:
     """All-pairs cosine sweep over article vectors; pairs at/above ``threshold``.
 
     Returned highest-similarity first. Each unordered pair appears once.
+    ``threshold`` defaults to the active embedder's calibrated floor.
     """
+    if threshold is None:
+        threshold = default_threshold()
     slugs, embeddings = _load_observed_vectors()
     if len(slugs) < 2:
         return []
@@ -177,7 +213,9 @@ def find_near_duplicates(
 # The embedding model (all-MiniLM-L6-v2) truncates its input at 256 tokens —
 # roughly 1,000 characters. Handing it a whole daily log as one query would
 # silently embed only the first session of the day and ignore everything after
-# it, so a source is chunked and the per-chunk hits are unioned.
+# it, so a source is chunked and the per-chunk hits are unioned. EmbeddingGemma
+# 2 reads 2,048 tokens, but its similar_to_text floor was calibrated on these
+# same 900-char chunks, so the chunk size stays.
 QUERY_CHUNK_CHARS = 900
 MAX_QUERY_CHUNKS = 12
 
@@ -206,7 +244,7 @@ def _chunk_for_query(text: str, chunk_chars: int = QUERY_CHUNK_CHARS) -> list[st
     return [c for c in chunks if c]
 
 
-def similar_to_text(text: str, limit: int = 5, threshold: float = 0.55) -> list[dict]:
+def similar_to_text(text: str, limit: int = 5, threshold: float | None = None) -> list[dict]:
     """Existing articles most similar to ``text`` — the prevention half.
 
     Called before compiling a source so the prompt can name the articles this
@@ -221,6 +259,8 @@ def similar_to_text(text: str, limit: int = 5, threshold: float = 0.55) -> list[
     """
     if not text.strip():
         return []
+    if threshold is None:
+        threshold = similar_floor()
 
     best: dict[str, dict] = {}
 
@@ -283,8 +323,9 @@ def main() -> int:
     parser.add_argument(
         "--threshold",
         type=float,
-        default=DEFAULT_THRESHOLD,
-        help=f"Cosine floor for reporting a pair (default: {DEFAULT_THRESHOLD})",
+        default=None,
+        help="Cosine floor for reporting a pair (default: calibrated per embedder, "
+        f"{GEMMA_DEFAULT_THRESHOLD} Gemma / {DEFAULT_THRESHOLD} MiniLM)",
     )
     parser.add_argument(
         "--json",
@@ -309,6 +350,8 @@ def main() -> int:
         return 0
 
     stale = find_stale_vectors()
+    if args.threshold is None:
+        args.threshold = default_threshold()
     pairs = find_near_duplicates(threshold=args.threshold)
 
     if args.json:
@@ -337,7 +380,7 @@ def main() -> int:
     identical = [p for p in pairs if p.identical]
     print(f"Found {len(pairs)} near-duplicate pair(s) at cosine >= {args.threshold}")
     if identical:
-        print(f"  {len(identical)} of them are effectively identical (>= {IDENTICAL_THRESHOLD})")
+        print(f"  {len(identical)} of them are effectively identical (>= {identical_threshold()})")
     print()
     for pair in pairs:
         print(f"  {pair}")
