@@ -9,8 +9,9 @@ So this module supplies the corpus and borrows the algorithms:
 
 * keyword ranking via ``bm25_store.TokenIndex`` — the project tokenizer
   and the negative-IDF presence gate, not a reimplementation;
-* vector ranking via a Chroma **ephemeral** client using the same default
-  ONNX embedder (all-MiniLM-L6-v2) the persistent store uses;
+* vector ranking via a Chroma **ephemeral** client using the same embedder
+  the persistent articles store uses (``MC_EMBEDDER``: EmbeddingGemma 2 by
+  default, all-MiniLM-L6-v2 for ``minilm``);
 * fusion via ``hybrid_search.fuse_rankings`` — the same RRF constant and
   the same first-seen dedup as live search.
 
@@ -32,6 +33,8 @@ from typing import Any
 
 import chromadb
 
+import config
+import embedder
 from bm25_store import TokenIndex
 from hybrid_search import _POOL_MULTIPLIER, fuse_rankings
 
@@ -178,9 +181,13 @@ class EphemeralCorpus:
             return self._collection
 
         client = chromadb.EphemeralClient()
+        extra: dict[str, Any] = {}
+        if config.active_embedder() == config.EMBEDDER_GEMMA:
+            extra["embedding_function"] = embedder.GemmaChromaEmbeddingFunction()
         collection = client.create_collection(
             name=self._collection_name,
             metadata={"hnsw:space": "cosine"},
+            **extra,
         )
         self._client = client
         embeddable_ids: list[str] = []

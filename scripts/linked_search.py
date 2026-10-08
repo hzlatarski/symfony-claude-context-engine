@@ -7,10 +7,11 @@ sibling projects in a single call. Hits are tagged with a ``project``
 label and RRF-merged across all sources.
 
 Assumptions:
-  - Every linked project uses the default Chroma embedder (ONNX
-    all-MiniLM-L6-v2). If a sibling switched embedders, vectors are
-    incompatible and the cross-project results will be noise — there's
-    no cheap way to detect that, so we trust the convention.
+  - Each embedder has its own collection name, so a sibling's vectors are
+    always queried with the model that made them: ``articles_gemma2_q4``
+    with EmbeddingGemma 2 when the sibling has it, else the legacy
+    ``articles`` with Chroma's default MiniLM. Fusion uses ranks only, so
+    distances on different scales do not matter.
   - Linked-project paths point at the **project root** (the directory
     above ``.claude/memory-compiler/``). The Chroma store is resolved
     as ``<project_root>/knowledge/chroma/`` to match this project's
@@ -28,9 +29,14 @@ from typing import Any
 
 import chromadb
 
+import embedder
 import hybrid_search
 from chroma_path import ensure_active_chroma_dir
-from config import CHROMA_COLLECTION_ARTICLES, LINKED_PROJECTS
+from config import (
+    CHROMA_COLLECTION_ARTICLES,
+    CHROMA_COLLECTION_ARTICLES_GEMMA,
+    LINKED_PROJECTS,
+)
 
 # RRF constant — must match hybrid_search._RRF_K so local hits and linked
 # hits live on the same fusion scale.
@@ -58,6 +64,25 @@ def _client_for(project_root: Path) -> Any:
     client = chromadb.PersistentClient(path=str(chroma_path))
     _client_cache[key] = client
     return client
+
+
+def _linked_articles_collection(client: Any) -> Any:
+    """Open a sibling's articles with the embedder its vectors came from.
+
+    Uses ``get_collection``, never ``get_or_create``: searching must not
+    create collections in another project's store. None when it has neither.
+    """
+    try:
+        return client.get_collection(
+            CHROMA_COLLECTION_ARTICLES_GEMMA,
+            embedding_function=embedder.GemmaChromaEmbeddingFunction(),
+        )
+    except Exception:
+        pass
+    try:
+        return client.get_collection(CHROMA_COLLECTION_ARTICLES)
+    except Exception:
+        return None
 
 
 def _build_where(
@@ -155,9 +180,8 @@ def search_articles_linked(
         client = _client_for(project_path)
         if client is None:
             continue
-        try:
-            coll = client.get_collection(CHROMA_COLLECTION_ARTICLES)
-        except Exception:
+        coll = _linked_articles_collection(client)
+        if coll is None:
             continue
         try:
             res = coll.query(query_texts=[query], n_results=pool, where=where)
