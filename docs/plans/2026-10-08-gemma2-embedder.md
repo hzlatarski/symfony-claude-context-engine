@@ -82,3 +82,36 @@ measured similarity data and recorded with the evidence in a code comment.
 
 After task 6: full `pytest`, then an adversarial review (Codex + Fable subagent) against this
 spec, before merge.
+
+## Addendum (2026-10-08): lost-vector bug found during the work
+
+While calibrating dedup, the live store turned out to be damaged:
+- `articles`: 392 of 2,503 zones are in Chroma's metadata but missing from the HNSW index
+  (reading their embedding fails with "Error finding id"; vector search never returns them).
+- `daily_chunks`: the index is ~8,100 log entries behind and Chroma can no longer apply the log
+  ("Failed to apply logs to the hnsw segment writer"); every read hangs or fails, so
+  `search_raw_daily` never answers (verified: a live call hung 30 min).
+- `codebase`: healthy.
+
+Root cause, reproduced with real processes: Chroma's local store keeps each HNSW index in
+process memory and saves it over the files on disk. A process that loaded the index early and
+wrote late (compile.py / ingest.py wait minutes on the LLM) saved a stale copy, erasing vectors
+other processes had added; the write log was purged past that point. `chroma_write_lock`
+serialized the calls, not the in-memory copies.
+
+**REQ-8 Writes never save a stale index.** Every write reloads the index from disk under the
+collection's write lock (`chroma_client.write_session`). All stores share one process client.
+- AC-8.1 Two real processes (stale loader writes after another process wrote and saved): no
+  vector of the other process is lost. The same scenario without the fix still loses them.
+- AC-8.2 Every write function in vector_store and codebase_store reloads exactly once.
+
+**REQ-9 Damage can be found and repaired.** `scripts/vector_health.py` lists records whose vector
+is unreadable and, with `--repair`, re-embeds them (delete + re-add of the stored document and
+metadata). AC-9.1 On a copy of the live store: articles 392 -> 0 damaged, 392/392 self-retrieved.
+
+**REQ-10 Daily chunks are rebuilt.** The unreadable `daily_chunks` is replaced by
+`daily_chunks_v2` (own hash key `vector_daily_hashes_v2`), rebuilt from the daily files by
+`reindex.py --daily-only`. The broken collection is left in place, not deleted.
+
+Cut-over order matters: merge first (old code would re-damage the store), then rebuild
+articles (Gemma) and daily (v2), then run `vector_health.py` as the check.
