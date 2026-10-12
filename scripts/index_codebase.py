@@ -36,6 +36,7 @@ for _p in (str(_ROOT), str(_HERE)):
         sys.path.insert(0, _p)
 
 import config  # noqa: E402
+from parsers import code_root  # noqa: E402
 from codebase_store import delete_chunks_for_file, replace_chunks_for_file  # noqa: E402
 from utils import load_state, update_state  # noqa: E402
 
@@ -251,7 +252,7 @@ def list_source_files() -> list[tuple[str, Path]]:
     results: list[tuple[str, Path]] = []
     for file_type, patterns, _desc in _all_source_groups():
         for pattern in patterns:
-            for match in config.PROJECT_ROOT.glob(pattern):
+            for match in code_root(config.PROJECT_ROOT).glob(pattern):
                 if match.is_file() and not _is_excluded(match):
                     results.append((file_type, match))
     return results
