@@ -4,9 +4,11 @@ The fuser combines the call graph (from parsers.call_graph) with articles
 in knowledge/concepts/ etc. We test against synthetic tmp_path knowledge
 dirs and minimal call-graph dicts — no dependence on live project state.
 """
+from datetime import datetime, timezone
 from pathlib import Path
 
 from scripts import unified_graph
+from scripts import coaccess
 
 
 def test_build_with_empty_inputs_returns_empty_graph(tmp_path):
@@ -67,6 +69,52 @@ def test_wikilinks_become_article_to_article_edges(tmp_path):
     pairs = [(e["from"], e["to"], e.get("relation")) for e in result["edges"] if e["kind"] == "wikilink"]
     assert ("article:concepts/src", "article:concepts/dst", None) in pairs
     assert ("article:concepts/src", "article:concepts/other", "depends_on") in pairs
+
+
+def test_coaccess_store_becomes_co_access_edges(tmp_path):
+    (tmp_path / "concepts").mkdir()
+    (tmp_path / "concepts" / "a.md").write_text("A", encoding="utf-8")
+    (tmp_path / "concepts" / "b.md").write_text("B", encoding="utf-8")
+    # A fresh co-access of the two live articles, stored beside the tree.
+    now = datetime.now(timezone.utc).isoformat()
+    coaccess.record_coaccess(
+        ["concepts/a", "concepts/b"], now=now, path=tmp_path / "coaccess.json"
+    )
+
+    result = unified_graph.build(
+        call_graph={"symbols": {}, "edges": [], "classes": {}}, knowledge_root=tmp_path
+    )
+
+    co = [e for e in result["edges"] if e["kind"] == "co_access"]
+    assert len(co) == 1
+    assert co[0]["from"] == "article:concepts/a"
+    assert co[0]["to"] == "article:concepts/b"
+    assert co[0]["weight"] > 0.5
+
+
+def test_coaccess_pair_to_missing_article_is_dropped(tmp_path):
+    (tmp_path / "concepts").mkdir()
+    (tmp_path / "concepts" / "a.md").write_text("A", encoding="utf-8")
+    # 'b' is never written to disk → not a node → the edge must be dropped.
+    now = datetime.now(timezone.utc).isoformat()
+    coaccess.record_coaccess(
+        ["concepts/a", "concepts/b"], now=now, path=tmp_path / "coaccess.json"
+    )
+
+    result = unified_graph.build(
+        call_graph={"symbols": {}, "edges": [], "classes": {}}, knowledge_root=tmp_path
+    )
+    assert [e for e in result["edges"] if e["kind"] == "co_access"] == []
+
+
+def test_absent_coaccess_store_adds_no_edges(tmp_path):
+    (tmp_path / "concepts").mkdir()
+    (tmp_path / "concepts" / "a.md").write_text("A", encoding="utf-8")
+    (tmp_path / "concepts" / "b.md").write_text("B", encoding="utf-8")
+    result = unified_graph.build(
+        call_graph={"symbols": {}, "edges": [], "classes": {}}, knowledge_root=tmp_path
+    )
+    assert [e for e in result["edges"] if e["kind"] == "co_access"] == []
 
 
 def test_wikilink_to_missing_article_is_skipped(tmp_path):

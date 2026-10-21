@@ -140,11 +140,15 @@ class ParseCache:
     def get_unified_graph(self) -> dict:
         """Cache the unified knowledge graph.
 
-        Invalidates when either the call graph or any article markdown file
-        in ``knowledge/{concepts,connections,qa}/`` changes. Signature is
-        ``(call_graph_mtime, articles_mtime)`` — recomputing the unified
-        graph is cheap (single linear pass over articles + dict copy of the
-        call graph) so we don't need a finer-grained dirty-set protocol.
+        Invalidates when the call graph, any article markdown file in
+        ``knowledge/{concepts,connections,qa}/``, OR the co-access store
+        (``knowledge/coaccess.json``) changes. The co-access store feeds Pass 3
+        of ``unified_graph.build`` (usage-based ``co_access`` edges); without it
+        in the signature a freshly recorded edge would never appear until an
+        unrelated code/article change forced a rebuild. Signature is
+        ``(call_graph_mtime, articles_mtime, coaccess_mtime)`` — recomputing the
+        unified graph is cheap (single linear pass + dict copy) so we don't need
+        a finer-grained dirty-set protocol.
         """
         from scripts.config import KNOWLEDGE_DIR
 
@@ -155,7 +159,10 @@ class ParseCache:
             if root.exists():
                 article_mtime = max(article_mtime, self._max_mtime(root.glob("*.md")))
 
-        signature = (self._call_graph_mtime, article_mtime)
+        coaccess_file = KNOWLEDGE_DIR / "coaccess.json"
+        coaccess_mtime = coaccess_file.stat().st_mtime if coaccess_file.exists() else 0.0
+
+        signature = (self._call_graph_mtime, article_mtime, coaccess_mtime)
         if self._unified_graph_cache is None or signature != self._unified_graph_signature:
             log.info("Rebuilding unified knowledge graph cache")
             self._unified_graph_cache = unified_graph.build(

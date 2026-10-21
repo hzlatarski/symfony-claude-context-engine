@@ -167,6 +167,75 @@ class TestCompileTruthQuarantine:
         assert "QUARANTINED" in output  # banner explaining the exclusion
 
 
+class TestCompileTruthCold:
+    """compile_truth should skip articles that are in cold storage."""
+
+    def test_cold_slug_excluded_from_output(self, tmp_path, monkeypatch):
+        knowledge = tmp_path / "knowledge"
+        (knowledge / "concepts").mkdir(parents=True)
+        (knowledge / "connections").mkdir()
+
+        (knowledge / "concepts" / "keep.md").write_text(
+            "---\ntitle: Keep\nupdated: 2026-04-12\nconfidence: 0.9\n---\n\n"
+            "## Truth\n\nThis article stays hot.\n"
+        )
+        (knowledge / "concepts" / "retired.md").write_text(
+            "---\ntitle: Retired\nupdated: 2026-04-12\nconfidence: 0.9\n---\n\n"
+            "## Truth\n\nThis one was marked cold.\n"
+        )
+
+        import sys
+        from scripts import compile_truth, config, utils
+
+        monkeypatch.setattr(config, "KNOWLEDGE_DIR", knowledge)
+        monkeypatch.setattr(config, "CONCEPTS_DIR", knowledge / "concepts")
+        monkeypatch.setattr(config, "CONNECTIONS_DIR", knowledge / "connections")
+        monkeypatch.setattr(compile_truth, "KNOWLEDGE_DIR", knowledge)
+        monkeypatch.setattr(compile_truth, "CONCEPTS_DIR", knowledge / "concepts")
+        monkeypatch.setattr(compile_truth, "CONNECTIONS_DIR", knowledge / "connections")
+        monkeypatch.setattr(compile_truth, "COMPILED_TRUTH_FILE", knowledge / "compiled-truth.md")
+        # Empty quarantine so this test isolates the COLD exclusion.
+        monkeypatch.setattr(utils, "CONTRADICTIONS_FILE", knowledge / "contradictions.json")
+
+        # Same bare-vs-package module duplication guard as the quarantine test:
+        # compile_truth uses bare imports, so patch sys.modules copies too.
+        for name, patches in (
+            ("utils", {"CONTRADICTIONS_FILE": knowledge / "contradictions.json"}),
+            ("config", {
+                "KNOWLEDGE_DIR": knowledge,
+                "CONCEPTS_DIR": knowledge / "concepts",
+                "CONNECTIONS_DIR": knowledge / "connections",
+            }),
+            ("compile_truth", {
+                "KNOWLEDGE_DIR": knowledge,
+                "CONCEPTS_DIR": knowledge / "concepts",
+                "CONNECTIONS_DIR": knowledge / "connections",
+                "COMPILED_TRUTH_FILE": knowledge / "compiled-truth.md",
+            }),
+        ):
+            mod = sys.modules.get(name)
+            if mod is not None:
+                for attr, value in patches.items():
+                    monkeypatch.setattr(mod, attr, value, raising=False)
+
+        # Mark 'retired' cold by patching load_cold directly — bypasses the
+        # cold.json file + config resolution, so this test is about the
+        # exclusion wiring, not cold.py's own I/O (covered by test_cold.py).
+        for name in ("cold", "scripts.cold"):
+            mod = sys.modules.get(name)
+            if mod is not None:
+                monkeypatch.setattr(mod, "load_cold", lambda path=None: {"concepts/retired"})
+        import cold as _cold
+        monkeypatch.setattr(_cold, "load_cold", lambda path=None: {"concepts/retired"})
+
+        compile_truth.compile_truth(budget=100_000)
+        output = (knowledge / "compiled-truth.md").read_text()
+
+        assert "## concepts/keep" in output
+        assert "## concepts/retired" not in output
+        assert "This one was marked cold." not in output
+
+
 class TestLintResolve:
     """lint.py --resolve should clear the quarantine file."""
 

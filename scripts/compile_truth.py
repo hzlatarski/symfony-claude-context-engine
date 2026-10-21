@@ -479,6 +479,12 @@ def compile_truth(
     access_counts = state.get("access_counts", {})
     inbound_map = build_inbound_link_map()
     quarantined = load_contradictions()
+    # Cold-stored articles (reversible archive, e.g. retired near-duplicates)
+    # are excluded here exactly like the contradiction quarantine — a runtime
+    # read, so a mark/restore takes effect on the next regenerate with no
+    # reindex. See cold.py.
+    import cold
+    cold_slugs = cold.load_cold()
 
     # Retrieval-outcome feedback scores (slug -> [0,1]); slugs absent from
     # the map have no feedback and fall back to the neutral 0.5. Loaded once
@@ -497,7 +503,7 @@ def compile_truth(
             rel = str(md_file.relative_to(KNOWLEDGE_DIR)).replace("\\", "/")
             slug = rel.replace(".md", "")
 
-            if slug in quarantined:
+            if slug in quarantined or slug in cold_slugs:
                 continue
 
             # Extract truth content, split into Observed / Synthesized zones

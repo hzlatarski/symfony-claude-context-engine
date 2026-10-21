@@ -38,6 +38,7 @@ for path in (str(_MEMORY_COMPILER_ROOT), str(_HERE)):
         sys.path.insert(0, path)
 
 import bm25_store  # noqa: E402
+import coaccess  # noqa: E402
 import hybrid_search  # noqa: E402
 import parent_watchdog  # noqa: E402
 import vector_store  # noqa: E402
@@ -53,6 +54,13 @@ log = logging.getLogger("knowledge_mcp_server")
 # expect; ``vector`` and ``bm25`` are exposed for A/B inspection and for
 # falling back when one path is degraded.
 SEARCH_MODES = {"hybrid", "vector", "bm25"}
+
+# In-memory co-access bridge (coaccess.py): remembers each search's result set
+# so that when 2+ of those articles are later rated ``useful`` it records a
+# usage-based edge between them. Per-process and best-effort — a rating with no
+# remembered set is a silent no-op. Writes to the default store
+# (KNOWLEDGE_DIR/coaccess.json), the same file unified_graph reads.
+_COACCESS = coaccess.CoAccessTracker()
 
 # Token-efficient retrieval: search tools return snippets, not full bodies.
 # Agents fetch full content via ``get_article`` / ``get_articles`` only for
@@ -86,6 +94,17 @@ _SLIM_METADATA_KEYS = (
 # When include_linked is set, we also surface the project tag so the agent
 # can tell at a glance which project a hit came from.
 _LINKED_EXTRA_KEYS = ("project",)
+
+
+def _hit_is_local(hit: dict[str, Any]) -> bool:
+    """True when a slim hit belongs to THIS project (not a linked one).
+
+    ``_slim_hit`` surfaces the linked-project tag at the hit's TOP LEVEL, and a
+    non-linked search leaves it absent — so an absent tag means local. Checking
+    ``metadata`` instead (where the tag never is) would treat every foreign hit
+    as local.
+    """
+    return hit.get("project", "<local>") == "<local>"
 
 
 def _slim_hit(hit: dict[str, Any]) -> dict[str, Any]:
@@ -224,6 +243,7 @@ def _search_knowledge_impl(
     mode: str = "hybrid",
     include_linked: bool = False,
     expand_neighbors: bool = False,
+    include_cold: bool = False,
 ) -> list[dict[str, Any]]:
     """Search curated articles with metadata filters.
 
@@ -255,12 +275,27 @@ def _search_knowledge_impl(
             "BM25 indexes are not exposed. Use mode='hybrid' or 'vector'."
         )
 
+    # Load the cold set up front (best-effort): a corrupt cold.json must never
+    # break a search, so a read failure degrades to "nothing is cold". It is
+    # needed before the backend call so we can OVER-FETCH — otherwise a cold hit
+    # that occupies a result slot would silently shrink the result count below
+    # the caller's limit.
+    cold_slugs: set[str] = set()
+    if not include_cold:
+        try:
+            import cold
+
+            cold_slugs = cold.load_cold()
+        except Exception:  # pragma: no cover - defensive: never break search
+            log.debug("cold load skipped", exc_info=True)
+    fetch_limit = limit + max(limit, 10) if cold_slugs else limit
+
     if include_linked:
         import linked_search
 
         raw = linked_search.search_articles_linked(
             query=query,
-            limit=limit,
+            limit=fetch_limit,
             type_filter=type_filter,
             min_confidence=min_confidence,
             zone_filter=zone_filter,
@@ -276,7 +311,7 @@ def _search_knowledge_impl(
 
         raw = backend(
             query=query,
-            limit=limit,
+            limit=fetch_limit,
             type_filter=type_filter,
             min_confidence=min_confidence,
             zone_filter=zone_filter,
@@ -284,11 +319,33 @@ def _search_knowledge_impl(
         )
         hits = [_slim_hit(hit) for hit in raw]
 
+    # Drop cold-stored articles (reversible archive, e.g. retired near-dups),
+    # then trim back to the requested limit (we over-fetched above). Only LOCAL
+    # hits are eligible: the linked-project tag sits at the TOP LEVEL of a slim
+    # hit (``_slim_hit`` copies it there, NOT into metadata), and a foreign hit
+    # can carry the same bare slug as a local cold one — hiding it on a local
+    # flag would be wrong.
+    if cold_slugs:
+        hits = [h for h in hits if not (_hit_is_local(h) and h.get("slug") in cold_slugs)]
+    hits = hits[:limit]
+
     # Opt-in 1-hop graph expansion. Off by default: most lookups are single
     # facts, and always-on expansion would bloat every response. Foreign
     # (linked-project) slugs simply resolve to nothing locally and stay bare.
     if expand_neighbors:
         _attach_neighbors(hits)
+
+    # Remember this result set so a later ``useful`` rating on 2+ of its
+    # members can record a co-access edge between them. Only LOCAL slugs: a
+    # foreign hit's bare slug can collide with a local one and mint a bogus
+    # local edge. The project tag is top-level on a slim hit (see
+    # ``_hit_is_local``). Best-effort: never let bookkeeping affect the result.
+    try:
+        local_slugs = [h["slug"] for h in hits if h.get("slug") and _hit_is_local(h)]
+        _COACCESS.remember(local_slugs)
+    except Exception:  # pragma: no cover - defensive: a tracker bug must not break search
+        log.debug("co-access remember failed", exc_info=True)
+
     return hits
 
 
@@ -420,6 +477,17 @@ def _record_retrieval_outcome_impl(
         )
 
     rec = retrieval_feedback.record(normalized, outcome, note=note)
+
+    # A ``useful`` rating is the positive co-access signal: if another member
+    # of the same search result set was already rated useful, strengthen the
+    # usage-based edge between them. Best-effort — never fail the rating over
+    # it. Non-useful outcomes carry no co-access signal.
+    if outcome == "useful":
+        try:
+            _COACCESS.mark_useful(normalized)
+        except Exception:  # pragma: no cover - defensive
+            log.debug("co-access mark_useful failed", exc_info=True)
+
     return {
         "ok": True,
         "slug": normalized,
@@ -689,6 +757,7 @@ def _make_server():
         mode: str = "hybrid",
         include_linked: bool = False,
         expand_neighbors: bool = False,
+        include_cold: bool = False,
     ) -> list[dict[str, Any]]:
         """Search the curated knowledge base (hybrid BM25 + vector by default).
 
@@ -716,6 +785,10 @@ def _make_server():
             include_quarantined: include articles currently flagged as
                 contradicted. Default False — quarantined articles are
                 hidden until lint --resolve clears them.
+            include_cold: include articles in cold storage (the reversible
+                archive, e.g. retired near-duplicates). Default False —
+                cold articles are hidden until a human restores or merges
+                them. See cold.py / maintain.py.
             include_linked: also search the knowledge bases of projects
                 listed in ``MEMORY_COMPILER_LINKED_PROJECTS``. Useful
                 for "have we hit this gotcha before in another project?"
@@ -755,6 +828,7 @@ def _make_server():
             mode=mode,
             include_linked=include_linked,
             expand_neighbors=expand_neighbors,
+            include_cold=include_cold,
         )
 
     @server.tool()
