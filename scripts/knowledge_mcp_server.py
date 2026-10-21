@@ -96,6 +96,17 @@ _SLIM_METADATA_KEYS = (
 _LINKED_EXTRA_KEYS = ("project",)
 
 
+def _hit_is_local(hit: dict[str, Any]) -> bool:
+    """True when a slim hit belongs to THIS project (not a linked one).
+
+    ``_slim_hit`` surfaces the linked-project tag at the hit's TOP LEVEL, and a
+    non-linked search leaves it absent — so an absent tag means local. Checking
+    ``metadata`` instead (where the tag never is) would treat every foreign hit
+    as local.
+    """
+    return hit.get("project", "<local>") == "<local>"
+
+
 def _slim_hit(hit: dict[str, Any]) -> dict[str, Any]:
     """Project a backend search hit down to the token-efficient shape.
 
@@ -232,6 +243,7 @@ def _search_knowledge_impl(
     mode: str = "hybrid",
     include_linked: bool = False,
     expand_neighbors: bool = False,
+    include_cold: bool = False,
 ) -> list[dict[str, Any]]:
     """Search curated articles with metadata filters.
 
@@ -263,12 +275,27 @@ def _search_knowledge_impl(
             "BM25 indexes are not exposed. Use mode='hybrid' or 'vector'."
         )
 
+    # Load the cold set up front (best-effort): a corrupt cold.json must never
+    # break a search, so a read failure degrades to "nothing is cold". It is
+    # needed before the backend call so we can OVER-FETCH — otherwise a cold hit
+    # that occupies a result slot would silently shrink the result count below
+    # the caller's limit.
+    cold_slugs: set[str] = set()
+    if not include_cold:
+        try:
+            import cold
+
+            cold_slugs = cold.load_cold()
+        except Exception:  # pragma: no cover - defensive: never break search
+            log.debug("cold load skipped", exc_info=True)
+    fetch_limit = limit + max(limit, 10) if cold_slugs else limit
+
     if include_linked:
         import linked_search
 
         raw = linked_search.search_articles_linked(
             query=query,
-            limit=limit,
+            limit=fetch_limit,
             type_filter=type_filter,
             min_confidence=min_confidence,
             zone_filter=zone_filter,
@@ -284,13 +311,23 @@ def _search_knowledge_impl(
 
         raw = backend(
             query=query,
-            limit=limit,
+            limit=fetch_limit,
             type_filter=type_filter,
             min_confidence=min_confidence,
             zone_filter=zone_filter,
             include_quarantined=include_quarantined,
         )
         hits = [_slim_hit(hit) for hit in raw]
+
+    # Drop cold-stored articles (reversible archive, e.g. retired near-dups),
+    # then trim back to the requested limit (we over-fetched above). Only LOCAL
+    # hits are eligible: the linked-project tag sits at the TOP LEVEL of a slim
+    # hit (``_slim_hit`` copies it there, NOT into metadata), and a foreign hit
+    # can carry the same bare slug as a local cold one — hiding it on a local
+    # flag would be wrong.
+    if cold_slugs:
+        hits = [h for h in hits if not (_hit_is_local(h) and h.get("slug") in cold_slugs)]
+    hits = hits[:limit]
 
     # Opt-in 1-hop graph expansion. Off by default: most lookups are single
     # facts, and always-on expansion would bloat every response. Foreign
@@ -300,17 +337,11 @@ def _search_knowledge_impl(
 
     # Remember this result set so a later ``useful`` rating on 2+ of its
     # members can record a co-access edge between them. Only LOCAL slugs: a
-    # linked-project hit carries a foreign ``project`` tag and its bare slug can
-    # collide with a local one, which would mint a local edge for articles never
-    # retrieved together here. Best-effort: never let tracker bookkeeping affect
-    # the search result the agent asked for.
+    # foreign hit's bare slug can collide with a local one and mint a bogus
+    # local edge. The project tag is top-level on a slim hit (see
+    # ``_hit_is_local``). Best-effort: never let bookkeeping affect the result.
     try:
-        local_slugs = [
-            h["slug"]
-            for h in hits
-            if h.get("slug")
-            and (h.get("metadata") or {}).get("project", "<local>") == "<local>"
-        ]
+        local_slugs = [h["slug"] for h in hits if h.get("slug") and _hit_is_local(h)]
         _COACCESS.remember(local_slugs)
     except Exception:  # pragma: no cover - defensive: a tracker bug must not break search
         log.debug("co-access remember failed", exc_info=True)
@@ -726,6 +757,7 @@ def _make_server():
         mode: str = "hybrid",
         include_linked: bool = False,
         expand_neighbors: bool = False,
+        include_cold: bool = False,
     ) -> list[dict[str, Any]]:
         """Search the curated knowledge base (hybrid BM25 + vector by default).
 
@@ -753,6 +785,10 @@ def _make_server():
             include_quarantined: include articles currently flagged as
                 contradicted. Default False — quarantined articles are
                 hidden until lint --resolve clears them.
+            include_cold: include articles in cold storage (the reversible
+                archive, e.g. retired near-duplicates). Default False —
+                cold articles are hidden until a human restores or merges
+                them. See cold.py / maintain.py.
             include_linked: also search the knowledge bases of projects
                 listed in ``MEMORY_COMPILER_LINKED_PROJECTS``. Useful
                 for "have we hit this gotcha before in another project?"
@@ -792,6 +828,7 @@ def _make_server():
             mode=mode,
             include_linked=include_linked,
             expand_neighbors=expand_neighbors,
+            include_cold=include_cold,
         )
 
     @server.tool()

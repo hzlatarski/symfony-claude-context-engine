@@ -195,6 +195,85 @@ class TestSearchKnowledgeImpl:
         slugs = {r["slug"] for r in results}
         assert "concepts/quarantined-two" in slugs
 
+    def test_cold_excluded_by_default(self, seeded_store, monkeypatch):
+        import cold
+        from knowledge_mcp_server import _search_knowledge_impl
+
+        # Baseline: the seeded article is retrievable.
+        baseline = _search_knowledge_impl(
+            "stimulus naming convention", limit=5, include_cold=True
+        )
+        assert "concepts/stimulus-naming" in {r["slug"] for r in baseline}
+
+        # Once cold, it drops out of the default (agent-facing) search.
+        monkeypatch.setattr(cold, "load_cold", lambda path=None: {"concepts/stimulus-naming"})
+        hidden = _search_knowledge_impl("stimulus naming convention", limit=5)
+        assert "concepts/stimulus-naming" not in {r["slug"] for r in hidden}
+
+    def test_cold_included_when_opted_in(self, seeded_store, monkeypatch):
+        import cold
+        from knowledge_mcp_server import _search_knowledge_impl
+
+        monkeypatch.setattr(cold, "load_cold", lambda path=None: {"concepts/stimulus-naming"})
+        results = _search_knowledge_impl(
+            "stimulus naming convention", limit=5, include_cold=True
+        )
+        assert "concepts/stimulus-naming" in {r["slug"] for r in results}
+
+    def test_cold_filter_failure_never_breaks_search(self, seeded_store, monkeypatch):
+        import cold
+        from knowledge_mcp_server import _search_knowledge_impl
+
+        def boom(path=None):
+            raise RuntimeError("corrupt cold.json")
+
+        monkeypatch.setattr(cold, "load_cold", boom)
+        # A corrupt cold store must degrade to "nothing cold", not raise.
+        results = _search_knowledge_impl("stimulus naming convention", limit=5)
+        assert isinstance(results, list)
+        assert "concepts/stimulus-naming" in {r["slug"] for r in results}
+
+    def test_cold_filter_preserves_the_requested_limit(self, monkeypatch):
+        """A cold hit must not eat a result slot — over-fetch then trim."""
+        import cold
+        import hybrid_search
+        import knowledge_mcp_server as k
+
+        raw = [
+            {"id": "1", "slug": "concepts/dup", "text": "a", "distance": 0.1, "metadata": {}},
+            {"id": "2", "slug": "concepts/hot1", "text": "b", "distance": 0.2, "metadata": {}},
+            {"id": "3", "slug": "concepts/hot2", "text": "c", "distance": 0.3, "metadata": {}},
+        ]
+        monkeypatch.setattr(hybrid_search, "search_articles", lambda **kw: raw)
+        monkeypatch.setattr(k, "hybrid_search", hybrid_search, raising=False)
+        monkeypatch.setattr(cold, "load_cold", lambda path=None: {"concepts/dup"})
+
+        out = k._search_knowledge_impl("q", mode="hybrid", limit=2)
+        slugs = [h["slug"] for h in out]
+        assert len(out) == 2                      # still full despite one cold drop
+        assert "concepts/dup" not in slugs
+        assert slugs == ["concepts/hot1", "concepts/hot2"]
+
+    def test_cold_filter_is_local_only(self, monkeypatch):
+        """A foreign hit sharing a bare slug with a local cold one is NOT hidden."""
+        import cold
+        import hybrid_search
+        import knowledge_mcp_server as k
+
+        raw = [
+            {"id": "1", "slug": "concepts/dup", "text": "local", "distance": 0.1, "metadata": {}},
+            {"id": "2", "slug": "concepts/dup", "text": "foreign", "distance": 0.2,
+             "metadata": {}, "project": "other"},
+        ]
+        monkeypatch.setattr(hybrid_search, "search_articles", lambda **kw: raw)
+        monkeypatch.setattr(k, "hybrid_search", hybrid_search, raising=False)
+        monkeypatch.setattr(cold, "load_cold", lambda path=None: {"concepts/dup"})
+
+        out = k._search_knowledge_impl("q", mode="hybrid", limit=5)
+        # Local cold dropped; the foreign same-slug hit survives.
+        assert len(out) == 1
+        assert out[0].get("project") == "other"
+
 
 class TestSlimSearchShape:
     """Search tools return token-efficient snippets, not full bodies.
