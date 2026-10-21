@@ -4,6 +4,13 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [0.15.0] — 2026-10-21
+
+### Changed
+
+- feat(maintain): reversible cold storage + safe maintenance pass
+- feat(coaccess): usage-based co-access graph edges
+
 ## [0.14.0] — 2026-10-08
 
 EmbeddingGemma 2 replaces MiniLM for article search, and a cross-process bug that silently erased vectors is fixed. Measured on 400 English questions against the real knowledge base: hybrid top-5 recall rose from **81.0% to 88.8%** (48 questions won, 17 lost, p < 0.001). Also ships the entity-extraction work (`find_entity`) that was on `feat/kb-expand-neighbors`.
