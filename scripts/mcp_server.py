@@ -32,7 +32,7 @@ _MEMORY_COMPILER_ROOT = _HERE.parent     # .../memory-compiler
 if str(_MEMORY_COMPILER_ROOT) not in sys.path:
     sys.path.insert(0, str(_MEMORY_COMPILER_ROOT))
 
-from scripts.parsers import PROJECT_ROOT, php_graph, route_map, twig_graph, stimulus_map, git_intel, call_graph, messenger_map
+from scripts.parsers import PROJECT_ROOT, CODE_ROOT, CODE_PREFIX, to_code_rel, php_graph, route_map, twig_graph, stimulus_map, git_intel, call_graph, messenger_map
 from scripts import unified_graph
 from scripts import entities
 from scripts import parent_watchdog, mermaid_render
@@ -77,58 +77,71 @@ class ParseCache:
             return 0.0
 
     def get_php_graph(self) -> dict:
-        current = self._max_mtime((PROJECT_ROOT / "src").rglob("*.php"))
+        current = self._max_mtime((CODE_ROOT / "src").rglob("*.php"))
         if self._php_cache is None or current != self._php_mtime:
             log.info("Rebuilding PHP graph cache (mtime %s -> %s)", self._php_mtime, current)
-            self._php_cache = php_graph.parse(PROJECT_ROOT)
+            self._php_cache = php_graph.parse(CODE_ROOT)
             self._php_mtime = current
         return self._php_cache
 
     def get_route_map(self) -> dict:
-        current = self._max_mtime((PROJECT_ROOT / "src" / "Controller").rglob("*.php"))
+        current = self._max_mtime((CODE_ROOT / "src" / "Controller").rglob("*.php"))
         if self._route_cache is None or current != self._route_mtime:
             log.info("Rebuilding route map cache")
-            self._route_cache = route_map.parse(PROJECT_ROOT)
+            self._route_cache = route_map.parse(CODE_ROOT)
             self._route_mtime = current
         return self._route_cache
 
     def get_twig_graph(self) -> dict:
-        current = self._max_mtime((PROJECT_ROOT / "templates").rglob("*.twig"))
+        current = self._max_mtime((CODE_ROOT / "templates").rglob("*.twig"))
         if self._twig_cache is None or current != self._twig_mtime:
             log.info("Rebuilding Twig graph cache")
-            self._twig_cache = twig_graph.parse(PROJECT_ROOT)
+            self._twig_cache = twig_graph.parse(CODE_ROOT)
             self._twig_mtime = current
         return self._twig_cache
 
     def get_stimulus_map(self) -> dict:
-        stim_mtime = self._max_mtime((PROJECT_ROOT / "assets" / "controllers").glob("*_controller.js"))
-        twig_mtime = self._max_mtime((PROJECT_ROOT / "templates").rglob("*.twig"))
+        stim_mtime = self._max_mtime((CODE_ROOT / "assets" / "controllers").glob("*_controller.js"))
+        twig_mtime = self._max_mtime((CODE_ROOT / "templates").rglob("*.twig"))
         current = max(stim_mtime, twig_mtime)
         if self._stim_cache is None or current != self._stim_mtime:
             log.info("Rebuilding Stimulus map cache")
-            self._stim_cache = stimulus_map.parse(PROJECT_ROOT)
+            self._stim_cache = stimulus_map.parse(CODE_ROOT)
             self._stim_mtime = current
         return self._stim_cache
 
     def get_git_intel(self) -> dict:
-        return git_intel.load_or_parse(PROJECT_ROOT)
+        intel = git_intel.load_or_parse(PROJECT_ROOT)
+        if not CODE_PREFIX:
+            return intel
+        # git paths are repo-relative ("app/src/X.php"); graph keys are
+        # CODE_ROOT-relative ("src/X.php"). Re-key hotspots so lookups match.
+        hotspots = []
+        for h in intel.get("hotspots", []):
+            h = {**h, "file": to_code_rel(h["file"])}
+            if h.get("co_change_partners"):
+                h["co_change_partners"] = [
+                    {**p, "file": to_code_rel(p["file"])} for p in h["co_change_partners"]
+                ]
+            hotspots.append(h)
+        return {**intel, "hotspots": hotspots}
 
     def get_messenger_map(self) -> dict:
-        current = self._max_mtime((PROJECT_ROOT / "src").rglob("*.php"))
+        current = self._max_mtime((CODE_ROOT / "src").rglob("*.php"))
         if self._messenger_cache is None or current != self._messenger_mtime:
             log.info("Rebuilding messenger map cache")
-            self._messenger_cache = messenger_map.parse(PROJECT_ROOT)
+            self._messenger_cache = messenger_map.parse(CODE_ROOT)
             self._messenger_mtime = current
         return self._messenger_cache
 
     def get_call_graph(self) -> dict:
         # Both PHP and Stimulus JS files affect the graph — invalidate on either.
-        php_mtime = self._max_mtime((PROJECT_ROOT / "src").rglob("*.php"))
-        js_mtime = self._max_mtime((PROJECT_ROOT / "assets" / "controllers").rglob("*_controller.js"))
+        php_mtime = self._max_mtime((CODE_ROOT / "src").rglob("*.php"))
+        js_mtime = self._max_mtime((CODE_ROOT / "assets" / "controllers").rglob("*_controller.js"))
         current = max(php_mtime, js_mtime)
         if self._call_graph_cache is None or current != self._call_graph_mtime:
             log.info("Rebuilding call graph cache")
-            graph = call_graph.parse(PROJECT_ROOT)
+            graph = call_graph.parse(CODE_ROOT)
             # Resolve JS fetch placeholders to PHP controller symbols using the
             # current route map. Must run inside the cache so trace_route /
             # impact_of_change consumers see crossed-boundary edges.
@@ -243,7 +256,7 @@ def _build_file_deps(file_path: str) -> str:
     Handles PHP files, Twig templates, and Stimulus controller JS files.
     """
     # Normalise
-    file_path = file_path.replace("\\", "/").lstrip("./")
+    file_path = to_code_rel(file_path).replace("\\", "/").lstrip("./")
 
     # Dispatch by extension
     if file_path.endswith(".php"):
@@ -320,7 +333,7 @@ def _file_deps_php(file_path: str) -> str:
     # this per-file view stays cheap.
     rationale_rows: list[tuple[int, str, str]] = []
     try:
-        abs_path = PROJECT_ROOT / file_path
+        abs_path = CODE_ROOT / file_path
         syms, _edges, classes = call_graph._parse_file(abs_path, file_path)
         for info in list(syms.values()) + list(classes.values()):
             for n in info.get("rationale", []):
@@ -480,7 +493,7 @@ def _build_file_api(file_path: str) -> str:
     free functions are not in the call graph, so they are not listed here;
     Twig templates have no method surface — use ``get_template_graph`` for those.
     """
-    file_path = file_path.replace("\\", "/").lstrip("./")
+    file_path = to_code_rel(file_path).replace("\\", "/").lstrip("./")
 
     graph = _cache.get_call_graph()
     symbols = graph["symbols"]
@@ -501,7 +514,7 @@ def _build_file_api(file_path: str) -> str:
 
     # Read the source once for signature slicing.
     try:
-        src_lines = (PROJECT_ROOT / file_path).read_text(
+        src_lines = (CODE_ROOT / file_path).read_text(
             encoding="utf-8", errors="replace"
         ).splitlines()
     except OSError:
@@ -789,18 +802,21 @@ def _render_trace_node(
 
 
 def _run_git_diff(since_ref: str, file: str | None = None) -> str:
-    """Run ``git diff -U0 <since_ref> [-- <file>]`` against PROJECT_ROOT.
+    """Run ``git diff -U0 --relative <since_ref> [-- <file>]`` in CODE_ROOT.
+
+    ``--relative`` makes diff paths CODE_ROOT-relative so they match the
+    call-graph keys when the app lives in a subfolder.
 
     Returns raw stdout. Empty string if diff produces no output or git
     fails — caller handles 'no changes' as an empty-string case.
     """
-    cmd = ["git", "diff", "-U0", since_ref]
+    cmd = ["git", "diff", "-U0", "--relative", since_ref]
     if file:
-        cmd += ["--", file]
+        cmd += ["--", to_code_rel(file)]
     try:
         return subprocess.check_output(
             cmd,
-            cwd=str(PROJECT_ROOT),
+            cwd=str(CODE_ROOT),
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
         ).decode("utf-8", errors="replace")
@@ -993,7 +1009,7 @@ def _build_merge_order_risk(
     branch_files: dict[str, list[str]] = {}
     for b in branches:
         files = _git_lines(["diff", "--name-only", f"{base}...{b}"])
-        branch_files[b] = [f.replace("\\", "/") for f in files]
+        branch_files[b] = [to_code_rel(f) for f in files]
 
     # Detect stacked branches so we don't report a parent's files restated in
     # a child's diff as a conflict.
@@ -1569,7 +1585,7 @@ def _build_neighborhood(
         exhausted = False
         for rel in sorted(by_file):
             try:
-                file_lines = (PROJECT_ROOT / rel).read_text(encoding="utf-8").splitlines()
+                file_lines = (CODE_ROOT / rel).read_text(encoding="utf-8").splitlines()
             except OSError:
                 continue
             lang = _fence_lang(rel)
@@ -1624,7 +1640,7 @@ def _build_neighborhood(
             for fid in bare_files:
                 rel = fid.removeprefix("file:")
                 try:
-                    head = (PROJECT_ROOT / rel).read_text(encoding="utf-8").splitlines()[:40]
+                    head = (CODE_ROOT / rel).read_text(encoding="utf-8").splitlines()[:40]
                 except OSError:
                     continue
                 lang = _fence_lang(rel)
@@ -2097,7 +2113,7 @@ def _build_explore(target: str, max_depth: int = 4) -> str:
 
 def _explore_file(file_path: str, header_kind: str = "file") -> str:
     """Compose the one-call file view: API surface + deps + related knowledge."""
-    file_path = file_path.replace("\\", "/").lstrip("./")
+    file_path = to_code_rel(file_path).replace("\\", "/").lstrip("./")
     header = f"# Explore: `{file_path}` (detected: {header_kind})\n"
 
     seeds = [f"file:{file_path}"]

@@ -77,6 +77,7 @@ def fake_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(mcp_server._cache, "get_unified_graph", lambda: fake_unified)
     monkeypatch.setattr(mcp_server._cache, "get_call_graph", lambda: fake_call_graph)
     monkeypatch.setattr(mcp_server, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(mcp_server, "CODE_ROOT", tmp_path)
     return tmp_path
 
 

@@ -282,12 +282,12 @@ def build_for_project(project_root: Path, knowledge_root: Path) -> dict:
     how the calling entrypoint set up ``sys.path`` — try both.
     """
     try:
-        from scripts.parsers import call_graph, route_map
+        from scripts.parsers import call_graph, code_root, route_map
     except ImportError:
-        from parsers import call_graph, route_map
+        from parsers import call_graph, code_root, route_map
 
-    cg = call_graph.parse(project_root)
-    call_graph.resolve_fetch_edges(cg, route_map.parse(project_root))
+    cg = call_graph.parse(code_root(project_root))
+    call_graph.resolve_fetch_edges(cg, route_map.parse(code_root(project_root)))
     return build(call_graph=cg, knowledge_root=knowledge_root)
 
 
