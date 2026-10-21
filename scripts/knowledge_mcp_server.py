@@ -38,6 +38,7 @@ for path in (str(_MEMORY_COMPILER_ROOT), str(_HERE)):
         sys.path.insert(0, path)
 
 import bm25_store  # noqa: E402
+import coaccess  # noqa: E402
 import hybrid_search  # noqa: E402
 import parent_watchdog  # noqa: E402
 import vector_store  # noqa: E402
@@ -53,6 +54,13 @@ log = logging.getLogger("knowledge_mcp_server")
 # expect; ``vector`` and ``bm25`` are exposed for A/B inspection and for
 # falling back when one path is degraded.
 SEARCH_MODES = {"hybrid", "vector", "bm25"}
+
+# In-memory co-access bridge (coaccess.py): remembers each search's result set
+# so that when 2+ of those articles are later rated ``useful`` it records a
+# usage-based edge between them. Per-process and best-effort — a rating with no
+# remembered set is a silent no-op. Writes to the default store
+# (KNOWLEDGE_DIR/coaccess.json), the same file unified_graph reads.
+_COACCESS = coaccess.CoAccessTracker()
 
 # Token-efficient retrieval: search tools return snippets, not full bodies.
 # Agents fetch full content via ``get_article`` / ``get_articles`` only for
@@ -289,6 +297,24 @@ def _search_knowledge_impl(
     # (linked-project) slugs simply resolve to nothing locally and stay bare.
     if expand_neighbors:
         _attach_neighbors(hits)
+
+    # Remember this result set so a later ``useful`` rating on 2+ of its
+    # members can record a co-access edge between them. Only LOCAL slugs: a
+    # linked-project hit carries a foreign ``project`` tag and its bare slug can
+    # collide with a local one, which would mint a local edge for articles never
+    # retrieved together here. Best-effort: never let tracker bookkeeping affect
+    # the search result the agent asked for.
+    try:
+        local_slugs = [
+            h["slug"]
+            for h in hits
+            if h.get("slug")
+            and (h.get("metadata") or {}).get("project", "<local>") == "<local>"
+        ]
+        _COACCESS.remember(local_slugs)
+    except Exception:  # pragma: no cover - defensive: a tracker bug must not break search
+        log.debug("co-access remember failed", exc_info=True)
+
     return hits
 
 
@@ -420,6 +446,17 @@ def _record_retrieval_outcome_impl(
         )
 
     rec = retrieval_feedback.record(normalized, outcome, note=note)
+
+    # A ``useful`` rating is the positive co-access signal: if another member
+    # of the same search result set was already rated useful, strengthen the
+    # usage-based edge between them. Best-effort — never fail the rating over
+    # it. Non-useful outcomes carry no co-access signal.
+    if outcome == "useful":
+        try:
+            _COACCESS.mark_useful(normalized)
+        except Exception:  # pragma: no cover - defensive
+            log.debug("co-access mark_useful failed", exc_info=True)
+
     return {
         "ok": True,
         "slug": normalized,

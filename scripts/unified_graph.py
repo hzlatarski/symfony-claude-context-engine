@@ -46,6 +46,11 @@ try:
 except ImportError:  # pragma: no cover - exercised only via CLI entrypoint
     import entities
 
+try:
+    from scripts import coaccess
+except ImportError:  # pragma: no cover - exercised only via CLI entrypoint
+    import coaccess
+
 _TYPED_WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\](?:\{([a-z0-9_]+)\})?")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _SRC_ANCHOR_RE = re.compile(r"\[src:([^\]]+)\]")
@@ -240,6 +245,26 @@ def build(call_graph: dict, knowledge_root: Path) -> dict:
                 # edge already represents it; skip the redundant mention.
                 continue
             edges.append({"from": src_id, "to": target_id, "kind": "mentions"})
+
+    # Pass 3: usage-based co-access edges (coaccess.py). A pair's weight rises
+    # each time the two articles are retrieved together in a useful answer and
+    # decays with age; only pairs still above the weight floor are emitted, and
+    # only when BOTH endpoints are live article nodes (a pair referencing a
+    # deleted article is silently dropped). The store path is derived from
+    # ``knowledge_root`` — not the global default — so a test with a tmp
+    # knowledge tree sees an empty store and this stays deterministic. An
+    # absent/empty store yields no edges, so Pass 3 is a no-op until retrievals
+    # begin recording co-access.
+    for ce in coaccess.load_edges(path=knowledge_root / "coaccess.json"):
+        from_id = f"article:{ce['from']}"
+        to_id = f"article:{ce['to']}"
+        if from_id in nodes and to_id in nodes:
+            edges.append({
+                "from": from_id,
+                "to": to_id,
+                "kind": "co_access",
+                "weight": ce["weight"],
+            })
 
     return {"nodes": nodes, "edges": edges}
 
