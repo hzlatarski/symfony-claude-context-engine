@@ -30,9 +30,6 @@ from filelock import FileLock
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT / "scripts"
-STATE_FILE = SCRIPTS_DIR / "last-flush.json"
-LOG_FILE = SCRIPTS_DIR / "flush.log"
-WIP_FILE = ROOT / "wip.md"
 
 # Daily logs live at ``knowledge/daily/`` in the outer project, NOT inside
 # ``.claude/memory-compiler/daily/``. Pull DAILY_DIR from config.py so
@@ -41,7 +38,11 @@ WIP_FILE = ROOT / "wip.md"
 # which silently landed session flushes at a stale path the rest of the
 # pipeline never saw.
 sys.path.insert(0, str(SCRIPTS_DIR))
-from config import CLAUDE_BIN, DAILY_DIR  # noqa: E402
+from config import (  # noqa: E402
+    CLAUDE_BIN, DAILY_DIR, FLUSH_STATE_FILE as STATE_FILE,
+    FLUSH_LOG_FILE as LOG_FILE, WIP_FILE, STATE_FILE as COMPILE_STATE_FILE,
+    COMPILE_LOG_FILE,
+)
 from flush_cursor import load_cursor, save_cursor, session_flush_lock  # noqa: E402
 from log_setup import configure as configure_logging  # noqa: E402
 from pending_flush import record_failed_attempt, remove_pending_flush  # noqa: E402
@@ -64,11 +65,11 @@ def load_flush_state() -> dict:
 
 def update_flush_state(mutator) -> dict:
     """Atomically update cross-session flush metadata without lost costs."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     lock = FileLock(str(STATE_FILE.with_suffix(".json.lock")))
     with lock:
         state = load_flush_state()
         mutator(state)
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = STATE_FILE.with_name(
             f".{STATE_FILE.name}.{os.getpid()}.{threading.get_ident()}.tmp"
         )
@@ -383,6 +384,7 @@ def update_wip_file(wip_content: str) -> None:
         "# Work In Progress\n\n"
         f"_Last updated: {today.strftime('%Y-%m-%d %H:%M %Z').strip()}_\n\n"
     )
+    WIP_FILE.parent.mkdir(parents=True, exist_ok=True)
     WIP_FILE.write_text(header + wip_content + "\n", encoding="utf-8")
 
 
@@ -515,7 +517,7 @@ def maybe_trigger_compilation() -> None:
 
     # Check if today's log has already been compiled
     today_log = f"{now.strftime('%Y-%m-%d')}.md"
-    compile_state_file = SCRIPTS_DIR / "state.json"
+    compile_state_file = COMPILE_STATE_FILE
     if compile_state_file.exists():
         try:
             compile_state = json.loads(compile_state_file.read_text(encoding="utf-8"))
@@ -550,7 +552,8 @@ def maybe_trigger_compilation() -> None:
         kwargs["start_new_session"] = True
 
     try:
-        log_handle = open(str(SCRIPTS_DIR / "compile.log"), "a")
+        COMPILE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = open(COMPILE_LOG_FILE, "a")
         _sp.Popen(cmd, stdout=log_handle, stderr=_sp.STDOUT, cwd=str(ROOT), **kwargs)
     except Exception as e:
         logging.error("Failed to spawn compile.py: %s", e)

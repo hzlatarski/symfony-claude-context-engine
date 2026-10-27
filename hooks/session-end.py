@@ -30,11 +30,10 @@ if "all" in _disabled or "session-end" in _disabled:
     sys.exit(0)
 
 ROOT = Path(__file__).resolve().parent.parent
-DAILY_DIR = ROOT / "daily"
 SCRIPTS_DIR = ROOT / "scripts"
-STATE_DIR = SCRIPTS_DIR
 
 sys.path.insert(0, str(SCRIPTS_DIR))
+from config import STATE_DIR, FLUSH_LOG_FILE
 from flush_cursor import load_cursor  # noqa: E402
 from log_setup import configure as configure_logging  # noqa: E402
 from pending_flush import create_pending_flush, load_pending_flushes  # noqa: E402
@@ -46,7 +45,7 @@ from transcript import (  # noqa: E402
 )
 
 configure_logging(
-    SCRIPTS_DIR / "flush.log",
+    FLUSH_LOG_FILE,
     "%(asctime)s %(levelname)s [hook] %(message)s",
 )
 

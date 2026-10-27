@@ -107,6 +107,7 @@ def update_state(
     """Atomically mutate current state under a cross-process lock."""
     path = state_file or STATE_FILE
     lock = FileLock(str(path.with_suffix(f"{path.suffix}.lock")))
+    path.parent.mkdir(parents=True, exist_ok=True)
     with lock:
         state = load_state(path)
         mutator(state)
@@ -475,12 +476,12 @@ def verify_source_anchor(anchor: str) -> bool:
     memory-compiler directory itself (local docs). Checks all three candidate
     roots for v1.
     """
-    from config import PROJECT_ROOT
+    from config import PROJECT_ROOT, ROOT_DIR
 
     candidates = [
         KNOWLEDGE_DIR / anchor,
         PROJECT_ROOT / anchor,
-        PROJECT_ROOT / ".claude" / "memory-compiler" / anchor,
+        ROOT_DIR / anchor,
     ]
     return any(c.exists() for c in candidates)
 

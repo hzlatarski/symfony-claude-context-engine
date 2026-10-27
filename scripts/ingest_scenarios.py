@@ -34,10 +34,10 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import vector_store  # noqa: E402
-from config import PROJECT_ROOT  # noqa: E402
+from config import KNOWLEDGE_DIR  # noqa: E402
 
 
-SCENARIOS_DIR = PROJECT_ROOT / "knowledge" / "scenarios"
+SCENARIOS_DIR = KNOWLEDGE_DIR / "scenarios"
 
 # How much of the article body to include in the embedded document. The
 # taxonomy block at the top already gives the embedder the structured

@@ -6,33 +6,43 @@ from datetime import datetime, timezone
 
 # ── Paths ──────────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent.parent
-PROJECT_ROOT = ROOT_DIR.parent.parent  # Outer Symfony project root (outside .claude/)
+_home = os.environ.get("MEMORY_COMPILER_HOME", "").strip()
+HOME_DIR = Path(_home).expanduser().resolve() if _home else None
+PROJECT_ROOT = HOME_DIR or ROOT_DIR.parent.parent
+ENV_FILE = (HOME_DIR or PROJECT_ROOT) / ".env.local"
 
 # Load .env.local from the Symfony project root so ANTHROPIC_API_KEY etc. are
 # available when running standalone scripts (viewer.py, canary.py, query.py).
 try:
     from dotenv import load_dotenv
-    _env_local = PROJECT_ROOT / ".env.local"
+    _env_local = ENV_FILE
     if _env_local.exists():
         load_dotenv(_env_local, override=False)
 except ImportError:
     pass
 # Knowledge base lives at project root so the Agent SDK can write to it
 # (Claude Code blocks writes inside .claude/ even with bypassPermissions)
-KNOWLEDGE_DIR = PROJECT_ROOT / "knowledge"
+KNOWLEDGE_DIR = (HOME_DIR or PROJECT_ROOT) / "knowledge"
 DAILY_DIR = KNOWLEDGE_DIR / "daily"
 CONCEPTS_DIR = KNOWLEDGE_DIR / "concepts"
 CONNECTIONS_DIR = KNOWLEDGE_DIR / "connections"
 QA_DIR = KNOWLEDGE_DIR / "qa"
-REPORTS_DIR = ROOT_DIR / "reports"
+REPORTS_DIR = (HOME_DIR or ROOT_DIR) / "reports"
 SCRIPTS_DIR = ROOT_DIR / "scripts"
+STATE_DIR = HOME_DIR / "state" if HOME_DIR else SCRIPTS_DIR
 HOOKS_DIR = ROOT_DIR / "hooks"
 AGENTS_FILE = ROOT_DIR / "AGENTS.md"
 
 INDEX_FILE = KNOWLEDGE_DIR / "index.md"
 LOG_FILE = KNOWLEDGE_DIR / "log.md"
-STATE_FILE = SCRIPTS_DIR / "state.json"
-SOURCES_FILE = ROOT_DIR / "sources.yaml"
+STATE_FILE = STATE_DIR / "state.json"
+FLUSH_STATE_FILE = STATE_DIR / "last-flush.json"
+FLUSH_CURSOR_FILE = STATE_DIR / "flush-cursors.json"
+FLUSH_LOG_FILE = STATE_DIR / "flush.log"
+COMPILE_LOG_FILE = STATE_DIR / "compile.log"
+COMPILE_LOCK_FILE = STATE_DIR / "compile.lock"
+WIP_FILE = (HOME_DIR or ROOT_DIR) / "wip.md"
+SOURCES_FILE = (HOME_DIR or ROOT_DIR) / "sources.yaml"
 
 # ── Vector store ─────────────────────────────────────────────────────
 # Keep the active database in a replaceable child directory so a verified
@@ -337,14 +347,14 @@ def compiler_agent_cwd(knowledge_dir: Path) -> str:
     callers turn it into an ordinary, retried failure.
     """
     knowledge_dir = Path(knowledge_dir)
-    knowledge_dir.mkdir(parents=True, exist_ok=True)
     resolved = knowledge_dir.resolve()
-    project = PROJECT_ROOT.resolve()
+    project = (HOME_DIR or PROJECT_ROOT).resolve()
     if project == resolved or resolved in project.parents:
         raise ValueError(
             f"refusing to run the compiler agent in {resolved}: the knowledge "
             f"dir resolves to the project root {project} or above it"
         )
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
     return str(knowledge_dir)
 
 

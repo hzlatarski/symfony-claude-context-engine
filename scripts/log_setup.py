@@ -163,6 +163,7 @@ def configure(log_file: Path | str, fmt: str, level: int = logging.INFO) -> None
     log stays attributable to the process that wrote each line.
     """
     log_file = Path(log_file)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
     failure = _rotate_if_needed(log_file)
     logging.basicConfig(
         filename=str(log_file),

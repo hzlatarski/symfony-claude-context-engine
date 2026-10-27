@@ -25,7 +25,7 @@ from pathlib import Path
 
 from filelock import FileLock
 
-STATE_FILE = Path(__file__).resolve().parent / "flush-cursors.json"
+from config import FLUSH_CURSOR_FILE as STATE_FILE
 
 # Cap the number of sessions tracked so last-flush.json cannot grow without
 # bound. Sessions are pruned oldest-first by their recorded cursor write order.
@@ -62,6 +62,7 @@ def session_flush_lock(
     """Serialize the complete flush transaction for one session."""
     path = state_file or STATE_FILE
     digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:20]
+    path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(f"{path.name}.{digest}.flush.lock")
     with FileLock(str(lock_path)):
         yield
@@ -76,6 +77,7 @@ def save_cursor(session_id: str, cursor: int, state_file: Path | None = None) ->
     """
     path = state_file or STATE_FILE
     lock = FileLock(str(path.with_suffix(f"{path.suffix}.lock")))
+    path.parent.mkdir(parents=True, exist_ok=True)
     with lock:
         state = _load_state(path)
 

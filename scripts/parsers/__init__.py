@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 
 # scripts/parsers/__init__.py → scripts/parsers → scripts → memory-compiler → .claude → project_root
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
+from config import PROJECT_ROOT
 
 
 def code_root(project_root: Path) -> Path:

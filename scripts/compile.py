@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 
 from filelock import FileLock
+from config import COMPILE_LOCK_FILE
 
 from config import AGENTS_FILE, CLAUDE_BIN, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, MODEL_COMPILE, NO_WINDOW_CREATIONFLAGS, COMPILER_AGENT_CWD_NOTE, agent_path, compiler_agent_cwd, compiler_agent_permission_args, now_iso
 from utils import (
@@ -524,7 +525,8 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Show what would be compiled")
     args = parser.parse_args()
 
-    lock_path = ROOT_DIR / "scripts" / "compile.lock"
+    lock_path = COMPILE_LOCK_FILE
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     with FileLock(str(lock_path)):
         return _main_unlocked(args)
 

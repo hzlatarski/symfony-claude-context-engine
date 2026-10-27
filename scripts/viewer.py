@@ -312,7 +312,7 @@ def summarize_tool_events(events: list[dict[str, Any]]) -> dict[str, Any]:
 
 def load_flush_state() -> dict[str, Any]:
     """Read the flush state file written by flush.py (costs, dedup, history)."""
-    path = config.SCRIPTS_DIR / "last-flush.json"
+    path = config.FLUSH_STATE_FILE
     if not path.exists():
         return {}
     try:

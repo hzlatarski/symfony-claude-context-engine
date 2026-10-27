@@ -39,7 +39,8 @@ if "all" in _disabled or "session-start" in _disabled:
 
 # Paths relative to project root
 ROOT = Path(__file__).resolve().parent.parent
-WIP_FILE = ROOT / "wip.md"
+sys.path.insert(0, str(ROOT / "scripts"))
+from config import KNOWLEDGE_DIR as PROJECT_KNOWLEDGE_DIR, STATE_FILE, FLUSH_STATE_FILE, WIP_FILE
 
 MAX_CONTEXT_CHARS = 60_000
 MAX_LOG_LINES = 30
@@ -50,7 +51,6 @@ MAX_WIP_CHARS = 2_000
 # at memory-compiler's own knowledge/ and daily/ subdirs, which were stale —
 # that is why every session said "empty - no articles compiled yet" even though
 # index.md had 250+ articles.
-PROJECT_KNOWLEDGE_DIR = ROOT.parent.parent / "knowledge"
 INDEX_FILE = PROJECT_KNOWLEDGE_DIR / "index.md"
 DAILY_DIR = PROJECT_KNOWLEDGE_DIR / "daily"
 COMPILED_TRUTH_FILE = PROJECT_KNOWLEDGE_DIR / "compiled-truth.md"
@@ -60,8 +60,6 @@ COMPILED_TRUTH_FILE = PROJECT_KNOWLEDGE_DIR / "compiled-truth.md"
 # daily log below still fit.
 MAX_COMPILED_TRUTH_CHARS = 20_000
 MAX_INDEX_CHARS = 20_000
-STATE_FILE = ROOT / "scripts" / "state.json"
-FLUSH_STATE_FILE = ROOT / "scripts" / "last-flush.json"
 
 
 def get_recent_log() -> str:

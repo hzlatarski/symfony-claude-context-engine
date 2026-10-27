@@ -58,19 +58,23 @@ SCRIPTS_DIR = ROOT / "scripts"
 # .claude/memory-compiler/daily/ which is a stale earlier location.
 sys.path.insert(0, str(SCRIPTS_DIR))
 try:
-    from config import DAILY_DIR  # noqa: E402
+    from config import DAILY_DIR, FLUSH_LOG_FILE  # noqa: E402
 except Exception:  # pragma: no cover — absolute last-resort fallback
-    DAILY_DIR = ROOT.parent.parent / "knowledge" / "daily"
+    _home = os.environ.get("MEMORY_COMPILER_HOME", "").strip()
+    _data_root = Path(_home).expanduser() if _home else ROOT.parent.parent
+    DAILY_DIR = _data_root / "knowledge" / "daily"
+    FLUSH_LOG_FILE = (Path(_home).expanduser() / "state" if _home else SCRIPTS_DIR) / "flush.log"
 
 _LOG_FMT = "%(asctime)s %(levelname)s [post-tool-use] %(message)s"
 try:
     from log_setup import configure as configure_logging  # noqa: E402
 
-    configure_logging(SCRIPTS_DIR / "flush.log", _LOG_FMT)
+    configure_logging(FLUSH_LOG_FILE, _LOG_FMT)
 except Exception:  # pragma: no cover — mirrors the config import guard above
     # This hook fires on every tool use; an unrotated log beats a broken hook.
+    FLUSH_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
-        filename=str(SCRIPTS_DIR / "flush.log"),
+        filename=str(FLUSH_LOG_FILE),
         level=logging.INFO,
         format=_LOG_FMT,
         datefmt="%Y-%m-%d %H:%M:%S",
