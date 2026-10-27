@@ -46,5 +46,6 @@ line-length = 100
 whisper-tray = "whisper_tray.main:main"
 
 [tool.pytest.ini_options]
+markers = ["slow: creates a clean environment and installs wiki dependencies"]
 pythonpath = [".", "scripts"]
 testpaths = ["tests"]

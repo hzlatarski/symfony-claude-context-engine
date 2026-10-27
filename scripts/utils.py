@@ -338,7 +338,15 @@ def resolve_source_files(group: SourceGroup, root: Path | None = None) -> list[P
     base = root or ROOT_DIR
     included: set[Path] = set()
     for pattern in group.include:
-        for match in base.glob(pattern):
+        # Path.glob only accepts relative patterns. Split absolute paths at
+        # their anchor so pathlib retains its recursive/wildcard semantics
+        # without interpreting the user's path as relative to compiler code.
+        path_pattern = Path(pattern)
+        if path_pattern.is_absolute():
+            matches = Path(path_pattern.anchor).glob(str(path_pattern.relative_to(path_pattern.anchor)))
+        else:
+            matches = base.glob(pattern)
+        for match in matches:
             if match.is_file():
                 included.add(match.resolve())
 
