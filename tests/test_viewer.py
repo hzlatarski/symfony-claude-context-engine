@@ -37,7 +37,7 @@ def seeded_kb(tmp_path, monkeypatch):
               2026-04-14.tools.jsonl (tool drawer with a few events)
 
     The fixture monkeypatches ``config.KNOWLEDGE_DIR``, ``config.DAILY_DIR``,
-    and ``config.SCRIPTS_DIR`` so the viewer app reads from this temp tree,
+    and its state-file constants so the viewer app reads from this temp tree,
     and patches ``viewer._chroma_stats`` so Chroma isn't touched.
     """
     import config
@@ -126,6 +126,7 @@ def seeded_kb(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "KNOWLEDGE_DIR", kb)
     monkeypatch.setattr(config, "DAILY_DIR", daily)
     monkeypatch.setattr(config, "SCRIPTS_DIR", scripts_state)
+    monkeypatch.setattr(config, "FLUSH_STATE_FILE", scripts_state / "last-flush.json")
     monkeypatch.setattr(config, "STATE_FILE", scripts_state / "state.json")
     monkeypatch.setattr(utils, "CONTRADICTIONS_FILE", kb / "contradictions.json")
 
@@ -441,6 +442,7 @@ class TestBootAppFactory:
         monkeypatch.setattr(config, "KNOWLEDGE_DIR", kb)
         monkeypatch.setattr(config, "DAILY_DIR", kb / "daily")
         monkeypatch.setattr(config, "SCRIPTS_DIR", tmp_path / "nonexistent")
+        monkeypatch.setattr(config, "FLUSH_STATE_FILE", tmp_path / "nonexistent/last-flush.json")
         monkeypatch.setattr(config, "STATE_FILE", tmp_path / "nonexistent" / "state.json")
 
         import viewer
