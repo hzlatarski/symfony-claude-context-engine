@@ -30,7 +30,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent          # .../memory-compiler
-PROJECT_ROOT = ROOT.parent.parent                      # repo root (AiTutor)
+PROJECT_ROOT = ROOT.parent.parent                      # repo root
+# Same slug as install.py / session-start.py, so the MCP names below match
+# the servers actually registered for this project (AiTutor → aitutor).
+PROJECT_SLUG = re.sub(r"[^a-z0-9]+", "-", PROJECT_ROOT.name.lower()).strip("-") or "project"
 
 # Caps — keep total work bounded so we never add more than ~1-2s on a code task.
 MAX_FILES = 3
@@ -388,8 +391,8 @@ def main() -> None:
     header = (
         "## Auto-fetched context\n\n"
         "Pulled automatically from the memory-compiler MCP servers so you don't "
-        "re-derive it: `aitutor-code-intel` for *what connects to what* "
-        "(dependencies, routes, call chains) and `aitutor-knowledge` for *why it "
+        f"re-derive it: `{PROJECT_SLUG}-code-intel` for *what connects to what* "
+        f"(dependencies, routes, call chains) and `{PROJECT_SLUG}-knowledge` for *why it "
         "was built this way* (curated articles). Treat the code structure as "
         "ground truth. For anything not shown — deeper chains, template "
         "inheritance, full articles — unlock and call the MCP tools "

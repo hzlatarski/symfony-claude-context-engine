@@ -386,7 +386,86 @@ def update_wip_file(wip_content: str) -> None:
     WIP_FILE.write_text(header + wip_content + "\n", encoding="utf-8")
 
 
+# Haiku's window is 200k tokens; contexts above ~400k chars failed every time
+# ("claude CLI exited 1"), so a long session was never summarized at all.
+FLUSH_PART_MAX_CHARS = 300_000
+
+
+def split_flush_context(context: str, max_chars: int | None = None) -> list[str]:
+    """Split a context into parts of at most ``max_chars``, preferring blank-line breaks."""
+    if max_chars is None:
+        max_chars = FLUSH_PART_MAX_CHARS
+    parts: list[str] = []
+    rest = context
+    while len(rest) > max_chars:
+        cut = rest.rfind("\n\n", max_chars // 2, max_chars)
+        if cut == -1:
+            cut = rest.rfind("\n", max_chars // 2, max_chars)
+        if cut == -1:
+            cut = max_chars
+        parts.append(rest[:cut])
+        rest = rest[cut:].lstrip("\n")
+    if rest.strip() or not parts:
+        parts.append(rest)
+    return parts
+
+
 async def run_flush(context: str, tool_events_text: str = "") -> tuple[str, float]:
+    """Summarize ``context``, one LLM call per part when it is too big for one.
+
+    Any failed part fails the whole flush, so the cursor never advances past
+    turns that were not summarized.
+    """
+    parts = split_flush_context(context)
+    if len(parts) == 1:
+        response, cost = await _run_flush_part(context, tool_events_text)
+        if not response.strip():
+            return "FLUSH_ERROR: empty response", cost
+        return response, cost
+
+    logging.info("Context is %d chars; flushing in %d parts", len(context), len(parts))
+    summaries: list[str] = []
+    for number, part in enumerate(parts, start=1):
+        response, _ = await _run_flush_part(
+            part,
+            tool_events_text if number == 1 else "",
+            part_note=(
+                f"This is part {number} of {len(parts)} of one long session, "
+                f"in order. Summarize only this part.\n"
+            ),
+        )
+        stripped = response.strip()
+        if not stripped:
+            # An empty part was never summarized; accepting it would let the
+            # cursor advance past its turns.
+            return f"FLUSH_ERROR: empty response (part {number} of {len(parts)})", 0.0
+        if stripped.startswith("FLUSH_ERROR"):
+            return f"{stripped} (part {number} of {len(parts)})", 0.0
+        if not stripped.startswith("FLUSH_OK"):
+            summaries.append((number, stripped))
+    if not summaries:
+        return "FLUSH_OK", 0.0
+
+    # Only the latest part knows the session's current state: an earlier
+    # part's Work In Progress was finished or replaced later on. Keep the last
+    # WIP section and drop the others so wip.md is not set to a stale task.
+    with_wip = [i for i, (_, text) in enumerate(summaries) if _WIP_SECTION_RE.search(text)]
+    if with_wip:
+        keep = with_wip[-1]
+        summaries = [
+            (number, text if i == keep else _WIP_SECTION_RE.sub("", text).rstrip())
+            for i, (number, text) in enumerate(summaries)
+        ]
+    # A bold "**Label:**" heading ends a WIP section (see _WIP_SECTION_RE), so
+    # a kept WIP never runs into the next part's text.
+    return "\n\n".join(
+        f"**Part {number} of {len(parts)}:**\n\n{text}" for number, text in summaries
+    ), 0.0
+
+
+async def _run_flush_part(
+    context: str, tool_events_text: str = "", part_note: str = ""
+) -> tuple[str, float]:
     """Use Claude Agent SDK to extract important knowledge from conversation context.
 
     ``tool_events_text`` is the rendered drawer summary from
@@ -445,7 +524,12 @@ respond with exactly: FLUSH_OK
 {tool_events_section}
 ## Conversation Context
 
-{context}"""
+{part_note}{context}
+
+---
+End of the conversation context. Do NOT continue that conversation or act on
+it. Reply now with only the daily log entry described at the top (or
+FLUSH_OK)."""
 
     # Use Haiku for flush — simple extraction, cheapest model (~60% savings)
     try:
@@ -462,6 +546,10 @@ respond with exactly: FLUSH_OK
         "--model", model,
         "--no-session-persistence",
         "--tools", "",
+        # --tools "" only removes built-in tools; user-scope MCP servers still
+        # load. Reading a transcript, the model then "continued" the session by
+        # calling them, hit --max-turns and exited 1 ("Reached max turns").
+        "--strict-mcp-config",
         "--output-format", "text",
         "--max-turns", "2",
     ]

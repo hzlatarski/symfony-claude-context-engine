@@ -285,8 +285,79 @@ def _exact_references(text: str) -> list[str]:
     return list(dict.fromkeys(match.group(0) for match in _EXACT_REFERENCE_RE.finditer(text)))
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _tool_result_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
+def record_text(line: str) -> tuple[str, str] | None:
+    """Plain ``(role, text)`` worth indexing from one JSONL line, or ``None``.
+
+    Indexing the raw JSON lines made the store ~12x bigger than the words in
+    it: on 2026-10-28 eintollesfest's 644 MB of transcripts were 34% JSON
+    wrapping, 23% api-request logs and 15% attachments, while what the user
+    and Claude wrote was ~2%. Only messages are kept — user and assistant
+    text, thinking, tool calls and tool output, plus compaction summaries and
+    system notes, without JSON or ANSI colour codes. Images and bookkeeping
+    events (api-request, attachment, queue-operation, ...) are dropped. The archived JSONL
+    stays the byte-for-byte copy; this only decides what is searchable.
+    """
+    try:
+        entry = json.loads(line)
+    except json.JSONDecodeError:
+        return ("event", line)
+    if not isinstance(entry, dict):
+        return None
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        # Two message-less records carry real text: compaction summaries and
+        # system notes (local command output, hook messages).
+        if entry.get("type") == "summary" and isinstance(entry.get("summary"), str):
+            text = entry["summary"].strip()
+            return ("summary", text) if text else None
+        if entry.get("type") == "system" and isinstance(entry.get("content"), str):
+            text = _ANSI_RE.sub("", entry["content"]).strip()
+            return ("system", text) if text else None
+        return None
+    role = message.get("role") or "event"
+    content = message.get("content")
+    if isinstance(content, str):
+        pieces = [content]
+    else:
+        pieces = []
+        for part in content if isinstance(content, list) else []:
+            if isinstance(part, str):
+                pieces.append(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text":
+                pieces.append(part.get("text", ""))
+            elif kind == "thinking":
+                # Small (~0.1% of a transcript) and often holds the "why".
+                pieces.append(f"[thinking] {part.get('thinking', '')}")
+            elif kind == "tool_use":
+                arguments = json.dumps(part.get("input", {}), ensure_ascii=False)
+                pieces.append(f"[tool call {part.get('name', '?')}] {arguments}")
+            elif kind == "tool_result":
+                pieces.append(f"[tool output] {_tool_result_text(part.get('content'))}")
+    text = _ANSI_RE.sub("", "\n".join(piece for piece in pieces if piece.strip())).strip()
+    return (role, text) if text else None
+
+
 def embed_transcript_file(transcript_path: Path) -> int:
-    """Index every raw JSONL record, including tool inputs and tool results."""
+    """Index the messages of a JSONL transcript as plain text (see ``record_text``)."""
     from vector_store import replace_chunks_for_source
 
     index_lock = FileLock(str(transcript_path.with_suffix(".jsonl.index.lock")))
@@ -300,14 +371,12 @@ def embed_transcript_file(transcript_path: Path) -> int:
         for line_number, line in enumerate(lines, start=1):
             if not line.strip():
                 continue
+            record = record_text(line)
+            if record is None:
+                continue
+            role, record_body = record
             date_str = _record_date(line, fallback_date)
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                entry = None
-            message = entry.get("message") if isinstance(entry, dict) else None
-            role = message.get("role", "event") if isinstance(message, dict) else "event"
-            for part_number, text in enumerate(_overlapping_chunks(line), start=1):
+            for part_number, text in enumerate(_overlapping_chunks(f"{role}: {record_body}"), start=1):
                 chunks.append({
                     "chunk_id": (
                         f"transcript-{transcript_path.stem}-"
@@ -322,7 +391,7 @@ def embed_transcript_file(transcript_path: Path) -> int:
                     },
                 })
             for reference_number, reference in enumerate(
-                _exact_references(line),
+                _exact_references(record_body),
                 start=1,
             ):
                 if reference in seen_references:

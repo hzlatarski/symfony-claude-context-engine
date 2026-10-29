@@ -4,6 +4,30 @@ All notable changes to the Claude Context Engine — Symfony Edition are tracked
 
 The version recorded in `VERSION` at the repo root is the source of truth. The `check_update.py` helper compares it against `https://raw.githubusercontent.com/hzlatarski/symfony-claude-context-engine/main/VERSION` to surface upgrade prompts.
 
+## [0.16.0] — 2026-10-28
+
+Session capture had silently stopped in most projects. This release fixes the code causes found while repairing them and makes the daily index ~10x smaller.
+
+### Changed
+
+- **Transcripts are indexed as plain message text** (`transcript.record_text`): user and assistant text, thinking, tool calls and tool output, with JSON wrapping and ANSI colour codes stripped. API-request logs, attachments, images and bookkeeping events are no longer indexed. On eintollesfest this is 673M → 62M chars; the old raw index was 7.7 GB and its top hits for real questions were terminal colour codes. Archived transcripts stay byte-for-byte on disk.
+
+### Added
+
+- **`scripts/reset_daily_index.py`** — drops the daily collections (including the abandoned `daily_chunks`) and VACUUMs `chroma.sqlite3` so the space comes back.
+- **Migration `v0.16.0`** — prints the rebuild steps.
+
+### Fixed
+
+- **Long sessions were never summarized.** Flush contexts above ~400k chars made `claude -p` exit 1 every time, so the job retried 5 times and was dropped. `flush.py` now summarizes in parts of 300k chars and joins them; one failed or empty part fails the whole flush so the cursor never skips turns, and only the latest part's Work In Progress reaches `wip.md`.
+- **The flush model "continued" the session instead of summarizing it.** `--tools ""` removes only built-in tools; user-scope MCP servers still loaded, so on long transcripts the model called them, used up `--max-turns` and exited 1 (`Reached max turns`). The flush call now passes `--strict-mcp-config`, and the prompt repeats the instruction after the context.
+- Transcript records with string list items, compaction `summary` records and `system` notes stay searchable.
+- **Prompt hook named the wrong MCP servers.** The auto-fetched context told Claude to use `aitutor-code-intel` / `aitutor-knowledge` in every project; it now uses the project's own slug.
+
+### Upgrade notes
+
+After `upgrade.py`, close the project's Claude Code sessions, then run `reset_daily_index.py` and `reindex.py --daily-only`.
+
 ## [0.15.0] — 2026-10-21
 
 ### Changed

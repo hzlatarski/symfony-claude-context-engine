@@ -250,3 +250,160 @@ class _NullContext:
 
     def __exit__(self, *_args):
         return False
+
+
+def test_split_flush_context_keeps_every_char_under_the_limit() -> None:
+    import flush
+
+    context = "\n\n".join(f"turn {i} " + "x" * 90 for i in range(5000))
+
+    parts = flush.split_flush_context(context, max_chars=10_000)
+
+    assert len(parts) > 1
+    assert all(len(part) <= 10_000 for part in parts)
+    assert "".join(parts).replace("\n", "") == context.replace("\n", "")
+
+
+def test_small_context_is_one_claude_call(monkeypatch) -> None:
+    import flush
+
+    calls: list[str] = []
+
+    def fake_run(*_a, **kwargs):
+        calls.append(kwargs["input"])
+        return subprocess.CompletedProcess(["claude"], 0, stdout="**Context:** x", stderr="")
+
+    monkeypatch.setattr(flush.subprocess, "run", fake_run)
+
+    response, _ = asyncio.run(flush.run_flush("short context"))
+
+    assert len(calls) == 1
+    assert response == "**Context:** x"
+
+
+def test_big_context_is_flushed_in_parts_and_joined(monkeypatch) -> None:
+    import flush
+
+    calls: list[str] = []
+
+    def fake_run(*_a, **kwargs):
+        calls.append(kwargs["input"])
+        return subprocess.CompletedProcess(
+            ["claude"], 0, stdout=f"summary {len(calls)}", stderr="",
+        )
+
+    monkeypatch.setattr(flush.subprocess, "run", fake_run)
+    monkeypatch.setattr(flush, "FLUSH_PART_MAX_CHARS", 1_000)
+    context = "\n\n".join("y" * 300 for _ in range(10))
+
+    response, _ = asyncio.run(flush.run_flush(context, "tool log"))
+
+    assert len(calls) > 1
+    assert "part 1 of" in calls[0] and "tool log" in calls[0]
+    assert "tool log" not in calls[1]
+    assert response.startswith("**Part 1 of")
+    assert "summary 1" in response and f"summary {len(calls)}" in response
+
+
+def test_one_failed_part_fails_the_whole_flush(monkeypatch) -> None:
+    import flush
+
+    results = iter([0, 1, 0, 0, 0, 0, 0, 0, 0, 0])
+
+    def fake_run(*_a, **_k):
+        return subprocess.CompletedProcess(["claude"], next(results), stdout="s", stderr="")
+
+    monkeypatch.setattr(flush.subprocess, "run", fake_run)
+    monkeypatch.setattr(flush, "FLUSH_PART_MAX_CHARS", 1_000)
+    context = "\n\n".join("z" * 300 for _ in range(10))
+
+    response, _ = asyncio.run(flush.run_flush(context))
+
+    assert response.startswith("FLUSH_ERROR: claude CLI exited 1 (part 2 of")
+
+
+def test_all_parts_flush_ok_is_flush_ok(monkeypatch) -> None:
+    import flush
+
+    monkeypatch.setattr(
+        flush.subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess(["claude"], 0, stdout="FLUSH_OK", stderr=""),
+    )
+    monkeypatch.setattr(flush, "FLUSH_PART_MAX_CHARS", 1_000)
+    context = "\n\n".join("w" * 300 for _ in range(10))
+
+    response, _ = asyncio.run(flush.run_flush(context))
+
+    assert response == "FLUSH_OK"
+
+
+def test_empty_part_fails_the_whole_flush(monkeypatch) -> None:
+    import flush
+
+    outputs = iter(["", "summary second half", "x", "x", "x", "x", "x", "x", "x", "x"])
+    monkeypatch.setattr(
+        flush.subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess(["claude"], 0, stdout=next(outputs), stderr=""),
+    )
+    monkeypatch.setattr(flush, "FLUSH_PART_MAX_CHARS", 1_000)
+    context = "\n\n".join("e" * 300 for _ in range(10))
+
+    response, _ = asyncio.run(flush.run_flush(context))
+
+    assert response.startswith("FLUSH_ERROR: empty response (part 1 of")
+
+
+def test_empty_single_response_is_flush_error(monkeypatch) -> None:
+    import flush
+
+    monkeypatch.setattr(
+        flush.subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess(["claude"], 0, stdout="  ", stderr=""),
+    )
+
+    response, _ = asyncio.run(flush.run_flush("short context"))
+
+    assert response == "FLUSH_ERROR: empty response"
+
+
+def test_multi_part_wip_is_taken_from_the_latest_part_only(monkeypatch) -> None:
+    import flush
+
+    outputs = iter([
+        "**Context:** early\n\n**Work In Progress:**\n- Implement A",
+        "**Context:** later\n\n**Work In Progress:**\n- A finished; implement B",
+    ])
+    monkeypatch.setattr(
+        flush.subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess(["claude"], 0, stdout=next(outputs), stderr=""),
+    )
+    monkeypatch.setattr(flush, "FLUSH_PART_MAX_CHARS", 1_000)
+    context = "\n\n".join("w" * 300 for _ in range(5))
+
+    response, _ = asyncio.run(flush.run_flush(context))
+
+    assert flush.extract_wip_section(response) == "- A finished; implement B"
+    assert "Implement A" not in response
+    assert "**Context:** early" in response
+
+
+def test_flush_call_loads_no_mcp_servers_and_closes_the_context(monkeypatch) -> None:
+    import flush
+
+    seen: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(cmd=cmd, prompt=kwargs["input"])
+        return subprocess.CompletedProcess(cmd, 0, stdout="**Context:** x", stderr="")
+
+    monkeypatch.setattr(flush.subprocess, "run", fake_run)
+
+    asyncio.run(flush.run_flush("the session"))
+
+    assert "--strict-mcp-config" in seen["cmd"]
+    assert seen["prompt"].rstrip().endswith("(or\nFLUSH_OK).")
+    assert seen["prompt"].index("the session") < seen["prompt"].index("Do NOT continue")
