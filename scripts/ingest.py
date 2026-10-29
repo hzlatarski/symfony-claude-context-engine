@@ -38,7 +38,8 @@ from utils import (
     resolve_source_files,
     update_state,
 )
-from compile_truth import compile_truth as regenerate_truth, COMPILED_TRUTH_FILE
+from compile_truth import (compile_truth as regenerate_truth, COMPILED_TRUTH_FILE,
+                           extract_truth_section, extract_zones, extract_fallback_truth)
 import dedup
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -164,8 +165,8 @@ def _articles_written_for(before: dict[str, str], rel_source: str) -> bool:
     silent permanent data loss this check exists to prevent.
 
     So we additionally require a changed article to carry this source's
-    ``[src:...]`` anchor, which the ingest prompt mandates on every extracted
-    claim. That ties the evidence to the file actually being ingested.
+    ``[src:...]`` anchor in its Observed claims (or legacy extracted body).
+    Metadata, Timeline and Synthesized-only citations cannot complete ingestion.
     """
     after = _articles_snapshot()
     changed = [p for p, digest in after.items() if before.get(p) != digest]
@@ -175,7 +176,10 @@ def _articles_written_for(before: dict[str, str], rel_source: str) -> bool:
     anchor = f"[src:{rel_source}]"
     for path in changed:
         try:
-            if anchor in Path(path).read_text(encoding="utf-8", errors="ignore"):
+            content = Path(path).read_text(encoding="utf-8", errors="ignore")
+            observed = (extract_zones(content).observed if extract_truth_section(content) is not None
+                        else extract_fallback_truth(content))
+            if anchor in observed:
                 return True
         except OSError:
             continue
@@ -343,6 +347,11 @@ architectural patterns.
    near-duplicate.
 
 ### Quality standards:
+- A duplicate import with a different source ID still needs inline provenance.
+  If this source corroborates facts already in an article, append
+  `[src:{rel_source}]` to the existing supported Observed bullets, retaining their
+  earlier anchors. Do not duplicate the facts. Adding this source only to YAML
+  `sources` or Timeline does not complete ingestion. Never cite an unsupported claim.
 - Every article must have complete YAML frontmatter (title, aliases, tags, sources,
   source_type, source_category, confidence, created, updated)
 - Every article must link to at least 2 other articles via [[wikilinks]]
@@ -372,10 +381,10 @@ architectural patterns.
         *compiler_agent_permission_args(),
     ]
 
-    def _run() -> subprocess.CompletedProcess:
+    def _run(request_prompt: str) -> subprocess.CompletedProcess:
         return subprocess.run(
             cmd,
-            input=prompt,
+            input=request_prompt,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -385,36 +394,49 @@ architectural patterns.
             creationflags=NO_WINDOW_CREATIONFLAGS,
         )
 
-    try:
-        result = await asyncio.to_thread(_run)
-    except subprocess.TimeoutExpired:
-        print(f"  Error: claude CLI timed out after 600s")
-        return 0.0, False
-    except Exception as e:
-        print(f"  Error: {e}")
-        return 0.0, False
+    request_prompt = prompt
+    for attempt in range(2):
+        try:
+            result = await asyncio.to_thread(_run, request_prompt)
+        except subprocess.TimeoutExpired:
+            print("  Error: claude CLI timed out after 600s")
+            return 0.0, False
+        except Exception as e:
+            print(f"  Error: {e}")
+            return 0.0, False
 
-    # A non-zero exit is a failure even when the CLI explains itself on stdout.
-    # This was previously `returncode != 0 AND not stdout.strip()`, so
-    # "Prompt is too long" — printed to stdout with exit 1 — fell through to the
-    # success path below: the hash was recorded, "Done." was printed, and no
-    # article was ever written. Every subsequent run then SKIPPED the file as
-    # already-ingested. Silent data loss; found 2026-07-26.
-    if result.returncode != 0:
-        detail = (result.stderr.strip() or result.stdout.strip())[:300]
-        print(f"  Error: claude CLI exited {result.returncode} — {detail}",
-              file=sys.stderr)
-        return 0.0, False
+        # Auth, command and transport errors are not citation-repair requests.
+        if result.returncode != 0:
+            detail = (result.stderr.strip() or result.stdout.strip())[:300]
+            print(f"  Error: claude CLI exited {result.returncode} — {detail}", file=sys.stderr)
+            return 0.0, False
 
-    # Exit 0 still isn't proof of work. The contract of this function is that
-    # the source was turned into at least one article, so verify that actually
-    # happened before recording the hash — recording it is what makes the file
-    # invisible to future runs.
-    if not _articles_written_for(before_snapshot, rel_source):
-        print(f"  Error: claude CLI exited 0 but no article credits "
-              f"{rel_source} — not marking {file_path.name} as ingested",
-              file=sys.stderr)
-        return 0.0, False
+        # Keep the original snapshot across both attempts. Exit 0, metadata-only
+        # edits and unrelated changes still cannot mark an uncredited file done.
+        if _articles_written_for(before_snapshot, rel_source):
+            break
+        if attempt:
+            print(f"  Error: citation repair did not credit {rel_source} — "
+                  f"not marking {file_path.name} as ingested", file=sys.stderr)
+            return 0.0, False
+
+        changed = [agent_path(Path(p), KNOWLEDGE_DIR)
+                   for p, digest in _articles_snapshot().items()
+                   if before_snapshot.get(p) != digest]
+        print(f"  Retrying once to repair missing inline citation for {rel_source}")
+        request_prompt = prompt + f"""
+
+## Automatic citation-repair request
+
+The previous invocation exited successfully but validation found no changed article
+crediting this exact source: [src:{rel_source}]. Changed articles: {', '.join(changed) or '(none)'}.
+Read those articles and the original source document above. If this is a duplicate
+source, append [src:{rel_source}] to existing Observed claims that this source
+actually supports, keeping all previous anchors and facts. Do not create duplicate
+claims. YAML source lists, Timeline mentions, touching files or unrelated edits are
+not sufficient. Do not invent facts or add citations to unsupported claims. Use
+the same restricted tools and article paths to complete the original task.
+"""
 
     key = source_state_key(group, file_path)
     entry = {

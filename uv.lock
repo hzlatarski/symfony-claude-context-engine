@@ -868,6 +868,7 @@ dependencies = [
     { name = "psutil" },
     { name = "pyautogui" },
     { name = "pynput" },
+    { name = "pypdf" },
     { name = "pyperclip" },
     { name = "pystray" },
     { name = "pytest" },
@@ -905,6 +906,7 @@ requires-dist = [
     { name = "psutil", specifier = ">=6.0.0" },
     { name = "pyautogui", specifier = ">=0.9.54" },
     { name = "pynput", specifier = ">=1.7.7" },
+    { name = "pypdf", specifier = ">=6.19.0" },
     { name = "pyperclip", specifier = ">=1.9.0" },
     { name = "pystray", specifier = ">=0.19.5" },
     { name = "pytest", specifier = ">=9.0.3" },
@@ -1898,6 +1900,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/67/43/b1f0ad3b842ab150a7e6b7d97f6257eab6af241b4c7d14cb8e7fde9214b8/pyobjc_framework_quartz-12.1-cp313-cp313t-macosx_10_13_universal2.whl", hash = "sha256:53b84e880c358ba1ddcd7e8d5ea0407d760eca58b96f0d344829162cda5f37b3", size = 224317, upload-time = "2025-11-14T10:00:30.703Z" },
     { url = "https://files.pythonhosted.org/packages/4a/00/96249c5c7e5aaca5f688ca18b8d8ad05cd7886ebd639b3c71a6a4cadbe75/pyobjc_framework_quartz-12.1-cp314-cp314-macosx_10_15_universal2.whl", hash = "sha256:42d306b07f05ae7d155984503e0fb1b701fecd31dcc5c79fe8ab9790ff7e0de0", size = 219558, upload-time = "2025-11-14T10:00:45.476Z" },
     { url = "https://files.pythonhosted.org/packages/4d/a6/708a55f3ff7a18c403b30a29a11dccfed0410485a7548c60a4b6d4cc0676/pyobjc_framework_quartz-12.1-cp314-cp314t-macosx_10_15_universal2.whl", hash = "sha256:0cc08fddb339b2760df60dea1057453557588908e42bdc62184b6396ce2d6e9a", size = 224580, upload-time = "2025-11-14T10:01:00.091Z" },
+]
+
+[[package]]
+name = "pypdf"
+version = "6.19.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1f/ac/63d71aaedb59acbcdef491e6ca6469165e3771c9c74358204818fd9bc5a6/pypdf-6.19.0.tar.gz", hash = "sha256:bbc43aca292369ccc6cbc8a921991ecf2538a3587ab5a116eff06c321d647155", size = 7033266, upload-time = "2026-09-16T09:32:05.946Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3c/2c/c43c03eaf630435f023f1dc61ec4a4a78951ad5530a62c71cc89bde307b7/pypdf-6.19.0-py3-none-any.whl", hash = "sha256:7e5d6e730e7dae87d560a2cee218b852f6498c8be61966f3cd02ead971e48d14", size = 395480, upload-time = "2026-09-16T09:32:04.087Z" },
 ]
 
 [[package]]
